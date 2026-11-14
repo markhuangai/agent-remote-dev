@@ -80,7 +80,7 @@ export function verifyReviewState(state: any, head: string, policy: ValidationPo
     const marker = typeof review.body === "string" ? review.body.match(/^<!-- ai-pr-reviewer:v3:([a-f0-9]{40}):([a-f0-9]{64}) -->/) : null;
     if (marker?.[1] === head && review.commit?.oid === head) marked.set(marker[2], review.body);
   }
-  if (marked.size < policy.marked_review_count && ![...marked.values()].some((body) => aggregateCoverage(body, policy.marked_review_count))) throw new RunnerError("incomplete_ai_review_coverage", "delivery", "Current-head AI review coverage is incomplete.",
+  if (policy.marked_review_count > 0 && ![...marked.values()].some((body) => aggregateCoverage(body, policy.marked_review_count))) throw new RunnerError("incomplete_ai_review_coverage", "delivery", "Current-head AI review coverage is incomplete.",
     { expected_sha: head, expected_review_count: policy.marked_review_count, observed_review_count: marked.size });
   verifyDispositions(state, dispositions);
 }

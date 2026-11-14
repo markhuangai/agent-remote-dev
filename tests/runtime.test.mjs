@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, lstat, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
@@ -117,6 +117,19 @@ test("actual Git publication verifies pushed commits, upstream, deletions and re
   const removed = await git.publish(["greeting.js"], "Remove unstaged fixture file", next, next);
   assert.equal(await git.remoteHead(), removed);
 });
+for (const change of ["deletion", "rename"]) test(`audited ${change} fingerprints survive staging and real publication`, async (t) => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
+  const original = await git.fingerprint();
+  if (change === "deletion") await unlink(join(r.cwd, "README.md"));
+  else await rename(join(r.cwd, "README.md"), join(r.cwd, "renamed.md"));
+  const audited = await git.fingerprint(), paths = await git.changedPaths();
+  assert.notEqual(audited, original);
+  await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited);
+  const sha = await git.publish(paths, `Publish fixture ${change}`, r.base, null);
+  assert.equal(await git.fingerprint(), audited); assert.equal(await git.remoteHead(), sha);
+  await writeFile(join(r.cwd, "renamed.md"), "Later implementation change\n");
+  assert.notEqual(await git.fingerprint(), audited);
+});
 test("real submodule fingerprints and publication preserve clean references and reject unpublished child work",async(t)=>{
   const f=await fixture(t),r=await repository(f),source=join(f.temporary,"module-source");
   await mkdir(source);
@@ -212,13 +225,31 @@ test("upload failures, missing sessions, drift and size limits never advance the
   assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
   const failure=f.records.find(record=>record.reason==="artifact_upload_failed");assert.equal(failure.intended_sha,"b".repeat(40));assert.equal(failure.last_durable_checkpoint.artifact_id,4);
 });
+test("checkpoint failure diagnostics preserve real Git observations and the preceding durable receipt", async (t) => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
+  await writeFile(join(r.cwd, "new.txt"), "Published change\n");
+  const observed = await git.publish(["new.txt"], "Publish fixture", r.base, null);
+  const previous = { sequence: 0, artifact_id: 7, checkpoint_sha: r.base };
+  await assert.rejects(isolatedCheckpoint(f.job, r.cwd, checkpoint({ base_sha:r.base, checkpoint_sha:r.base, previous }), f.log, sha => git.verify(sha)), error => {
+    assert.equal(error.reason, "checkpoint_operation_failed"); assert.equal(error.details.expected_sha, r.base);
+    assert.equal(error.details.observed_sha, observed); assert.equal(error.details.last_durable_checkpoint.artifact_id, 7); return true;
+  });
+  const failure = f.records.find(record => record.event === "checkpoint.failed");
+  assert.equal(failure.cause_reason, "checkpoint_head_mismatch"); assert.equal(failure.intended_sha, r.base);
+  assert.equal(failure.expected_sha, r.base); assert.equal(failure.observed_sha, observed);
+  assert.equal(failure.last_verified_sha, null); assert.equal(failure.last_durable_checkpoint.artifact_id, 7);
+});
 test("required checks, marked review coverage and dispositions reject stale or incomplete completion", () => {
   const head = "a".repeat(40), p = { ...policy, marked_review_count: 1 };
   const receipt = { gate:"terminal", phase:"full", head_sha:head, all_checks_nonblocking:true, required_reviewers_satisfied:true,
     required_checks:policy.checks, required_reviewers:[], required_check_problems:[], required_reviewer_problems:[] };
   verifyTerminal(receipt, head, policy);
   for (const change of [{head_sha:"b".repeat(40)},{required_checks:[]},{gate:"review_terminal"},{all_checks_nonblocking:false}]) assert.throws(() => verifyTerminal({...receipt,...change},head,policy));
-  const state = {pull_request:{head_sha:head}, codex_thread_actions:{incomplete:0}, ai_pr_reviewer_thread_actions:{incomplete:0}, reviews:[{id:"review-1",commit:{oid:head},body:`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->\nFixture review`}]};
+  const state = {pull_request:{head_sha:head}, codex_thread_actions:{incomplete:0}, ai_pr_reviewer_thread_actions:{incomplete:0}, reviews:[{id:"review-1",commit:{oid:head},body:`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->
+| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
+|:--|--:|--:|--:|--:|--:|
+| <code>src/main.ts</code> | 5 | 5 | 100% | 1 | 1 |
+| **Total** | **5** | **5** | **100%** | — | **1** |`}]};
   const ledger=reviewSurfaces(state).map(surface=>({...surface,decision:"not_finding",reason:"Fixture contains no finding",fix_sha:null}));
   verifyReviewState(state,head,p,ledger);
   assert.throws(() => verifyReviewState({...state,reviews:[]},head,p,[]));
@@ -226,6 +257,11 @@ test("required checks, marked review coverage and dispositions reject stale or i
   const finding={...state,reviews:[{...state.reviews[0],body:state.reviews[0].body+"\nP1: Missing authorization validation"}]};
   assert.throws(()=>verifyReviewState(finding,head,p,[]),{reason:"review_surface_coverage_mismatch"});
   assert.throws(()=>verifyReviewState(finding,head,p,ledger),{reason:"unhandled_review_surface"});
+  for (const body of ["Fixture review without coverage", state.reviews[0].body.replace("5 | 5 | 100%", "1 | 5 | 20%")]) {
+    const partial = { ...state, reviews:[{ ...state.reviews[0], body }] };
+    const dispositions = reviewSurfaces(partial).map(surface => ({ ...surface, decision:"not_finding", reason:"Fixture only", fix_sha:null }));
+    assert.throws(() => verifyReviewState(partial, head, p, dispositions), { reason:"incomplete_ai_review_coverage" });
+  }
 });
 test("the actual v3 aggregate coverage format proves all profiles and rejects partial or inconsistent receipts",()=>{
   const head="a".repeat(40),validation={...policy,marked_review_count:6};
@@ -243,7 +279,22 @@ Coverage does not measure review quality or completion.`;
   verify(state);
   for(const changed of [body.replace("100% | 6 | 6","80% | 6 | 6"),body.replace("100% | 6 | 6","100% | 5 | 6"),body.replace("**118** | **118**","**119** | **118**"),body.replace(head,"b".repeat(40))]) {
     assert.throws(()=>verify({...state,reviews:[{...state.reviews[0],body:changed}]}),{reason:"incomplete_ai_review_coverage"});
+    const reviews = Array.from({ length:6 }, (_, index) => ({ ...state.reviews[0], id:`profile-${index}`, body:changed.replace("c".repeat(64), String(index + 1).repeat(64)) }));
+    assert.throws(() => verify({ ...state, reviews }), { reason:"incomplete_ai_review_coverage" });
   }
+});
+test("failed validation retains bounded sanitized stdout while worker and API stdout stay private", async (t) => {
+  const f = await fixture(t), args = ["-e", "process.stdout.write('validation-failure-evidence\\n'+process.env.CODEX_API_KEY+'\\n'+JSON.stringify({private_provider:'omit-this-body'})+'\\n'+'x'.repeat(10000));process.exit(1)"];
+  await assert.rejects(command(process.execPath, args, { cwd:f.temporary, env:f.job.env, stage:"local_check_0", log:f.log, diagnosticStdout:true }), error => {
+    assert.match(error.nativeCause, /validation-failure-evidence/); assert.match(error.nativeCause, /truncated/);
+    assert.doesNotMatch(error.nativeCause, /fixture-api-credential-9374|omit-this-body/); assert.ok(error.nativeCause.length < 8300);
+    f.log.failure(error); return true;
+  });
+  const failure = f.records.find(record => record.event === "runtime.failed");
+  assert.match(failure.native_cause, /validation-failure-evidence/); assert.equal(failure.truncated, true);
+  for (const stage of ["worker", "preflight_api"]) await assert.rejects(command(process.execPath, args, { cwd:f.temporary, env:f.job.env, stage, log:f.log }), error => {
+    assert.doesNotMatch(error.nativeCause, /validation-failure-evidence|omit-this-body/); return true;
+  });
 });
 test("real process timeout stops managed descendants and preserves a diagnostic cause", async (t) => {
   const f = await fixture(t);
@@ -274,6 +325,7 @@ test("a stalled real artifact transport is terminated within the checkpoint acti
   assert.ok(requests>0,"The actual artifact SDK reached the stalled transport");
   const evidence=f.records.find(record=>record.event==="checkpoint.failed");
   assert.equal(evidence.last_durable_checkpoint.artifact_id,8);assert.equal(evidence.intended_sha,sha);
+  assert.equal(evidence.observed_sha,null);assert.equal(evidence.last_verified_sha,sha);
   assert.ok(Date.now()<Number(f.job.env.CODEX_TASK_DEADLINE_MS));
 });
 test("normal diagnostic output masks credentials and raw provider bodies and marks truncation", () => {

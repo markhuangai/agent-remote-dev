@@ -30,10 +30,12 @@ export async function isolatedCheckpoint(job: Job, cwd: string, input: Checkpoin
   const sequence = (input.previous?.sequence ?? 0) + 1;
   const requestPath = join(job.root, `checkpoint-request-${sequence}.json`), resultPath = join(job.root, `checkpoint-result-${sequence}.json`);
   const fields = { ...log.fields, artifact_name: `codex-${input.task_id}-${sequence}`, intended_sha: input.checkpoint_sha,
-    observed_sha: input.checkpoint_sha, last_durable_checkpoint: input.previous };
-  await verify(input.checkpoint_sha);
-  await writeFile(requestPath, JSON.stringify({ job, cwd, input, fields, resultPath, secrets: log.protectedValues }), { mode: 0o600 });
+    last_durable_checkpoint: input.previous };
+  let verifiedSha: string | null = null;
   try {
+    await verify(input.checkpoint_sha);
+    verifiedSha = input.checkpoint_sha;
+    await writeFile(requestPath, JSON.stringify({ job, cwd, input, fields, resultPath, secrets: log.protectedValues }), { mode: 0o600 });
     await command(process.execPath, [entry, "--checkpoint-worker", requestPath], {
       cwd, env: { ...environment, CODEX_TASK_DEADLINE_MS: job.env.CODEX_TASK_DEADLINE_MS }, stage: "checkpoint", log, context: fields, collect: false,
       timeoutMs: Math.max(1, Number(job.env.CODEX_TASK_DEADLINE_MS ?? Date.now() + 180000) - Date.now() - 11000),
@@ -51,8 +53,11 @@ export async function isolatedCheckpoint(job: Job, cwd: string, input: Checkpoin
     return receipt;
   } catch (error) {
     const timeout = error instanceof RunnerError && ["command_timeout", "command_cancelled"].includes(error.reason);
-    log.event("checkpoint.failed", "ERROR", { ...fields, reason: timeout ? "checkpoint_interrupted" : "checkpoint_operation_failed", native_cause: error instanceof RunnerError ? error.nativeCause : "Checkpoint worker did not return a verified receipt",
+    const details = error instanceof RunnerError ? error.details : {};
+    const failed = { ...fields, ...details, last_verified_sha: verifiedSha, observed_sha: details.observed_sha ?? null };
+    const cause = error instanceof RunnerError ? error.nativeCause : error instanceof Error ? error.message : "Checkpoint worker did not return a verified receipt";
+    log.event("checkpoint.failed", "ERROR", { ...failed, reason: timeout ? "checkpoint_interrupted" : "checkpoint_operation_failed", cause_reason: error instanceof RunnerError ? error.reason : "unexpected_failure", native_cause: cause,
       corrective_action: "Retain the previous durable artifact; inspect the checkpoint stage and deadline before retrying." });
-    throw new RunnerError(timeout ? (error as RunnerError).reason : "checkpoint_operation_failed", "checkpoint", error instanceof Error ? error.message : "Checkpoint worker failed", fields);
+    throw new RunnerError(timeout ? (error as RunnerError).reason : "checkpoint_operation_failed", "checkpoint", cause, failed);
   }
 }

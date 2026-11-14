@@ -48,10 +48,10 @@ test("the real CLI driver audits independently, checks production files, publish
     [message(turn("accomplishment",{paths:["greeting.js"],commit_message:"Complete fixture file",validation_policy:policy}))],
     [message(turn("audit",{validation_policy:policy}))],
     [message(auditResult("nonconformant",[{plan_item:"Complete fixture",category:"missing_behavior",evidence:"greeting.js:1",gap:"Fixture correction required",required_outcome:"Correct fixture",guidance:"Correct fixture logic"}]))],
-    [tool("printf '%s\\n' 'console.log(43);' > greeting.js","correction")],
+    [tool("printf '%s\\n' 'console.log(43);' > greeting.js && rm README.md","correction")],
     [message(turn("audit",{validation_policy:policy}))],
     [message(auditResult("conformant"))],
-    [message(turn("accomplishment",{paths:["greeting.js"],commit_message:"Correct fixture",validation_policy:policy}))],
+    [message(turn("accomplishment",{paths:["greeting.js","README.md"],commit_message:"Correct fixture",validation_policy:policy}))],
     [tool(deliver,"delivery-call")],
     [message(turn("complete",{pr_url:"https://github.com/fixture/repo/pull/9",review_receipt:receipt,validation_policy:policy}))],
   ];
@@ -117,6 +117,23 @@ test("a real piped validation failure cannot become a passing supervisor receipt
   const failure=f.records.find(record=>record.event==="runtime.failed"&&record.stage==="local_check_0");
   assert.equal(failure.reason,"command_failed");assert.equal(failure.exit_code,1);
   assert.ok(!f.records.some(record=>record.event==="runtime.operation"&&record.stage==="local_check_0"&&record.outcome==="success"));
+});
+test("a failed real Node check returns sanitized assertion evidence to the resumed worker", async (t) => {
+  const f = await fixture(t), r = await repository(f), source = await portableSource(f);
+  await installSkillSource(f.job, executionSource, source, 0, f.log);
+  const validation = { ...policy, local_checks:["node --test failure.test.mjs"] };
+  const code = "import test from 'node:test';import assert from 'node:assert/strict';test('validation evidence',()=>assert.equal(process.env.CODEX_API_KEY,'expected-value','validation-assertion-7351'));\n";
+  const audit = { verdict:"conformant", findings:[], summary:"Fixture conformance", auditor:{session:"not exposed by CLI",model:"not exposed by CLI"}, base_sha:r.base, audited_state:"Complete fixture worktree" };
+  const api = await provider(t, [[tool(`printf '%s' ${quote(code)} > failure.test.mjs`)], [message(turn("audit", {validation_policy:validation}))], [message(audit)], [message(turn("blocked", {blocker:{reason:"validation_failed",references:[],missing_inputs:[]}}))]]);
+  await configure(f.job, api.config, f.log);
+  const git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
+  const result = await drive({ job:f.job, git, log:f.log, plan:"Fixture", planSource:"inline", authorization:{repository:"fixture/repo",plan_sha256:hash("Fixture"),request:"Implement fixture"}, repository:"fixture/repo", taskId:"fixture-task", base:r.base, budgetMs:240000, started:Date.now(), skills:[executionSource], lineage:{}, checkpoint:async()=>{throw Error("Failed validation cannot checkpoint");}, complete:async()=>{throw Error("Failed validation cannot complete");} });
+  assert.equal(result.status, "blocked");
+  const feedback = api.requests.at(-1).input.filter(item => item.role === "user").flatMap(item => item.content ?? []).map(item => item.text ?? "").findLast(text => text.includes("Sanitized cause:"));
+  assert.match(feedback, /validation-assertion-7351/); assert.match(feedback, /failure.test.mjs/);
+  assert.doesNotMatch(feedback, /fixture-api-credential-9374/);
+  const failure = f.records.find(record => record.event === "runtime.failed" && record.stage === "local_check_0");
+  assert.match(failure.native_cause, /validation-assertion-7351/); assert.doesNotMatch(JSON.stringify(f.records), /fixture-api-credential-9374/);
 });
 for(const interruption of ["budget","SIGTERM","SIGINT"]) test(`${interruption} interruption retains the last real pushed and uploaded accomplishment`, async(t)=>{
   const f=await fixture(t),r=await repository(f),source=await portableSource(f);

@@ -102,12 +102,12 @@ export async function main() {
     log.event("runtime.outcome", result.status === "completed" ? "INFO" : "ERROR", { status: result.status, last_durable_checkpoint: result.checkpoint });
     if (result.status !== "completed") core.setFailed(`Plan execution ${result.status}; inspect runtime and checkpoint diagnostics.`);
   } catch (error) {
-    log.failure(error); core.setOutput("status", "failed"); core.setFailed("Plan execution failed; inspect runtime.failed diagnostics.");
+    log.failure(error, latestCheckpoint); core.setOutput("status", "failed"); core.setFailed("Plan execution failed; inspect runtime.failed diagnostics.");
   } finally {
     activeStage = "cleanup";
     if (job) {
       try { await removeJob(job.root); log.event("runtime.cleanup", "INFO", { outcome: "removed_owned_job_directory", path: job.root }); }
-      catch (error) { log.failure(error); core.setOutput("status", "failed"); core.setFailed("Job-owned temporary cleanup failed."); }
+      catch (error) { log.failure(error, latestCheckpoint); core.setOutput("status", "failed"); core.setFailed("Job-owned temporary cleanup failed."); }
     }
     clearTimeout(deadlineTimer);
   }

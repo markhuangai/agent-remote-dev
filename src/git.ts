@@ -39,25 +39,25 @@ export class TaskGit {
     const gitlinks = await this.gitlinks();
     const paths = [...new Set((await this.run(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean))].sort();
     for (const path of paths) {
+      let stat;
+      try { stat = await lstat(join(this.cwd, path)); }
+      catch (error: any) { if (error.code === "ENOENT") continue; throw error; }
       digest.update(path + "\0");
-      try {
-        const stat = await lstat(join(this.cwd, path));
-        digest.update(stat.isSymbolicLink() ? "symlink" : String(stat.mode & 0o777));
-        if (stat.isDirectory() && gitlinks.has(path)) {
-          const directory = join(this.cwd, path);
-          digest.update(gitlinks.get(path)!);
-          let initialized = false;
-          try { await lstat(join(directory, ".git")); initialized = true; }
-          catch (error: any) { if (error.code !== "ENOENT") throw error; }
-          if (initialized) {
-            const nested = new TaskGit(directory, this.env, this.log, this.branch);
-            digest.update(await nested.head()); digest.update(await nested.fingerprint());
-          } else {
-            requireValue((await readdir(directory)).length === 0, "uninitialized_submodule_has_files", "git");
-            digest.update("uninitialized");
-          }
-        } else digest.update(stat.isSymbolicLink() ? await readlink(join(this.cwd, path)) : await readFile(join(this.cwd, path)));
-      } catch (error: any) { if (error.code === "ENOENT") digest.update("deleted"); else throw error; }
+      digest.update(stat.isSymbolicLink() ? "symlink" : String(stat.mode & 0o777));
+      if (stat.isDirectory() && gitlinks.has(path)) {
+        const directory = join(this.cwd, path);
+        digest.update(gitlinks.get(path)!);
+        let initialized = false;
+        try { await lstat(join(directory, ".git")); initialized = true; }
+        catch (error: any) { if (error.code !== "ENOENT") throw error; }
+        if (initialized) {
+          const nested = new TaskGit(directory, this.env, this.log, this.branch);
+          digest.update(await nested.head()); digest.update(await nested.fingerprint());
+        } else {
+          requireValue((await readdir(directory)).length === 0, "uninitialized_submodule_has_files", "git");
+          digest.update("uninitialized");
+        }
+      } else digest.update(stat.isSymbolicLink() ? await readlink(join(this.cwd, path)) : await readFile(join(this.cwd, path)));
       digest.update("\0");
     }
     return digest.digest("hex");

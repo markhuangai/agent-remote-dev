@@ -8,7 +8,7 @@ import { RunnerError } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 
 export type CommandOptions = { cwd: string; env: NodeJS.ProcessEnv; stage: string; log?: Diagnostics; timeoutMs?: number;
-  stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; context?: Record<string, unknown> };
+  stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown> };
 export async function command(executable: string, args: string[], options: CommandOptions) {
   const started = Date.now();
   const timeoutMs = Math.min(options.timeoutMs ?? 180000, Number(options.env.CODEX_TASK_DEADLINE_MS ?? Infinity) - started - 11000);
@@ -57,8 +57,16 @@ export async function command(executable: string, args: string[], options: Comma
     try { receipt = JSON.parse(await readFile(receiptPath, "utf8")); }
     catch (error: any) { if (error.code !== "ENOENT") throw error; }
     if (!spawnError && code === 0 && (receipt?.nonce !== nonce || receipt?.quiescent !== true)) throw new RunnerError("worker_not_quiescent", options.stage, "The Linux supervisor did not prove descendant quiescence.");
-    if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained) throw new RunnerError(cancelled ? "command_cancelled" : timeout ? "command_timeout" : overflow ? "command_output_limit" : !drained ? "command_output_not_closed" : "command_failed",
-      options.stage, spawnError?.message ?? stderr, { exit_code: code, executable: executable.split("/").pop(), elapsed_ms: Date.now() - started, quiescent: receipt?.quiescent === true });
+    if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained) {
+      let cause = spawnError?.message ?? stderr;
+      if (options.diagnosticStdout) {
+        cause = [cause, stdout].filter(Boolean).join("\n");
+        cause = options.log?.sanitize(cause) ?? cause;
+        if (cause.length > 8192) cause = cause.slice(0, 8192) + `...[truncated ${cause.length - 8192} characters]`;
+      }
+      throw new RunnerError(cancelled ? "command_cancelled" : timeout ? "command_timeout" : overflow ? "command_output_limit" : !drained ? "command_output_not_closed" : "command_failed",
+        options.stage, cause, { exit_code: code, executable: executable.split("/").pop(), elapsed_ms: Date.now() - started, quiescent: receipt?.quiescent === true });
+    }
     options.log?.event("runtime.operation", "INFO", { stage: options.stage, outcome: "success", quiescent: true, elapsed_ms: Date.now() - started });
     return stdout;
   } finally {

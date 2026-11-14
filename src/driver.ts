@@ -109,7 +109,7 @@ Portable delivery instructions:\n${guidance}`;
           audit.validation = [];
           try {
             for (const [index, check] of policy.local_checks.entries()) {
-              const options = { cwd: git.cwd, env: job.env, log, stage: `local_check_${index}`, timeoutMs: Math.max(1, remaining() - 120000) };
+              const options = { cwd: git.cwd, env: job.env, log, stage: `local_check_${index}`, timeoutMs: Math.max(1, remaining() - 120000), diagnosticStdout: true };
               await command("bash", ["-e", "-o", "pipefail", "-c", check], options);
               audit.validation.push({ command: check, exit_code: 0 });
             }
