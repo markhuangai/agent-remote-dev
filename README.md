@@ -47,8 +47,9 @@ deduplicate pending and successful statuses for that PR and head.
 The workflow and helper checkout stays on the trusted workflow revision. The
 reviewer receives an explicit PR URL and creates its own isolated read-only
 checkout; no PR scripts, builds, local actions, or dependency installs execute
-with review secrets. The reviewer is pinned to `v1.2.3-rc.0` with `model: auto`,
-`effort: xhigh`, and `auto-approve: false`.
+with review secrets. The reviewer follows `v1-prerelease` with `model: auto`,
+`effort: high`, and `auto-approve: false`. The alias follows published prereleases;
+bootstrap logs identify the resolved release while policy logs record the alias.
 
 Provision these repository or permitted organization secrets before the first
 post-bootstrap implementation PR:

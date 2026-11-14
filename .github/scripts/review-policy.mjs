@@ -1,5 +1,5 @@
 export const trustedActor = "Z-M-Huang";
-export const reviewerVersion = "v1.2.3-rc.0";
+export const reviewerVersion = "v1-prerelease";
 const shaPattern = /^[0-9a-f]{40}$/;
 const positiveInteger = (value) => Number.isSafeInteger(value) && value > 0;
 
@@ -29,7 +29,7 @@ export function logEvent(core, event, level, fields, env = process.env) {
     run_attempt: env.GITHUB_RUN_ATTEMPT,
     workflow_sha: env.GITHUB_WORKFLOW_SHA,
     retention_days: env.GITHUB_RETENTION_DAYS,
-    reviewer_version: reviewerVersion, model: "auto", effort: "xhigh",
+    reviewer_version: reviewerVersion, model: "auto", effort: "high",
     ...fields,
   }, (_key, value) => {
     if (typeof value !== "string" || value.length <= 512) return value;

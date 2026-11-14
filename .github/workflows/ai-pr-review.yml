@@ -23,7 +23,7 @@ permissions:
 env:
   TRIGGERING_ACTOR: ${{ github.triggering_actor }}
   REVIEW_MODEL: auto
-  REVIEW_EFFORT: xhigh
+  REVIEW_EFFORT: high
 
 jobs:
   resolve:
@@ -100,7 +100,7 @@ jobs:
         id: reviewer
         continue-on-error: true
         timeout-minutes: 50
-        uses: markhuangai/ai-pr-reviewer@v1.2.3-rc.0
+        uses: markhuangai/ai-pr-reviewer@v1-prerelease
         with:
           pull-request-url: ${{ format('{0}/{1}/pull/{2}', github.server_url, github.repository, needs.resolve.outputs.pr_number) }}
           github-pat: ${{ secrets.PR_REVIEW_PAT }}
