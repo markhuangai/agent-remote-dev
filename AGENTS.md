@@ -1,8 +1,8 @@
 # Repository development
 
-This repository is bootstrapping a Codex plan runner. Work only on the linked
-issue; runner execution, session persistence, and platform support belong to
-their separate tickets. Use Node.js 24 for repository policy helpers and tests.
+This repository implements a Linux Codex plan runner. Work only on the linked
+issue; cross-run resume, continuation, release qualification and other platform
+support belong to their separate tickets. Use Node.js 24 for runtime, policy helpers and tests.
 Keep helpers dependency-free and test their actual decisions. API fixtures may
 isolate GitHub transport; do not replace the policy under test.
 
@@ -10,18 +10,23 @@ isolate GitHub transport; do not replace the policy under test.
 
 Before publication, run:
 
-1. `actionlint` (v1.7.12, verified against its published SHA-256).
-2. `node --test tests/review-policy.test.mjs`.
+1. `npm run check` after installing locked dependencies with `npm ci --ignore-scripts`.
+2. `actionlint` (v1.7.12, verified against its published SHA-256).
+3. `node --test tests/review-policy.test.mjs`.
 
 When delivery requires plan conformance, obtain the independent read-only audit
-before running tests. Required remote PR checks are `CI`, `Analyze (actions)`,
+before running tests. Required remote PR checks are `CI`, `Runtime (linux-arm64)`, `Analyze (actions)`,
 `Analyze (javascript-typescript)`, and `CodeQL analysis`. Check the latest
 execution for each language, including partial reruns; a successful parent does
 not override a failed, missing, skipped, or ambiguous child. These workflows
 validate the exact PR head rather than a mutable branch name.
 
-Full CI runs automatically. There is no review-first controller, validation
-label, container image, database, or remote development-test route.
+Full CI runs automatically. CI requires successful real sandbox execution on
+both architectures. On a host denying namespaces, local CLI tests verify the
+explicit failure path without claiming successful sandbox execution. There is
+no review-first controller, validation label, container image, shared database,
+or pre-PR remote development-test route. The manual acceptance entrypoint is
+reserved for explicitly authorized live qualification after its prerequisites land.
 
 ## Review policy
 

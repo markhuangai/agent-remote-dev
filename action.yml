@@ -1,0 +1,57 @@
+name: Codex plan runner
+description: Execute an authorized plan on Linux and export verified accomplishment checkpoints
+inputs:
+  working-directory:
+    description: Checked-out target directory relative to GITHUB_WORKSPACE
+    default: .
+  plan:
+    description: Inline approved plan; mutually exclusive with issue-url
+  issue-url:
+    description: GitHub issue URL in the checked-out repository; mutually exclusive with plan
+  authorization:
+    description: JSON with repository, plan_sha256, permission_mode, and the direct delivery request
+    required: true
+  codex-config:
+    description: Secret-backed Codex config.toml contents
+    required: true
+  codex-api-key:
+    description: Secret API credential for Codex
+    required: true
+  github-token:
+    description: Secret publication credential; never persisted in Git configuration
+    required: true
+  git-author-name:
+    description: Explicit author and committer name for this job
+    required: true
+  git-author-email:
+    description: Explicit author and committer email for this job
+    required: true
+  permission-mode:
+    description: full-access or sandboxed; must match the authorization
+    default: full-access
+  skills:
+    description: JSON array of additional repository, revision (full SHA), and names skill sources
+    default: '[]'
+  budget-minutes:
+    description: Total runtime budget, including a 120-second shutdown and export reserve
+    default: '300'
+outputs:
+  task-id:
+    description: Unique task identifier
+  branch:
+    description: Published task branch
+  base-sha:
+    description: Verified task base
+  checkpoint-sha:
+    description: Last successfully uploaded checkpoint's pushed commit
+  session-id:
+    description: Explicit worker conversation identifier
+  artifact-id:
+    description: Last durable checkpoint artifact ID
+  pull-request-url:
+    description: Delivered or in-progress pull request
+  status:
+    description: completed, incomplete, blocked, or failed
+runs:
+  using: node24
+  main: dist/index.js

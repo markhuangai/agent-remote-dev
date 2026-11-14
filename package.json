@@ -1,0 +1,23 @@
+{
+  "name": "agent-remote-dev-codex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs && node scripts/check-bundle.mjs"
+  },
+  "dependencies": {
+    "@actions/artifact": "6.3.1",
+    "@actions/core": "3.0.1",
+    "@openai/codex": "0.169.0",
+    "skills": "1.8.1",
+    "smol-toml": "1.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@vercel/ncc": "0.45.0",
+    "typescript": "5.9.3"
+  }
+}

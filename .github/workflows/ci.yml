@@ -14,9 +14,10 @@ jobs:
   validation:
     name: CI
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      REQUIRE_SANDBOX_SUCCESS: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -47,3 +48,31 @@ jobs:
         run: actionlint
       - name: Test review and validation policy
         run: node --test tests/review-policy.test.mjs
+      - name: Install locked runtime and build dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check runtime and bundled distribution
+        run: npm run check
+
+  runtime-arm64:
+    name: Runtime (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      REQUIRE_SANDBOX_SUCCESS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Verify source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked runtime and build dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check native arm64 runtime and bundle
+        run: npm run check
