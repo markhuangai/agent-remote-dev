@@ -2,7 +2,7 @@ import { backup, DatabaseSync } from "node:sqlite";
 import { cp, lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
-import { Authorization, hash, requireValue, RunnerError, SkillSource, versions } from "./contracts.js";
+import { Authorization, executionMode, hash, requireValue, RunnerError, SkillSource, versions } from "./contracts.js";
 import { safeTree, Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
 
@@ -67,7 +67,7 @@ export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Di
     inventory.push({ path: relative(root, file), sha256: hash(data), bytes: data.length });
   }
   requireValue(input.sessions.every((id) => identifiers.some((entry) => entry.thread_id === id)), "missing_session_history", "checkpoint");
-  const manifest = { schema_version: 1, ...input, session_identifiers: identifiers, plan_sha256: hash(input.plan), versions, sequence, files: inventory,
+  const manifest = { schema_version: 1, ...input, permission_mode: executionMode, session_identifiers: identifiers, plan_sha256: hash(input.plan), versions, sequence, files: inventory,
     limits: { max_bytes: limit }, created_at: new Date().toISOString() };
   const encoded = JSON.stringify(manifest, null, 2) + "\n";
   for (const secret of log.protectedValues) requireValue(!encoded.includes(secret), "credential_in_manifest", "checkpoint");

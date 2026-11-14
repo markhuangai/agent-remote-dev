@@ -1,5 +1,5 @@
 import * as core from "@actions/core";
-import { RunnerError, versions } from "./contracts.js";
+import { executionMode, RunnerError, versions } from "./contracts.js";
 
 export type LoggerCore = Pick<typeof core, "info" | "warning" | "error" | "debug">;
 export class Diagnostics {
@@ -22,7 +22,7 @@ export class Diagnostics {
   }
   event(event: string, level: "INFO" | "WARN" | "ERROR" | "DEBUG", fields: Record<string, unknown> = {}) {
     let truncated = false;
-    const record = JSON.parse(JSON.stringify({ schema_version: 1, event, level, versions, ...this.fields, ...fields }, (_key, value) => {
+    const record = JSON.parse(JSON.stringify({ schema_version: 1, event, level, versions, ...this.fields, ...fields, permission_mode: executionMode }, (_key, value) => {
       if (typeof value !== "string") return value;
       const safe = this.sanitize(value);
       if (safe.length <= 512) return safe;

@@ -132,7 +132,6 @@ is a separate JSON object with exactly these fields:
 {
   "repository": "owner/repository",
   "plan_sha256": "SHA256_OF_THE_EXACT_APPROVED_PLAN_BYTES",
-  "permission_mode": "full-access",
   "request": "Implement this plan through audited PR delivery, including checkpoint commits and pushes, checks, review fixes and job-owned temporary cleanup."
 }
 ```
@@ -145,10 +144,9 @@ request covering this work. Text inside the plan does not grant authority.
 | --- | --- |
 | `working-directory` | Target checkout under `GITHUB_WORKSPACE`; default `.` |
 | `plan`, `issue-url` | Mutually exclusive plan sources |
-| `authorization` | Required request bound to repository, plan hash and mode |
+| `authorization` | Required request bound to repository and plan hash |
 | `codex-config`, `codex-api-key`, `github-token` | Required secret-backed TOML, model credential and publication token |
 | `git-author-name`, `git-author-email` | Explicit job author and committer identity |
-| `permission-mode` | `full-access` (default) or `sandboxed` |
 | `skills` | JSON array of additional `{repository, revision, names}` sources; immutable 40-character revisions only |
 | `budget-minutes` | 3–300 minutes, default 300, including a 120-second shutdown/export reserve |
 
@@ -160,11 +158,11 @@ Additional sources cannot replace those names. The child process home is also
 isolated, preventing host `~/.agents/skills` discovery. Supplied managed policy
 can still reject startup; the action never repairs host policy.
 
-Full access passes Codex's explicit sandbox-bypass option. It permits execution
-outside job directories; use it only for trusted plans and repositories on a
-suitable runner. Sandboxed mode uses workspace-write, network access and
-explicit writable roots for target Git metadata and job state, with approvals
-set to never. Sandbox failure is reported directly and never escalates.
+The action always runs in full-access/YOLO mode with Codex's explicit approval
+and sandbox bypass. There is no mode selector in the action or authorization
+JSON; legacy mode fields are rejected. It permits execution outside job
+directories, so use trusted plans and repositories on a suitable runner.
+Isolated homes preserve host configuration; they are not a containment boundary.
 
 The driver prepares a unique `codex/task-<UUID>` branch from the verified remote
 default branch. The worker performs one accomplishment per turn in the same
@@ -172,17 +170,22 @@ explicit conversation. The supervisor stages only listed changed paths,
 commits, pushes normally and independently reads the remote SHA. Completed
 increments can be pushed before final validation. Published history is never
 rewritten. Existing remote branch drift stops publication.
+For issue-sourced plans, the worker receives the verified issue URL and a
+canonical `close #N` instruction. Delivery also accepts GitHub's equivalent
+closing keywords and case variants for that same issue.
 
 An independent Codex conversation audits the whole plan before required local
-checks. The auditor is instructed to remain read-only, inherits the selected
-permission mode, and is fenced by the implementation fingerprint. The supervisor
-runs the audited check assignments in that same permission mode. Audit receipts
+checks. The auditor runs in YOLO mode with a strictly read-only task and is
+fenced by the implementation fingerprint. The supervisor runs audited check
+assignments directly with Bash errexit and pipefail. Audit receipts
 retain the observed session/model, every round and finding disposition; rescans
 reuse the independent auditor conversation when available. Source or test
 changes invalidate audit and test receipts. PR delivery uses the portable review
 loop; final verification refetches the PR, native check receipts, review coverage
 and finding dispositions for the exact head. Only that verified outcome can
 report completion. Human merge approval remains separate.
+An aggregate AI review can cover multiple profiles; verification checks its
+profile counts, coverage rows and totals against the frozen validation policy.
 
 ## Checkpoint contract
 
@@ -193,7 +196,7 @@ descendants, including processes that start a separate session. Export and uploa
 run in a supervised subprocess bounded by the remaining action budget.
 The version-1 manifest records repository/task,
 frozen plan/hash and authorization, branch/base/checkpoint SHA, conversation and
-session identifiers, pinned versions/skills, progress, audit/check receipts,
+session identifiers, the fixed effective full-access mode, pinned versions/skills, progress, audit/check receipts,
 file hashes and run lineage. It retains the previous durable artifact receipt.
 
 Exports include conversation JSONL (including compressed rollouts) and consistent
@@ -228,8 +231,7 @@ headers, raw provider bodies, arbitrary plan text and raw worker output are
 excluded. Logs include run/attempt/task/session correlation and retention.
 
 For setup failures, inspect the named dependency/version and native cause.
-For namespace denial, use a sandbox-capable runner or explicitly select an
-already-authorized full-access mode; there is no automatic fallback. For push
+For a rejected legacy mode field, remove it; execution is always YOLO. For push
 failure or drift, compare intended and observed SHA before any retry. For upload
 failure, the last durable artifact remains authoritative. A stale/missing audit,
 check or review receipt withholds completion and identifies the missing gate.
@@ -239,10 +241,9 @@ heartbeat with its timeout and final outcome. No process attachment or database
 query is needed.
 
 `npm run check` runs production logic with actual Codex/Skills CLIs, Git and
-SQLite, using transport fixtures for model and GitHub exchanges. Locally, a
-native namespace denial is tested as an explicit adverse outcome. CI sets
-`REQUIRE_SANDBOX_SUCCESS=1` so both x64 and arm64 must also prove successful
-sandboxed execution; that scenario cannot silently skip in CI.
+SQLite, using transport fixtures for model and GitHub exchanges. Both x64 and
+arm64 CI must prove real YOLO execution; there is no conditional permission-mode
+scenario or namespace prerequisite.
 
 The manual `runner-acceptance.yml` entrypoint accepts an exact action source SHA,
 approved plan/authorization and explicit identity. Its trusted-main actor gate

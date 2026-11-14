@@ -26,13 +26,17 @@ export class TaskGit {
   }
   async changedPaths() {
     const changed = await this.run(["ls-files", "-m", "-d", "-o", "--exclude-standard", "-z"]);
-    const staged = await this.run(["diff", "--cached", "--name-only", "-z"]);
-    return [...new Set((changed + staged).split("\0").filter(Boolean))].sort();
+    const staged = await this.run(["diff", "--cached", "--name-only", "--no-renames", "-z"]);
+    const unstaged = await this.run(["diff", "--name-only", "--no-renames", "--ignore-submodules=none", "-z"]);
+    return [...new Set((changed + staged + unstaged).split("\0").filter(Boolean))].sort();
+  }
+  async gitlinks() {
+    return new Map((await this.run(["ls-files", "--stage", "-z"])).split("\0").filter((entry) => entry.startsWith("160000 "))
+      .map((entry) => [entry.slice(entry.indexOf("\t") + 1), entry.split(" ")[1]]));
   }
   async fingerprint() {
     const digest = createHash("sha256");
-    const gitlinks = new Map((await this.run(["ls-files", "--stage", "-z"])).split("\0").filter((entry) => entry.startsWith("160000 "))
-      .map((entry) => [entry.slice(entry.indexOf("\t") + 1), entry.split(" ")[1]]));
+    const gitlinks = await this.gitlinks();
     const paths = [...new Set((await this.run(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean))].sort();
     for (const path of paths) {
       digest.update(path + "\0");
@@ -67,11 +71,17 @@ export class TaskGit {
     requireValue(paths.every((path) => path.length > 0 && !path.startsWith("/") && !path.split("/").some((part) => ["..", ".git"].includes(part)) && !path.includes("\0")), "unsafe_commit_path", "publication");
     requireValue(JSON.stringify([...new Set(paths)].sort()) === JSON.stringify(await this.changedPaths()), "unlisted_worktree_changes", "publication");
     requireValue(!message.includes("\0") && message.length <= 512, "invalid_commit_message", "publication");
+    const gitlinks = await this.gitlinks();
     for (const path of paths) {
       let bytes: Buffer;
       try {
         const stat = await lstat(join(this.cwd, path));
-        bytes = stat.isSymbolicLink() ? Buffer.from(await readlink(join(this.cwd, path))) : await readFile(join(this.cwd, path));
+        if (stat.isDirectory() && gitlinks.has(path)) {
+          const nested = new TaskGit(join(this.cwd, path), this.env, this.log, this.branch);
+          requireValue((await nested.run(["rev-parse", "--show-toplevel"])).trim() === nested.cwd, "uninitialized_submodule", "publication");
+          requireValue((await nested.changedPaths()).length === 0, "dirty_submodule", "publication");
+          bytes = Buffer.from(await nested.head());
+        } else bytes = stat.isSymbolicLink() ? Buffer.from(await readlink(join(this.cwd, path))) : await readFile(join(this.cwd, path));
       } catch (error: any) { if (error.code === "ENOENT") continue; throw error; }
       for (const secret of this.log.protectedValues) requireValue(!bytes.includes(Buffer.from(secret)), "credential_in_commit", "publication");
     }

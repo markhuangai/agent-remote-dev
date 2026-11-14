@@ -21,9 +21,9 @@ execution for each language, including partial reruns; a successful parent does
 not override a failed, missing, skipped, or ambiguous child. These workflows
 validate the exact PR head rather than a mutable branch name.
 
-Full CI runs automatically. CI requires successful real sandbox execution on
-both architectures. On a host denying namespaces, local CLI tests verify the
-explicit failure path without claiming successful sandbox execution. There is
+Full CI runs automatically. The action supports full-access/YOLO execution only,
+with no mode selector. CI requires successful real YOLO execution on both
+architectures. There is
 no review-first controller, validation label, container image, shared database,
 or pre-PR remote development-test route. The manual acceptance entrypoint is
 reserved for explicitly authorized live qualification after its prerequisites land.

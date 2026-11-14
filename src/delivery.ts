@@ -6,6 +6,24 @@ import { command } from "./process.js";
 import { Diagnostics } from "./diagnostics.js";
 import { hash, object, parseJson, requireValue, RunnerError, shaPattern, ValidationPolicy } from "./contracts.js";
 
+function aggregateCoverage(body: string, profiles: number) {
+  const header = "| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |";
+  const start = body.indexOf(header);
+  if (start < 0) return false;
+  const lines = body.slice(start).split(/\r?\n/);
+  const end = lines.findIndex((line) => !line.trim().startsWith("|"));
+  const rows = lines.slice(2, end < 0 ? lines.length : end).map((line) => line.split("|").slice(1, -1).map((cell) => cell.replaceAll("**", "").trim()));
+  const files = rows.filter((row) => row[0]?.startsWith("<code>")), totals = rows.filter((row) => row[0] === "Total");
+  const number = (value: string) => /^[0-9,]+$/.test(value) ? Number(value.replaceAll(",", "")) : NaN;
+  if (!files.length || totals.length !== 1 || rows.length !== files.length + 1) return false;
+  if (!files.every((row) => row.length === 6 && Number.isSafeInteger(number(row[1])) && number(row[1]) >= 0 &&
+      number(row[1]) === number(row[2]) && row[3] === "100%" && number(row[4]) === profiles && number(row[5]) === profiles)) return false;
+  const total = totals[0];
+  return total.length === 6 && total[3] === "100%" && number(total[5]) === profiles &&
+    number(total[1]) === files.reduce((sum, row) => sum + number(row[1]), 0) &&
+    number(total[2]) === files.reduce((sum, row) => sum + number(row[2]), 0);
+}
+
 export function reviewSurfaces(state: any) {
   const surfaces: { surface_kind: string; id: string; body_sha256: string; thread?: any }[] = [];
   for (const [kind, records] of [["review", state.reviews ?? []], ["comment", state.conversation_comments ?? []]] as const) {
@@ -57,12 +75,12 @@ export function verifyReviewState(state: any, head: string, policy: ValidationPo
     throw new RunnerError("unfinished_review_dispositions", "delivery", "Review state is stale or has unfinished inline dispositions.", { expected_sha: head, observed_sha: state?.pull_request?.head_sha,
       codex_incomplete: state.codex_thread_actions?.incomplete, marked_review_incomplete: state.ai_pr_reviewer_thread_actions?.incomplete });
   }
-  const marked = new Set<string>();
+  const marked = new Map<string, string>();
   for (const review of state.reviews ?? []) {
     const marker = typeof review.body === "string" ? review.body.match(/^<!-- ai-pr-reviewer:v3:([a-f0-9]{40}):([a-f0-9]{64}) -->/) : null;
-    if (marker?.[1] === head && review.commit?.oid === head) marked.add(marker[2]);
+    if (marker?.[1] === head && review.commit?.oid === head) marked.set(marker[2], review.body);
   }
-  if (marked.size < policy.marked_review_count) throw new RunnerError("incomplete_ai_review_coverage", "delivery", "Current-head AI review coverage is incomplete.",
+  if (marked.size < policy.marked_review_count && ![...marked.values()].some((body) => aggregateCoverage(body, policy.marked_review_count))) throw new RunnerError("incomplete_ai_review_coverage", "delivery", "Current-head AI review coverage is incomplete.",
     { expected_sha: head, expected_review_count: policy.marked_review_count, observed_review_count: marked.size });
   verifyDispositions(state, dispositions);
 }
@@ -76,7 +94,8 @@ export async function verifyDelivery(input: { job: Job; git: TaskGit; log: Diagn
   const checkPull = (pull: any) => requireValue(pull.state === "open" && pull.draft === false && pull.user?.login === login &&
     pull.head?.sha === head && pull.head?.ref === git.branch && pull.head?.repo?.full_name === repository &&
     pull.base?.ref === baseBranch && pull.base?.repo?.full_name === repository &&
-    (!input.issueNumber || (typeof pull.body === "string" && pull.body.split(/\r?\n/).some((line: string) => line === `close #${input.issueNumber}`))), "pr_identity_mismatch", "delivery");
+    (!input.issueNumber || (typeof pull.body === "string" && pull.body.split(/\r?\n/).some((line: string) =>
+      /^(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+#([1-9][0-9]*)$/i.exec(line.trim())?.[1] === input.issueNumber))), "pr_identity_mismatch", "delivery");
   checkPull(parseJson(await api(), "delivery_pr"));
   const receipt = await readJobReceipt(job, input.receiptPath);
   requireValue(receipt.state === "automation_clean" && object(receipt.terminal_receipt), "missing_review_loop_receipt", "delivery");

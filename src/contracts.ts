@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 
 export const versions = { codex: "0.169.0", skills_cli: "1.8.1", artifact_sdk: "6.3.1", execution_skills: "224a5be4ddf40c6cf0a50b97885cb353e8522e2e" };
 export const shaPattern = /^[a-f0-9]{40}$/;
-export type PermissionMode = "full-access" | "sandboxed";
+export const executionMode = "full-access";
 export type Status = "completed" | "incomplete" | "blocked" | "failed";
-export type Authorization = { repository: string; plan_sha256: string; permission_mode: PermissionMode; request: string };
+export type Authorization = { repository: string; plan_sha256: string; request: string };
 export type SkillSource = { repository: string; revision: string; names: string[] };
 export type ValidationPolicy = { checks: string[]; reviewers: string[]; local_checks: string[]; marked_review_count: number };
 export const blockerReasons = ["plan_decision_required", "missing_dependency", "authentication_failed", "permission_denied", "audit_blocked", "validation_failed", "review_unavailable", "out_of_scope"] as const;
@@ -28,11 +28,10 @@ export function parseJson(value: string, stage: string): any {
 export function object(value: unknown): value is Record<string, any> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-export function authorize(raw: string, repository: string, plan: string, mode: string): Authorization {
-  requireValue(mode === "full-access" || mode === "sandboxed", "unsupported_permission_mode");
+export function authorize(raw: string, repository: string, plan: string): Authorization {
   const value = parseJson(raw, "authorization");
-  requireValue(object(value) && Object.keys(value).sort().join() === "permission_mode,plan_sha256,repository,request", "invalid_authorization");
-  requireValue(value.repository === repository && value.plan_sha256 === hash(plan) && value.permission_mode === mode,
+  requireValue(object(value) && Object.keys(value).sort().join() === "plan_sha256,repository,request", "invalid_authorization", "authorization");
+  requireValue(value.repository === repository && value.plan_sha256 === hash(plan),
     "authorization_mismatch", "authorization");
   requireValue(typeof value.request === "string" && value.request.trim().length > 0, "missing_direct_request", "authorization");
   return value as Authorization;

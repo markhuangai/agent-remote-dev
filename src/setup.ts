@@ -45,9 +45,11 @@ export async function installTools(job: Job, actionRoot: string, log: Diagnostic
   for (const file of ["package.json", "package-lock.json"]) await cp(join(actionRoot, file), join(job.tools, file));
   await command("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: job.tools, env: job.env, stage: "tool_install", log });
   const actual = (await command(join(job.tools, "node_modules/.bin/codex"), ["--version"], { cwd: job.tools, env: job.env, stage: "codex_version", log })).trim();
-  requireValue(actual === `codex-cli ${versions.codex}`, "codex_version_mismatch", "setup");
+  if (actual !== `codex-cli ${versions.codex}`) throw new RunnerError("codex_version_mismatch", "setup", "Installed Codex does not match the pinned version.",
+    { dependency: "codex", expected_version: versions.codex, observed_version: actual });
   const skillsPackage = JSON.parse(await readFile(join(job.tools, "node_modules/skills/package.json"), "utf8"));
-  requireValue(skillsPackage.version === versions.skills_cli, "skills_version_mismatch", "setup");
+  if (skillsPackage.version !== versions.skills_cli) throw new RunnerError("skills_version_mismatch", "setup", "Installed Skills CLI does not match the pinned version.",
+    { dependency: "skills", expected_version: versions.skills_cli, observed_version: typeof skillsPackage.version === "string" ? skillsPackage.version : "invalid package metadata" });
 }
 export async function safeTree(root: string) {
   requireValue(!(await lstat(root)).isSymbolicLink(), "symlink_not_allowed", "filesystem");

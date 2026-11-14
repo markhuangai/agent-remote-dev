@@ -1,5 +1,5 @@
 name: Codex plan runner
-description: Execute an authorized plan on Linux and export verified accomplishment checkpoints
+description: Execute an authorized plan in full-access/YOLO mode on Linux and export verified checkpoints
 inputs:
   working-directory:
     description: Checked-out target directory relative to GITHUB_WORKSPACE
@@ -9,7 +9,7 @@ inputs:
   issue-url:
     description: GitHub issue URL in the checked-out repository; mutually exclusive with plan
   authorization:
-    description: JSON with repository, plan_sha256, permission_mode, and the direct delivery request
+    description: JSON with repository, plan_sha256, and the direct delivery request
     required: true
   codex-config:
     description: Secret-backed Codex config.toml contents
@@ -26,9 +26,6 @@ inputs:
   git-author-email:
     description: Explicit author and committer email for this job
     required: true
-  permission-mode:
-    description: full-access or sandboxed; must match the authorization
-    default: full-access
   skills:
     description: JSON array of additional repository, revision (full SHA), and names skill sources
     default: '[]'

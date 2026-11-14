@@ -31,6 +31,8 @@ export async function main() {
   try {
     requireValue(process.platform === "linux" && ["x64", "arm64"].includes(process.arch) && Number(process.versions.node.split(".")[0]) === 24,
       "unsupported_platform", "setup");
+    if (get("permission-mode").trim()) throw new RunnerError("unsupported_mode_input", "preflight",
+      "This action always runs in full-access/YOLO mode. Remove the retired permission-mode input.");
     const repository = process.env.GITHUB_REPOSITORY ?? "";
     requireValue(/^[\w.-]+\/[\w.-]+$/.test(repository) && process.env.GITHUB_SERVER_URL === "https://github.com", "unsupported_repository");
     const token = get("github-token", true), key = get("codex-api-key", true), config = get("codex-config", true);
@@ -41,7 +43,6 @@ export async function main() {
     const cwd = await realpath(resolve(workspace, get("working-directory") || "."));
     requireValue(cwd === workspace || cwd.startsWith(workspace + sep), "workspace_escape");
     const source = selectPlanSource(get("plan"), get("issue-url"), repository);
-    const mode = get("permission-mode") || "full-access";
     const budget = Number(get("budget-minutes") || "300");
     requireValue(Number.isFinite(budget) && budget >= 3 && budget <= 300, "invalid_budget");
     deadlineTimer = setTimeout(() => {
@@ -54,7 +55,7 @@ export async function main() {
     const currentJob = job;
     job.env.CODEX_TASK_DEADLINE_MS = String(started + budget * 60000);
     await configure(job, config, log);
-    log.fields = { ...log.fields, permission_mode: mode, platform: process.platform, architecture: process.arch, job_root: job.root };
+    log.fields = { ...log.fields, platform: process.platform, architecture: process.arch, job_root: job.root };
     const api = async (endpoint: string) => parseJson(await command("gh", ["api", endpoint], { cwd, env: currentJob.env, stage: "preflight_api", log }), "github_api");
     const login = (await api("user")).login;
     const repo = await api(`repos/${repository}`);
@@ -68,7 +69,7 @@ export async function main() {
       plan = issue.body;
     }
     requireValue(plan !== null, "missing_plan");
-    const authorization = authorize(get("authorization", true), repository, plan, mode);
+    const authorization = authorize(get("authorization", true), repository, plan);
     const taskId = randomUUID(), branch = `codex/task-${taskId}`;
     log.fields = { ...log.fields, task_id: taskId, branch, plan_sha256: hash(plan), actor: login };
     const git = new TaskGit(cwd, job.env, log, branch);
@@ -86,7 +87,7 @@ export async function main() {
     log.event("runtime.setup", "INFO", { stage: "ready", base_sha: base, outcome: "ready", budget_ms: budget * 60000 });
     activeStage = "driver";
     const result = await drive({ job, git, log, plan, planSource: source.issueNumber ? get("issue-url") : "inline", authorization,
-      repository, taskId, base, skills: sources, budgetMs: budget * 60000, started,
+      repository, taskId, base, issueNumber: source.issueNumber, skills: sources, budgetMs: budget * 60000, started,
       lineage: { repository, workflow_ref: process.env.GITHUB_WORKFLOW_REF, workflow_sha: process.env.GITHUB_WORKFLOW_SHA,
         run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT, actor: login },
       checkpoint: async (input) => {

@@ -6,17 +6,17 @@ import { createServer } from "node:http";
 import { zstdCompressSync } from "node:zlib";
 import test from "node:test";
 import { authorize, executionSource, hash, parseTurn, skillSources } from "../.build/contracts.js";
-import { configure, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
+import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
 import { exportCheckpoint, durableCheckpoint } from "../.build/checkpoint.js";
 import { isolatedCheckpoint } from "../.build/checkpoint-worker.js";
 import { TaskGit } from "../.build/git.js";
 import { reviewSurfaces, verifyReviewState, verifyTerminal } from "../.build/delivery.js";
 import { selectPlanSource } from "../.build/main.js";
 import { command } from "../.build/process.js";
-import { exec, fixture, logger, portableSource, repository, root, turn, policy } from "./helpers.mjs";
+import { exec, fixture, logger, portableSource, repository, root, skillTransport, turn, policy } from "./helpers.mjs";
 
 const plan = "Implement the fixture plan.\n";
-const auth = { repository: "fixture/repo", plan_sha256: hash(plan), permission_mode: "full-access", request: "Implement and deliver this plan, with checkpoint pushes." };
+const auth = { repository: "fixture/repo", plan_sha256: hash(plan), request: "Implement and deliver this plan, with checkpoint pushes." };
 const checkpoint = (extra = {}) => ({ task_id: "fixture-task", repository: "fixture/repo", branch: "codex/fixture-task", base_sha: "a".repeat(40), checkpoint_sha: "b".repeat(40),
   plan, plan_source: "inline", authorization: auth, sessions: ["fixture-session"], skills: [executionSource], progress: { completed: ["fixture"] }, lineage: { run_id: "13" }, audit: null, previous: null, ...extra });
 async function history(f, content = "completed turn") {
@@ -24,14 +24,19 @@ async function history(f, content = "completed turn") {
   const data = JSON.stringify({ type: "session_meta", payload: { id: "fixture-session", session_id: "root-session" } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
   await writeFile(join(f.job.codexHome, "sessions/rollout.jsonl"), data);
 }
-test("plan selection and direct authorization bind exact bytes, repository and permission mode", () => {
+test("plan selection and direct authorization bind exact bytes and repository without a mode selector", () => {
   assert.equal(selectPlanSource(plan, "", "fixture/repo").plan, plan);
   assert.equal(selectPlanSource("", "https://github.com/fixture/repo/issues/2", "fixture/repo").issueNumber, "2");
   for (const args of [[plan,"https://github.com/fixture/repo/issues/2"], ["", ""], ["", "https://github.com/other/repo/issues/2"]]) assert.throws(() => selectPlanSource(...args, "fixture/repo"));
-  assert.deepEqual(authorize(JSON.stringify(auth), "fixture/repo", plan, "full-access"), auth);
-  for (const changed of [{ ...auth, permission_mode: "sandboxed" }, { ...auth, plan_sha256: hash(plan.trim()) }, { ...auth, request: "" }, { ...auth, repository: "other/repo" }]) {
-    assert.throws(() => authorize(JSON.stringify(changed), "fixture/repo", plan, "full-access"));
+  assert.deepEqual(authorize(JSON.stringify(auth), "fixture/repo", plan), auth);
+  for (const changed of [{ ...auth, permission_mode: "sandboxed" }, { ...auth, permission_mode: "full-access" }, { ...auth, plan_sha256: hash(plan.trim()) }, { ...auth, request: "" }, { ...auth, repository: "other/repo" }]) {
+    assert.throws(() => authorize(JSON.stringify(changed), "fixture/repo", plan));
   }
+});
+test("the actual bundled entry rejects retired mode inputs before configuration or execution",async()=>{
+  for(const mode of ["sandboxed","full-access"]) await assert.rejects(exec(process.execPath,[join(root,"dist/index.js")],{
+    env:{...process.env,"INPUT_PERMISSION-MODE":mode,GITHUB_REPOSITORY:"fixture/repo",GITHUB_SERVER_URL:"https://github.com"},
+  }),error=>{assert.equal(error.code,1);assert.match(error.stdout,/unsupported_mode_input/);assert.doesNotMatch(error.stdout,/runtime\.setup|runtime\.operation/);return true;});
 });
 test("skill sources preserve the three immutable defaults and refuse collisions and mutable refs", () => {
   assert.deepEqual(skillSources("[]"), [executionSource]);
@@ -65,6 +70,31 @@ test("actual Skills CLI installs complete pinned portable packages outside proje
   assert.deepEqual(await readdir(root), before);
   await assert.rejects(installSkillSource(f.job, { ...executionSource, names:["missing-skill"] }, source, 1, f.log));
 });
+test("real locked tool installation rejects a mismatched installed Skills CLI version",async(t)=>{
+  const f=await fixture(t),action=join(f.temporary,"action-source");await mkdir(action);
+  await writeFile(join(action,"package.json"),JSON.stringify({name:"fixture-tools",private:true,version:"0.0.0",dependencies:{"@openai/codex":"0.169.0",skills:"1.8.0"}}));
+  await exec("npm",["install","--package-lock-only","--ignore-scripts","--no-audit","--no-fund"],{cwd:action,env:f.job.env,maxBuffer:1024*1024});
+  await assert.rejects(installTools(f.job,action,f.log),error=>{
+    assert.equal(error.reason,"skills_version_mismatch");assert.equal(error.details.expected_version,"1.8.1");assert.equal(error.details.observed_version,"1.8.0");
+    f.log.failure(error);return true;
+  });
+  assert.ok(f.records.some(record=>record.event==="runtime.operation"&&record.stage==="codex_version"&&record.outcome==="success"));
+});
+for(const scenario of ["valid","revision","traversal","symlink"]) test(`actual skill source fetch enforces ${scenario} archive/revision decisions`,async(t)=>{
+  const f=await fixture(t),archive=join(f.temporary,"source.tar.gz");
+  await exec("python3",["-c",`import io,sys,tarfile
+with tarfile.open(sys.argv[1],"w:gz") as archive:
+    item=tarfile.TarInfo("root/../escape" if sys.argv[2]=="traversal" else "root/file.txt")
+    if sys.argv[2]=="symlink":
+        item.type=tarfile.SYMTYPE;item.linkname="../../outside";archive.addfile(item)
+    else:
+        data=b"fixture source";item.size=len(data);archive.addfile(item,io.BytesIO(data))
+`,archive,scenario]);
+  await skillTransport(f,scenario==="revision"?"a".repeat(40):executionSource.revision,archive);
+  const operation=()=>fetchSkillSource(f.job,executionSource,0,f.log);
+  if(scenario==="valid")assert.equal(await readFile(join(await operation(),"file.txt"),"utf8"),"fixture source");
+  else await assert.rejects(operation(),{reason:{revision:"skill_revision_mismatch",traversal:"unsafe_skill_archive",symlink:"linked_skill_archive"}[scenario]});
+});
 test("safe tree and cleanup refuse export symlinks and never follow cleanup links into other files", async (t) => {
   const f = await fixture(t), outside = join(f.temporary, "outside");
   await writeFile(outside, "retain"); await symlink(outside, join(f.job.home, "alias"));
@@ -87,7 +117,7 @@ test("actual Git publication verifies pushed commits, upstream, deletions and re
   const removed = await git.publish(["greeting.js"], "Remove unstaged fixture file", next, next);
   assert.equal(await git.remoteHead(), removed);
 });
-test("real initialized submodule fingerprints cover clean, dirty and untracked content",async(t)=>{
+test("real submodule fingerprints and publication preserve clean references and reject unpublished child work",async(t)=>{
   const f=await fixture(t),r=await repository(f),source=join(f.temporary,"module-source");
   await mkdir(source);
   const moduleGit=async(...args)=>exec("git",args,{cwd:source,env:f.job.env});
@@ -101,6 +131,24 @@ test("real initialized submodule fingerprints cover clean, dirty and untracked c
   await writeFile(join(r.cwd,"module/value.txt"),"original\n");assert.equal(await git.fingerprint(),clean);
   await writeFile(join(r.cwd,"module/untracked.txt"),"one");const untracked=await git.fingerprint();
   await writeFile(join(r.cwd,"module/untracked.txt"),"two");assert.notEqual(await git.fingerprint(),untracked);
+  await unlink(join(r.cwd,"module/untracked.txt"));
+  const parent=await git.publish([],"",await git.head(),null);
+  await writeFile(join(source,"value.txt"),"published update\n");await moduleGit("commit","-am","Update module fixture");
+  const moduleHead=(await moduleGit("rev-parse","HEAD")).stdout.trim();
+  await exec("git",["-C",join(r.cwd,"module"),"fetch","origin"],{env:f.job.env});
+  await exec("git",["-C",join(r.cwd,"module"),"checkout","--detach",moduleHead],{env:f.job.env});
+  const published=await git.publish(["module"],"Publish module reference",parent,parent);
+  assert.equal(await git.remoteHead(),published);assert.match(await r.git("ls-tree","HEAD","module"),new RegExp(moduleHead));
+  await writeFile(join(r.cwd,"module/value.txt"),"unpublished work\n");
+  await assert.rejects(git.publish(["module"],"Invalid child work",published,published),{reason:"dirty_submodule"});
+  assert.equal(await git.head(),published);assert.equal(await git.remoteHead(),published);
+});
+test("publication rejects a staged credential without advancing local or remote history",async(t)=>{
+  const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);
+  await writeFile(join(r.cwd,"credential.txt"),f.job.env.CODEX_API_KEY);await r.git("add","credential.txt");
+  await assert.rejects(git.publish(["credential.txt"],"Rejected fixture",r.base,null),{reason:"credential_in_commit"});
+  assert.equal(await git.head(),r.base);assert.equal(await git.remoteHead(),null);
+  assert.equal(await r.git("diff","--cached","--name-only"),"credential.txt");
 });
 test("real rejected push records intended/observed SHA and never pretends it is durable", async (t) => {
   const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
@@ -127,6 +175,7 @@ test("checkpoint exports exact session state and consistent SQLite backups, excl
   const saved = new DatabaseSync(join(output.root, "codex/state_5.sqlite"), { readOnly: true });
   assert.equal(saved.prepare("SELECT value FROM progress").get().value, "durable"); saved.close();
   const manifest = JSON.parse(await readFile(join(output.root, "manifest.json"), "utf8"));
+  assert.equal(manifest.permission_mode,"full-access");assert.ok(!Object.hasOwn(manifest.authorization,"permission_mode"));
   assert.equal(manifest.plan_sha256, hash(plan)); assert.equal(manifest.session_identifiers[0].session_id, "root-session");
   assert.ok(manifest.files.every((entry) => !/auth|config|cache|\.git/.test(entry.path)));
   assert.ok(output.files.every((file) => !/-(wal|shm)$/.test(file)));
@@ -177,6 +226,24 @@ test("required checks, marked review coverage and dispositions reject stale or i
   const finding={...state,reviews:[{...state.reviews[0],body:state.reviews[0].body+"\nP1: Missing authorization validation"}]};
   assert.throws(()=>verifyReviewState(finding,head,p,[]),{reason:"review_surface_coverage_mismatch"});
   assert.throws(()=>verifyReviewState(finding,head,p,ledger),{reason:"unhandled_review_surface"});
+});
+test("the actual v3 aggregate coverage format proves all profiles and rejects partial or inconsistent receipts",()=>{
+  const head="a".repeat(40),validation={...policy,marked_review_count:6};
+  const body=`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->
+## AI review
+| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
+|:--|--:|--:|--:|--:|--:|
+| <code>src/entry.ts</code> | 5 | 5 | 100% | 6 | 6 |
+| <code>src/main.ts</code> | 113 | 113 | 100% | 6 | 6 |
+| **Total** | **118** | **118** | **100%** | — | **6** |
+
+Coverage does not measure review quality or completion.`;
+  const state={pull_request:{head_sha:head},codex_thread_actions:{incomplete:0},ai_pr_reviewer_thread_actions:{incomplete:0},reviews:[{id:"aggregate",commit:{oid:head},body}]};
+  const verify=value=>verifyReviewState(value,head,validation,reviewSurfaces(value).map(surface=>({...surface,decision:"not_finding",reason:"Fixture coverage only",fix_sha:null})));
+  verify(state);
+  for(const changed of [body.replace("100% | 6 | 6","80% | 6 | 6"),body.replace("100% | 6 | 6","100% | 5 | 6"),body.replace("**118** | **118**","**119** | **118**"),body.replace(head,"b".repeat(40))]) {
+    assert.throws(()=>verify({...state,reviews:[{...state.reviews[0],body:changed}]}),{reason:"incomplete_ai_review_coverage"});
+  }
 });
 test("real process timeout stops managed descendants and preserves a diagnostic cause", async (t) => {
   const f = await fixture(t);

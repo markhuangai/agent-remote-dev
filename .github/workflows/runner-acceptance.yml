@@ -14,14 +14,9 @@ on:
         description: Approved issue URL in this repository, mutually exclusive with plan
         type: string
       authorization:
-        description: JSON binding the direct delivery request to repository, plan hash and permission mode
+        description: JSON binding the direct YOLO delivery request to repository and plan hash
         required: true
         type: string
-      permission-mode:
-        description: Explicit execution permission mode
-        type: choice
-        options: [full-access, sandboxed]
-        default: full-access
       git-author-name:
         description: Authorized job Git author and committer name
         required: true
@@ -48,7 +43,6 @@ jobs:
           INLINE_PLAN: ${{ inputs.plan }}
           ISSUE_URL: ${{ inputs.issue-url }}
           DELIVERY_AUTHORIZATION: ${{ inputs.authorization }}
-          PERMISSION_MODE: ${{ inputs.permission-mode }}
         with:
           script: |
             const { createHash } = require('node:crypto');
@@ -73,9 +67,11 @@ jobs:
             try { authorization = JSON.parse(process.env.DELIVERY_AUTHORIZATION); }
             catch { throw new Error('Invalid authorization JSON'); }
             const hash = createHash('sha256').update(plan).digest('hex');
-            if (authorization.repository !== repository || authorization.plan_sha256 !== hash ||
-                authorization.permission_mode !== process.env.PERMISSION_MODE || !authorization.request?.trim()) {
-              throw new Error('Authorization does not bind this plan and permission mode');
+            if (!authorization || typeof authorization !== 'object' || Array.isArray(authorization) ||
+                Object.keys(authorization).sort().join() !== 'plan_sha256,repository,request' ||
+                authorization.repository !== repository || authorization.plan_sha256 !== hash ||
+                typeof authorization.request !== 'string' || !authorization.request.trim()) {
+              throw new Error('Authorization must bind this plan and repository without a mode selector');
             }
             core.info(JSON.stringify({ event: 'runtime.acceptance', source_sha: sha, plan_sha256: hash,
               actor: context.actor, workflow_sha: process.env.GITHUB_WORKFLOW_SHA, outcome: 'authorized' }));
@@ -101,7 +97,6 @@ jobs:
           plan: ${{ inputs.plan }}
           issue-url: ${{ inputs.issue-url }}
           authorization: ${{ inputs.authorization }}
-          permission-mode: ${{ inputs.permission-mode }}
           git-author-name: ${{ inputs.git-author-name }}
           git-author-email: ${{ inputs.git-author-email }}
           codex-config: ${{ secrets.CODEX_CONFIG_TOML }}

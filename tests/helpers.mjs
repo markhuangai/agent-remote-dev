@@ -123,7 +123,7 @@ else if (args.includes('graphql')) {
  const connection={nodes:[],pageInfo:{hasNextPage:false,endCursor:null}};
  result={data:{repository:{pullRequest:{comments:connection,reviews:connection,reactions:connection,reviewThreads:connection}}}};
 } else if (args.includes('user')) { if(args.includes('--jq')) {process.stdout.write('fixture-actor');process.exit(0);} result={login:'fixture-actor'}; }
-else if(endpoint?.includes('/pulls/')) result={state:'open',draft:false,user:{login:'fixture-actor'},head:{sha:state.stale?'b'.repeat(40):sha,ref:branch,repo:{full_name:'fixture/repo'}},base:{ref:'main',repo:{full_name:'fixture/repo'}}};
+else if(endpoint?.includes('/pulls/')) result={state:'open',draft:false,body:state.body||'',user:{login:'fixture-actor'},head:{sha:state.stale?'b'.repeat(40):sha,ref:branch,repo:{full_name:'fixture/repo'}},base:{ref:'main',repo:{full_name:'fixture/repo'}}};
 else if(endpoint?.includes('/actions/runs')) result={workflow_runs:[]};
 else if(endpoint?.includes('/statuses')) result=[];
 else { process.stderr.write('Unexpected fixture GitHub request'); process.exit(1); }
@@ -131,4 +131,15 @@ if(args.includes('--slurp')) result=[result];
 process.stdout.write(JSON.stringify(result));
 `, { mode: 0o700 });
   f.job.env.PATH = `${bin}:${f.job.env.PATH}`;
+}
+export async function skillTransport(f, revision, archive) {
+  const bin=join(f.job.root,"skill-api-bin");await mkdir(bin);
+  await writeFile(join(bin,"gh"),`#!/usr/bin/env node
+const fs=require('node:fs');
+const endpoint=process.argv[3]||'';
+if(endpoint.includes('/commits/'))process.stdout.write(JSON.stringify({sha:${JSON.stringify(revision)}}));
+else if(endpoint.includes('/tarball/'))process.stdout.write(fs.readFileSync(${JSON.stringify(archive)}));
+else{process.stderr.write('Unexpected skill transport endpoint');process.exitCode=1;}
+`,{mode:0o700});
+  f.job.env.PATH=`${bin}:${f.job.env.PATH}`;
 }
