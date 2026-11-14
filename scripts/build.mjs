@@ -24,7 +24,7 @@ export async function clean(path) {
   await rmdir(path);
 }
 export async function build(destination) {
-  await promisify(execFile)(process.execPath, [join(root, "node_modules/@vercel/ncc/dist/ncc/cli.js"), "build", "src/entry.ts", "-o", destination, "--license", "licenses.txt"], { cwd: root });
+  await promisify(execFile)(process.execPath, [join(root, "node_modules/@vercel/ncc/dist/ncc/cli.js"), "build", "src/entry.ts", "-o", destination, "--minify", "--license", "licenses.txt"], { cwd: root });
   await cp(join(root,"src/supervise.py"),join(destination,"supervise.py"));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

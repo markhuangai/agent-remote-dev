@@ -1,4 +1,4 @@
-import { lstat, readFile, readlink } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { command } from "./process.js";
@@ -31,13 +31,28 @@ export class TaskGit {
   }
   async fingerprint() {
     const digest = createHash("sha256");
+    const gitlinks = new Map((await this.run(["ls-files", "--stage", "-z"])).split("\0").filter((entry) => entry.startsWith("160000 "))
+      .map((entry) => [entry.slice(entry.indexOf("\t") + 1), entry.split(" ")[1]]));
     const paths = [...new Set((await this.run(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean))].sort();
     for (const path of paths) {
       digest.update(path + "\0");
       try {
         const stat = await lstat(join(this.cwd, path));
         digest.update(stat.isSymbolicLink() ? "symlink" : String(stat.mode & 0o777));
-        digest.update(stat.isSymbolicLink() ? await readlink(join(this.cwd, path)) : await readFile(join(this.cwd, path)));
+        if (stat.isDirectory() && gitlinks.has(path)) {
+          const directory = join(this.cwd, path);
+          digest.update(gitlinks.get(path)!);
+          let initialized = false;
+          try { await lstat(join(directory, ".git")); initialized = true; }
+          catch (error: any) { if (error.code !== "ENOENT") throw error; }
+          if (initialized) {
+            const nested = new TaskGit(directory, this.env, this.log, this.branch);
+            digest.update(await nested.head()); digest.update(await nested.fingerprint());
+          } else {
+            requireValue((await readdir(directory)).length === 0, "uninitialized_submodule_has_files", "git");
+            digest.update("uninitialized");
+          }
+        } else digest.update(stat.isSymbolicLink() ? await readlink(join(this.cwd, path)) : await readFile(join(this.cwd, path)));
       } catch (error: any) { if (error.code === "ENOENT") digest.update("deleted"); else throw error; }
       digest.update("\0");
     }

@@ -27,8 +27,8 @@ export async function runCodex(job: Job, cwd: string, mode: PermissionMode | "re
       try { value = JSON.parse(line); } catch { return; }
       if (value.type === "thread.started" && typeof value.thread_id === "string") observed = value.thread_id;
       const output = value.item?.aggregated_output ?? value.item?.message;
-      if (mode !== "full-access" && typeof output === "string" && /bwrap: No permissions to create (?:a )?new namespace/.test(output)) {
-        sandboxCause = output.split("\n").find((line: string) => line.includes("bwrap: No permissions"));
+      if (mode !== "full-access" && typeof output === "string" && /^bwrap: /m.test(output)) {
+        sandboxCause = output.split("\n").find((line: string) => line.startsWith("bwrap: "));
       }
     },
   });

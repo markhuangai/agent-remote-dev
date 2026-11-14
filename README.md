@@ -119,7 +119,9 @@ The action supports Linux x64/arm64 on GitHub.com. The runner needs Git, npm,
 GitHub CLI and Python 3.12+. The JavaScript entrypoint uses Node 24; subprocesses
 use that same Node executable. It installs locked runtime dependencies under
 `RUNNER_TEMP`; no host package, Codex home, Git identity or authentication file
-is changed. The target must be a clean checkout whose `origin` is its GitHub
+is changed. The artifact worker loads its pinned SDK from that installation;
+the committed minified entry bundle does not duplicate the SDK's dependency tree.
+The target must be a clean checkout whose `origin` is its GitHub
 HTTPS URL. Set `persist-credentials: false` on checkout.
 
 Pass exactly one of `plan` (preserved verbatim) or `issue-url` (an open issue in

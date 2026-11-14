@@ -109,10 +109,10 @@ Portable delivery instructions:\n${guidance}`;
           try {
             for (const [index, check] of policy.local_checks.entries()) {
               const options = { cwd: git.cwd, env: job.env, log, stage: `local_check_${index}`, timeoutMs: Math.max(1, remaining() - 120000) };
-              if (input.authorization.permission_mode === "full-access") await command("bash", ["-e", "-c", check], options);
+              if (input.authorization.permission_mode === "full-access") await command("bash", ["-e", "-o", "pipefail", "-c", check], options);
               else await command(join(job.tools, "node_modules/.bin/codex"), ["sandbox", "-C", git.cwd,
                 "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true", "-c",
-                `sandbox_workspace_write.writable_roots=${JSON.stringify([join(git.cwd, ".git"), job.root])}`, "--", "bash", "-e", "-c", check], options);
+                `sandbox_workspace_write.writable_roots=${JSON.stringify([join(git.cwd, ".git"), job.root])}`, "--", "bash", "-e", "-o", "pipefail", "-c", check], options);
               audit.validation.push({ command: check, exit_code: 0 });
             }
             if (before !== await git.fingerprint()) {

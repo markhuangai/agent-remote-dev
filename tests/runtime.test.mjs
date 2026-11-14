@@ -87,6 +87,21 @@ test("actual Git publication verifies pushed commits, upstream, deletions and re
   const removed = await git.publish(["greeting.js"], "Remove unstaged fixture file", next, next);
   assert.equal(await git.remoteHead(), removed);
 });
+test("real initialized submodule fingerprints cover clean, dirty and untracked content",async(t)=>{
+  const f=await fixture(t),r=await repository(f),source=join(f.temporary,"module-source");
+  await mkdir(source);
+  const moduleGit=async(...args)=>exec("git",args,{cwd:source,env:f.job.env});
+  await moduleGit("init","--initial-branch=main");await writeFile(join(source,"value.txt"),"original\n");
+  await moduleGit("add","value.txt");await moduleGit("commit","-m","Initial module fixture");
+  await exec("git",["submodule","add",source,"module"],{cwd:r.cwd,env:{...f.job.env,GIT_ALLOW_PROTOCOL:"file"}});
+  await r.git("commit","-am","Add fixture submodule");assert.equal(await r.git("status","--porcelain"),"");
+  const git=new TaskGit(r.cwd,f.job.env,f.log,r.branch),clean=await git.fingerprint();
+  assert.equal(await git.fingerprint(),clean);
+  await writeFile(join(r.cwd,"module/value.txt"),"changed\n");assert.notEqual(await git.fingerprint(),clean);
+  await writeFile(join(r.cwd,"module/value.txt"),"original\n");assert.equal(await git.fingerprint(),clean);
+  await writeFile(join(r.cwd,"module/untracked.txt"),"one");const untracked=await git.fingerprint();
+  await writeFile(join(r.cwd,"module/untracked.txt"),"two");assert.notEqual(await git.fingerprint(),untracked);
+});
 test("real rejected push records intended/observed SHA and never pretends it is durable", async (t) => {
   const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
   await writeFile(join(r.remote, "hooks/pre-receive"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
@@ -124,6 +139,16 @@ for (const compressed of [false, true]) test(`credential exclusion scans ${compr
     const { unlink } = await import("node:fs/promises"); await unlink(path);
   }
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+test("non-secret environment flags permit export while configured MCP credentials remain excluded",async(t)=>{
+  const f=await fixture(t),secret="fixture-mcp-credential-9371";
+  await configure(f.job,`[mcp_servers.fixture.env]\nDEBUG="1"\nMCP_API_TOKEN="${secret}"\n`,f.log);
+  assert.ok(!f.log.protectedValues.includes("1"));assert.ok(f.log.protectedValues.includes(secret));
+  await history(f,"Ordinary completed turn 1");
+  await exportCheckpoint(f.job,checkpoint(),f.log);
+  const path=join(f.job.codexHome,"sessions/rollout.jsonl");
+  await writeFile(path,await readFile(path,"utf8")+JSON.stringify({type:"response_item",payload:{text:secret}})+"\n");
+  await assert.rejects(exportCheckpoint(f.job,checkpoint({previous:{sequence:1,artifact_id:4,checkpoint_sha:"a".repeat(40)}}),f.log),{reason:"credential_in_checkpoint"});
 });
 test("upload failures, missing sessions, drift and size limits never advance the last durable receipt", async (t) => {
   const f = await fixture(t); await history(f);
@@ -168,6 +193,8 @@ test("managed descendants in another session stop before a completed command ret
 });
 test("a stalled real artifact transport is terminated within the checkpoint action budget",async(t)=>{
   const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);await history(f);
+  await mkdir(join(f.job.tools,"node_modules/@actions"));
+  await symlink(join(root,"node_modules/@actions/artifact"),join(f.job.tools,"node_modules/@actions/artifact"),"dir");
   const sha=await git.publish([],"",r.base,null);
   let requests=0;const server=createServer(async(request,response)=>{requests++;for await(const _ of request){};});
   await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));

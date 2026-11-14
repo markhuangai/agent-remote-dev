@@ -30,7 +30,8 @@ export async function configure(job: Job, raw: string, log: Diagnostics) {
   let config: any;
   try { config = parse(raw); } catch { throw new RunnerError("invalid_codex_config", "configuration", "Codex TOML could not be parsed; configuration contents withheld."); }
   const protect = (value: any, key = "") => {
-    if (typeof value === "string" && /key|token|secret|password|authorization|header|env/i.test(key) && !/\.(env_key|env_vars)$/.test(key)) log.protect(value);
+    if (/\.(env_key|env_vars)$/.test(key)) return;
+    if (typeof value === "string" && (/key|token|secret|password|auth|credential|signature/i.test(key.split(".").at(-1)!) || /\.(?:http_headers|headers)\./i.test(key))) log.protect(value);
     else if (value && typeof value === "object") for (const [childKey, child] of Object.entries(value)) protect(child, key + "." + childKey);
   };
   protect(config);

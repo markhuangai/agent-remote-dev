@@ -1,9 +1,9 @@
-import { DefaultArtifactClient } from "@actions/artifact";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { durableCheckpoint, CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
 import { Diagnostics } from "./diagnostics.js";
-import { RunnerError, requireValue } from "./contracts.js";
+import { RunnerError, requireValue, versions } from "./contracts.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
@@ -15,6 +15,10 @@ export async function checkpointWorker(requestPath: string) {
   for (const secret of request.secrets) log.protect(secret);
   try {
     const git = new TaskGit(request.cwd, request.job.env, log, request.input.branch);
+    const artifactRoot = join(request.job.tools, "node_modules", "@actions", "artifact");
+    const metadata = JSON.parse(await readFile(join(artifactRoot, "package.json"), "utf8"));
+    requireValue(metadata.name === "@actions/artifact" && metadata.version === versions.artifact_sdk, "artifact_sdk_version_mismatch", "checkpoint");
+    const { DefaultArtifactClient } = await import(/* webpackIgnore: true */ pathToFileURL(join(artifactRoot, "lib", "artifact.js")).href);
     const artifacts = new DefaultArtifactClient();
     const receipt = await durableCheckpoint(request.job, request.input, log, (sha) => git.verify(sha),
       (name, files, root) => artifacts.uploadArtifact(name, files, root));

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export const versions = { codex: "0.169.0", skills_cli: "1.8.1", execution_skills: "224a5be4ddf40c6cf0a50b97885cb353e8522e2e" };
+export const versions = { codex: "0.169.0", skills_cli: "1.8.1", artifact_sdk: "6.3.1", execution_skills: "224a5be4ddf40c6cf0a50b97885cb353e8522e2e" };
 export const shaPattern = /^[a-f0-9]{40}$/;
 export type PermissionMode = "full-access" | "sandboxed";
 export type Status = "completed" | "incomplete" | "blocked" | "failed";

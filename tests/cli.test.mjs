@@ -38,7 +38,14 @@ test("sandboxed mode performs a real write or diagnoses native namespace denial 
     assert.equal(f.records.find(record=>record.event==="runtime.failed").stage,"worker");
     assert.notEqual(process.env.REQUIRE_SANDBOX_SUCCESS,"1","CI must prove successful sandbox execution; native denial is not a CI pass");
     t.diagnostic("Native sandbox denial verified locally; CI requires the successful write scenario.");
-  } else assert.equal(await readFile(join(r.cwd,"sandbox-result.txt"),"utf8"),"sandboxed");
+  } else {
+    const outputs=api.requests.flatMap(request=>request.input??[]).filter(item=>item.type==="function_call_output").map(item=>String(item.output)).join("\n");
+    const cause=f.log.sanitize(outputs.split("\n").filter(line=>/bwrap:|sandbox|permitted|denied|error|exit code|Process exited|failed/i.test(line)).join("\n")).slice(0,512);
+    let content;
+    try { content=await readFile(join(r.cwd,"sandbox-result.txt"),"utf8"); }
+    catch { assert.fail(`Real sandbox tool did not produce the required file. Native evidence: ${cause||"No native diagnostic exposed"}`); }
+    assert.equal(content,"sandboxed");
+  }
 });
 test("real CLI authentication errors retain stage and sanitized native cause without raw provider bodies", async (t) => {
   const f = await fixture(t),r=await repository(f);
@@ -118,6 +125,20 @@ test("a real worker blocker retains structured causes in normal runtime diagnost
   const evidence=f.records.find(record=>record.event==="runtime.blocked");
   assert.equal(evidence.level,"ERROR");assert.equal(evidence.reason,blocker.reason);
   assert.deepEqual(evidence.references,blocker.references);assert.deepEqual(evidence.missing_inputs,blocker.missing_inputs);
+});
+test("a real piped validation failure cannot become a passing supervisor receipt",async(t)=>{
+  const f=await fixture(t),r=await repository(f),source=await portableSource(f);
+  await installSkillSource(f.job,executionSource,source,0,f.log);
+  const validation={...policy,local_checks:["false | cat"]};
+  const audit={verdict:"conformant",findings:[],summary:"Fixture conformance",auditor:{session:"not exposed by CLI",model:"not exposed by CLI"},base_sha:r.base,audited_state:"Complete fixture worktree"};
+  const api=await provider(t,[[message(turn("audit",{validation_policy:validation}))],[message(audit)],[message(turn("blocked",{blocker:{reason:"validation_failed",references:[],missing_inputs:[]}}))]]);
+  await configure(f.job,api.config,f.log);
+  const git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);
+  const result=await drive({job:f.job,git,log:f.log,plan:"Fixture",planSource:"inline",authorization:{repository:"fixture/repo",plan_sha256:hash("Fixture"),permission_mode:"full-access",request:"Implement fixture"},repository:"fixture/repo",taskId:"fixture-task",base:r.base,budgetMs:240000,started:Date.now(),skills:[executionSource],lineage:{},checkpoint:async()=>{throw Error("Failed validation cannot checkpoint");},complete:async()=>{throw Error("Failed validation cannot complete");}});
+  assert.equal(result.status,"blocked");
+  const failure=f.records.find(record=>record.event==="runtime.failed"&&record.stage==="local_check_0");
+  assert.equal(failure.reason,"command_failed");assert.equal(failure.exit_code,1);
+  assert.ok(!f.records.some(record=>record.event==="runtime.operation"&&record.stage==="local_check_0"&&record.outcome==="success"));
 });
 for(const interruption of ["budget","SIGTERM","SIGINT"]) test(`${interruption} interruption retains the last real pushed and uploaded accomplishment`, async(t)=>{
   const f=await fixture(t),r=await repository(f),source=await portableSource(f);
