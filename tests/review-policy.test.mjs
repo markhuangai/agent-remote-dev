@@ -351,3 +351,21 @@ test("secret-bearing workflow uses trusted source and no PR execution steps", as
   assert.match(workflow, /pull-request-url:/);
   assert.match(workflow, /auto-approve: "false"/);
 });
+
+test("PR base edits subscribe all validation/review routes to main without admitting other bases", async () => {
+  for (const [file, event] of [
+    ["ci.yml", "pull_request"], ["codeql.yml", "pull_request"], ["ai-pr-review.yml", "pull_request_target"],
+  ]) {
+    const workflow = await readFile(new URL("../.github/workflows/" + file, import.meta.url), "utf8");
+    const subscription = workflow.match(new RegExp("^  " + event + ":\\n((?:    .+\\n)+)", "m"))?.[1];
+    assert.ok(subscription, file + " must declare its PR event");
+    const list = (key) => subscription.match(new RegExp(key + ": \\[([^\\]]+)\\]"))[1]
+      .split(",").map((value) => value.trim());
+    const admits = (base, action) => list("branches").includes(base) && list("types").includes(action);
+    for (const action of ["opened", "synchronize", "reopened", "ready_for_review", "edited"]) {
+      assert.equal(admits("main", action), true, file + " must validate " + action + " on main");
+    }
+    assert.equal(admits("release", "edited"), false, file + " must keep its main boundary");
+    assert.equal(admits("main", "closed"), false, file + " must not start work for closing a PR");
+  }
+});
