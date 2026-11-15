@@ -83,13 +83,25 @@ for (const closeDuringUpload of [false, true]) test(`the real CLI driver audits,
   if (closeDuringUpload) {
     const failure = f.records.findLast(record => record.event === "runtime.failed" && record.reason === "pr_identity_mismatch");
     assert.equal(failure.last_durable_checkpoint.artifact_id, 43);
+    assert.equal(failure.expected_sha, result.checkpoint.checkpoint_sha); assert.equal(failure.observed_sha, result.checkpoint.checkpoint_sha);
+    assert.deepEqual(failure.missing_gates, ["open_pull_request"]);
+    assert.equal(failure.expected_pr.state, "open"); assert.equal(failure.observed_pr.state, "closed");
+    assert.doesNotMatch(JSON.stringify(failure), /Closes #2/);
     assert.equal(f.records.findLast(record => record.event === "runtime.complete").status, "failed");
     return;
   }
   const verification={job:f.job,git,log:f.log,repository:"fixture/repo",login:"fixture-actor",baseBranch:"main",url:"https://github.com/fixture/repo/pull/9",receiptPath:receipt,policy,timeoutMs:10000};
-  await assert.rejects(verifyDelivery({...verification,issueNumber:"3"}),{reason:"pr_identity_mismatch"});
+  await assert.rejects(verifyDelivery({...verification,issueNumber:"3"}), error => {
+    f.log.failure(error, result.checkpoint);
+    assert.equal(error.reason, "pr_identity_mismatch"); assert.deepEqual(error.details.missing_gates, ["issue_closing_line"]);
+    assert.equal(error.details.expected_pr.issue_number, "3"); assert.equal(error.details.observed_pr.has_issue_closing_line, false); return true;
+  });
   await writeFile(join(f.job.root,"api-state.json"),JSON.stringify({stale:true}));
-  await assert.rejects(verifyDelivery(verification),{reason:"pr_identity_mismatch"});
+  await assert.rejects(verifyDelivery(verification), error => {
+    f.log.failure(error, result.checkpoint);
+    assert.equal(error.reason, "pr_identity_mismatch"); assert.deepEqual(error.details.missing_gates, ["head_sha"]);
+    assert.equal(error.details.expected_sha, result.checkpoint.checkpoint_sha); assert.equal(error.details.observed_sha, "b".repeat(40)); return true;
+  });
 });
 test("an unsupported completion claim cannot bypass the driver audit and delivery gates", async(t)=>{
   const f=await fixture(t),r=await repository(f),source=await portableSource(f);

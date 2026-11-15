@@ -201,6 +201,31 @@ test("real submodule fingerprints and publication preserve clean references and 
   await r.git("update-index", "--cacheinfo", `160000,${originalModuleHead},module`);
   assert.notEqual(await git.fingerprint(), uninitialized);
 });
+for (const staged of [false, true]) test("new submodules preserve audit identity with " + (staged ? "staged legacy" : "unstaged canonical") + " publication paths", async (t) => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
+  const source = join(f.temporary, "new-module-source"); await mkdir(source);
+  const child = (...args) => exec("git", args, { cwd:source, env:f.job.env });
+  await child("init", "--initial-branch=main"); await writeFile(join(source, "value.txt"), "Published module\n");
+  await child("add", "value.txt"); await child("commit", "-m", "Prepare module fixture");
+  const moduleHead = (await child("rev-parse", "HEAD")).stdout.trim();
+  await exec("git", ["clone", source, join(r.cwd, "module")], { env:f.job.env });
+  await writeFile(join(r.cwd, ".gitmodules"), '[submodule "module"]\n\tpath = module\n\turl = ' + source + "\n");
+  const paths = await git.changedPaths(), audited = await git.fingerprint();
+  assert.deepEqual(paths, [".gitmodules", "module"]);
+  await writeFile(join(r.cwd, "module/value.txt"), "Dirty module\n");
+  assert.notEqual(await git.fingerprint(), audited);
+  await assert.rejects(git.publish(paths, "Reject dirty new module", r.base, null), { reason:"dirty_submodule" });
+  assert.equal(await git.head(), r.base); assert.equal(await git.remoteHead(), null);
+  await writeFile(join(r.cwd, "module/value.txt"), "Published module\n");
+  assert.equal(await git.fingerprint(), audited);
+  if (staged) { await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited); }
+  const supplied = paths.map(path => staged && path === "module" ? "module/" : path);
+  const sha = await git.publish(supplied, "Publish new module", r.base, null);
+  assert.equal(await git.remoteHead(), sha); assert.equal(await git.fingerprint(), audited);
+  assert.equal(await r.git("status", "--porcelain"), "");
+  const tree = (await exec("git", ["--git-dir", r.remote, "ls-tree", sha, "module"], { env:f.job.env })).stdout;
+  assert.match(tree, new RegExp("160000 commit " + moduleHead + "\\tmodule"));
+});
 test("publication rejects a staged credential without advancing local or remote history",async(t)=>{
   const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);
   await writeFile(join(r.cwd,"credential.txt"),f.job.env.CODEX_API_KEY);await r.git("add","credential.txt");
@@ -427,6 +452,32 @@ test("normal diagnostic output masks credentials and raw provider bodies and mar
   const encoded = JSON.stringify(records);
   assert.doesNotMatch(encoded, /fixture-secret-8291|private API body|Authorization: Bearer/);
   assert.equal(records[0].truncated, true); assert.equal(records[0].level, "ERROR");
+});
+test("real delivery rejection logs identify stale head and policy without raw receipt content", async () => {
+  const deliveryPath = JSON.stringify(new URL("../.build/delivery.js", import.meta.url).href);
+  const diagnosticPath = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const expected = "a".repeat(40), observed = "b".repeat(40);
+  const receipt = { gate:"terminal", phase:"full", head_sha:observed, all_checks_nonblocking:true, required_reviewers_satisfied:true,
+    required_check_problems:[], required_reviewer_problems:[], required_checks:Array.from({ length:12 }, (_, index) => "Check " + index), required_reviewers:[],
+    provider_body:"private-provider-body-5419", secret:"fixture-secret-3149" };
+  const script = "import {verifyTerminal} from " + deliveryPath + ";import {Diagnostics} from " + diagnosticPath +
+    ";const log=new Diagnostics({task_id:'delivery-log-task',run_id:'13',run_attempt:'1',session_id:'log-session',turn:2});log.protect('fixture-secret-3149');" +
+    "try{verifyTerminal(" + JSON.stringify(receipt) + "," + JSON.stringify(expected) + "," + JSON.stringify(policy) +
+    ");}catch(error){log.failure(error,{artifact_id:17});}";
+  const output = (await exec(process.execPath, ["--input-type=module", "-e", script])).stdout;
+  const visible = output.split("\n").filter(line => !line.startsWith("::add-mask::")).join("\n");
+  assert.doesNotMatch(visible, /private-provider-body-5419|fixture-secret-3149/);
+  const line = visible.split("\n").find(line => line.includes('"event":"runtime.failed"'));
+  const evidence = JSON.parse(line.slice(line.indexOf("{")));
+  assert.equal(evidence.level, "ERROR"); assert.equal(evidence.stage, "delivery");
+  assert.equal(evidence.reason, "delivery_gate_incomplete"); assert.equal(evidence.evidence_source, "terminal_receipt");
+  assert.equal(evidence.expected_sha, expected); assert.equal(evidence.observed_sha, observed);
+  assert.deepEqual(evidence.missing_gates, ["head", "required_checks"]);
+  assert.deepEqual(evidence.expected_policy.checks.names, ["CI"]);
+  assert.equal(evidence.observed_policy.checks.count, 12); assert.equal(evidence.observed_policy.checks.names.length, 10);
+  assert.equal(evidence.observed_policy.checks.omitted, 2); assert.match(evidence.native_cause, /current-head review receipt/);
+  assert.equal(evidence.task_id, "delivery-log-task"); assert.equal(evidence.run_attempt, "1");
+  assert.equal(evidence.session_id, "log-session"); assert.equal(evidence.turn, 2); assert.equal(evidence.last_durable_checkpoint.artifact_id, 17);
 });
 test("the real Actions logger retains required failure evidence after DEBUG filtering",async()=>{
   const diagnosticPath=JSON.stringify(new URL("../.build/diagnostics.js",import.meta.url).href);

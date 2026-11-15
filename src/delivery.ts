@@ -62,13 +62,26 @@ export async function readJobReceipt(job: Job, path: string) {
   requireValue(actual.startsWith(job.root + sep), "receipt_outside_job", "delivery");
   return parseJson(await readFile(actual, "utf8"), "delivery_receipt");
 }
+function nameSummary(values: unknown) {
+  if (!Array.isArray(values)) return { names: null, count: null, omitted: 0 };
+  return { names: values.slice(0, 10).map((value) => typeof value === "string" ? value : "[invalid name]"),
+    count: values.length, omitted: Math.max(0, values.length - 10) };
+}
 export function verifyTerminal(value: any, head: string, policy: ValidationPolicy) {
-  requireValue(object(value) && value.gate === "terminal" && value.head_sha === head && value.phase === "full" &&
-    value.all_checks_nonblocking === true && value.required_reviewers_satisfied === true &&
-    Array.isArray(value.required_check_problems) && value.required_check_problems.length === 0 &&
-    Array.isArray(value.required_reviewer_problems) && value.required_reviewer_problems.length === 0 &&
-    JSON.stringify(value.required_checks) === JSON.stringify(policy.checks) &&
-    JSON.stringify(value.required_reviewers) === JSON.stringify(policy.reviewers), "delivery_gate_incomplete", "delivery");
+  const gates = { receipt: object(value), gate: value?.gate === "terminal", head: value?.head_sha === head, phase: value?.phase === "full",
+    checks_nonblocking: value?.all_checks_nonblocking === true, reviewers_satisfied: value?.required_reviewers_satisfied === true,
+    check_problems: Array.isArray(value?.required_check_problems) && value.required_check_problems.length === 0,
+    reviewer_problems: Array.isArray(value?.required_reviewer_problems) && value.required_reviewer_problems.length === 0,
+    required_checks: JSON.stringify(value?.required_checks) === JSON.stringify(policy.checks),
+    required_reviewers: JSON.stringify(value?.required_reviewers) === JSON.stringify(policy.reviewers) };
+  const missing = Object.entries(gates).filter(([, passed]) => !passed).map(([gate]) => gate);
+  if (missing.length) throw new RunnerError("delivery_gate_incomplete", "delivery", "Refresh the current-head review receipt under the frozen validation policy.",
+    { expected_sha: head, observed_sha: typeof value?.head_sha === "string" && shaPattern.test(value.head_sha) ? value.head_sha : null,
+      evidence_source: "terminal_receipt", missing_gates: missing,
+      expected_policy: { checks: nameSummary(policy.checks), reviewers: nameSummary(policy.reviewers) },
+      observed_policy: { checks: nameSummary(value?.required_checks), reviewers: nameSummary(value?.required_reviewers) },
+      check_problems: nameSummary(Array.isArray(value?.required_check_problems) ? value.required_check_problems.map((item: any) => item?.name) : null),
+      reviewer_problems: nameSummary(Array.isArray(value?.required_reviewer_problems) ? value.required_reviewer_problems.map((item: any) => item?.name) : null) });
 }
 export function verifyReviewState(state: any, head: string, policy: ValidationPolicy, dispositions: unknown) {
   if (state?.pull_request?.head_sha !== head || state.codex_thread_actions?.incomplete !== 0 || state.ai_pr_reviewer_thread_actions?.incomplete !== 0) {
@@ -91,11 +104,24 @@ export async function verifyDelivery(input: { job: Job; git: TaskGit; log: Diagn
   requireValue(input.url.startsWith(prefix) && /^[1-9][0-9]*$/.test(input.url.slice(prefix.length)), "invalid_pr_url", "delivery");
   const number = input.url.slice(prefix.length), head = await git.head();
   const api = () => command("gh", ["api", `repos/${repository}/pulls/${number}`], { cwd: git.cwd, env: job.env, stage: "delivery_pr", log });
-  const checkPull = (pull: any) => requireValue(pull.state === "open" && pull.draft === false && pull.user?.login === login &&
-    pull.head?.sha === head && pull.head?.ref === git.branch && pull.head?.repo?.full_name === repository &&
-    pull.base?.ref === baseBranch && pull.base?.repo?.full_name === repository &&
-    (!input.issueNumber || (typeof pull.body === "string" && pull.body.split(/\r?\n/).some((line: string) =>
-      /^(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+#([1-9][0-9]*)$/i.exec(line.trim())?.[1] === input.issueNumber))), "pr_identity_mismatch", "delivery");
+  const checkPull = (pull: any) => {
+    const closingLine = !input.issueNumber || (typeof pull?.body === "string" && pull.body.split(/\r?\n/).some((line: string) =>
+      /^(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+#([1-9][0-9]*)$/i.exec(line.trim())?.[1] === input.issueNumber));
+    const gates = { open_pull_request: pull?.state === "open", non_draft: pull?.draft === false, author: pull?.user?.login === login,
+      head_sha: pull?.head?.sha === head, head_branch: pull?.head?.ref === git.branch, head_repository: pull?.head?.repo?.full_name === repository,
+      base_branch: pull?.base?.ref === baseBranch, base_repository: pull?.base?.repo?.full_name === repository, issue_closing_line: closingLine };
+    const missing = Object.entries(gates).filter(([, passed]) => !passed).map(([gate]) => gate);
+    if (missing.length) throw new RunnerError("pr_identity_mismatch", "delivery", "Refresh the open non-draft PR identity and issue-closing evidence before completing.",
+      { expected_sha: head, observed_sha: typeof pull?.head?.sha === "string" && shaPattern.test(pull.head.sha) ? pull.head.sha : null,
+        evidence_source: "pull_request", missing_gates: missing,
+        expected_pr: { state: "open", draft: false, author: login, branch: git.branch, base: baseBranch, repository, issue_number: input.issueNumber ?? null },
+        observed_pr: { state: typeof pull?.state === "string" ? pull.state : null, draft: typeof pull?.draft === "boolean" ? pull.draft : null,
+          author: typeof pull?.user?.login === "string" ? pull.user.login : null, branch: typeof pull?.head?.ref === "string" ? pull.head.ref : null,
+          base: typeof pull?.base?.ref === "string" ? pull.base.ref : null,
+          head_repository: typeof pull?.head?.repo?.full_name === "string" ? pull.head.repo.full_name : null,
+          base_repository: typeof pull?.base?.repo?.full_name === "string" ? pull.base.repo.full_name : null,
+          has_issue_closing_line: closingLine } });
+  };
   checkPull(parseJson(await api(), "delivery_pr"));
   const receipt = await readJobReceipt(job, input.receiptPath);
   requireValue(receipt.state === "automation_clean" && object(receipt.terminal_receipt), "missing_review_loop_receipt", "delivery");
