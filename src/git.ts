@@ -46,7 +46,6 @@ export class TaskGit {
       digest.update(stat.isSymbolicLink() ? "symlink" : String(stat.mode & 0o777));
       if (stat.isDirectory() && gitlinks.has(path)) {
         const directory = join(this.cwd, path);
-        digest.update(gitlinks.get(path)!);
         let initialized = false;
         try { await lstat(join(directory, ".git")); initialized = true; }
         catch (error: any) { if (error.code !== "ENOENT") throw error; }
@@ -55,6 +54,7 @@ export class TaskGit {
           digest.update(await nested.head()); digest.update(await nested.fingerprint());
         } else {
           requireValue((await readdir(directory)).length === 0, "uninitialized_submodule_has_files", "git");
+          digest.update(gitlinks.get(path)!);
           digest.update("uninitialized");
         }
       } else digest.update(stat.isSymbolicLink() ? await readlink(join(this.cwd, path)) : await readFile(join(this.cwd, path)));

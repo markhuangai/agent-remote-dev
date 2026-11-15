@@ -136,6 +136,7 @@ test("real submodule fingerprints and publication preserve clean references and 
   const moduleGit=async(...args)=>exec("git",args,{cwd:source,env:f.job.env});
   await moduleGit("init","--initial-branch=main");await writeFile(join(source,"value.txt"),"original\n");
   await moduleGit("add","value.txt");await moduleGit("commit","-m","Initial module fixture");
+  const originalModuleHead = (await moduleGit("rev-parse", "HEAD")).stdout.trim();
   await exec("git",["submodule","add",source,"module"],{cwd:r.cwd,env:{...f.job.env,GIT_ALLOW_PROTOCOL:"file"}});
   await r.git("commit","-am","Add fixture submodule");assert.equal(await r.git("status","--porcelain"),"");
   const git=new TaskGit(r.cwd,f.job.env,f.log,r.branch),clean=await git.fingerprint();
@@ -150,11 +151,19 @@ test("real submodule fingerprints and publication preserve clean references and 
   const moduleHead=(await moduleGit("rev-parse","HEAD")).stdout.trim();
   await exec("git",["-C",join(r.cwd,"module"),"fetch","origin"],{env:f.job.env});
   await exec("git",["-C",join(r.cwd,"module"),"checkout","--detach",moduleHead],{env:f.job.env});
+  const audited = await git.fingerprint(); assert.notEqual(audited, clean);
+  await r.git("add", "module"); assert.equal(await git.fingerprint(), audited);
   const published=await git.publish(["module"],"Publish module reference",parent,parent);
+  assert.equal(await git.fingerprint(), audited);
   assert.equal(await git.remoteHead(),published);assert.match(await r.git("ls-tree","HEAD","module"),new RegExp(moduleHead));
   await writeFile(join(r.cwd,"module/value.txt"),"unpublished work\n");
   await assert.rejects(git.publish(["module"],"Invalid child work",published,published),{reason:"dirty_submodule"});
   assert.equal(await git.head(),published);assert.equal(await git.remoteHead(),published);
+  await writeFile(join(r.cwd,"module/value.txt"), "published update\n");
+  await r.git("submodule", "deinit", "--force", "module");
+  const uninitialized = await git.fingerprint();
+  await r.git("update-index", "--cacheinfo", `160000,${originalModuleHead},module`);
+  assert.notEqual(await git.fingerprint(), uninitialized);
 });
 test("publication rejects a staged credential without advancing local or remote history",async(t)=>{
   const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);

@@ -111,7 +111,7 @@ const args = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(${JSON.stringify(join(f.job.root, "api-state.json"))}));
 const sha = cp.execFileSync('git', ['rev-parse', 'HEAD'], {cwd:${JSON.stringify(repo.cwd)}, encoding:'utf8'}).trim();
 const branch = ${JSON.stringify(repo.branch)};
-const pr = {number:9,title:'Fixture PR',url:'https://github.com/fixture/repo/pull/9',state:'OPEN',isDraft:false,
+const pr = {number:9,title:'Fixture PR',url:'https://github.com/fixture/repo/pull/9',state:state.closed?'CLOSED':'OPEN',isDraft:false,
  author:{login:'fixture-actor'},headRefOid:sha,headRefName:branch,baseRefName:'main'};
 const endpoint = args.find(x=>x.startsWith('repos/'));
 let result;
@@ -123,7 +123,7 @@ else if (args.includes('graphql')) {
  const connection={nodes:[],pageInfo:{hasNextPage:false,endCursor:null}};
  result={data:{repository:{pullRequest:{comments:connection,reviews:connection,reactions:connection,reviewThreads:connection}}}};
 } else if (args.includes('user')) { if(args.includes('--jq')) {process.stdout.write('fixture-actor');process.exit(0);} result={login:'fixture-actor'}; }
-else if(endpoint?.includes('/pulls/')) result={state:'open',draft:false,body:state.body||'',user:{login:'fixture-actor'},head:{sha:state.stale?'b'.repeat(40):sha,ref:branch,repo:{full_name:'fixture/repo'}},base:{ref:'main',repo:{full_name:'fixture/repo'}}};
+else if(endpoint?.includes('/pulls/')) result={state:state.closed?'closed':'open',draft:false,body:state.body||'',user:{login:'fixture-actor'},head:{sha:state.stale?'b'.repeat(40):sha,ref:branch,repo:{full_name:'fixture/repo'}},base:{ref:'main',repo:{full_name:'fixture/repo'}}};
 else if(endpoint?.includes('/actions/runs')) result={workflow_runs:[]};
 else if(endpoint?.includes('/statuses')) result=[];
 else { process.stderr.write('Unexpected fixture GitHub request'); process.exit(1); }

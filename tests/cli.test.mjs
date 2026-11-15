@@ -34,7 +34,7 @@ test("real CLI authentication errors retain stage and sanitized native cause wit
   assert.doesNotMatch(output,/private-provider-body-5741|fixture-api-credential-9374/);
   assert.ok(f.records.some(record=>record.event==="runtime.failed"&&record.stage==="worker"));
 });
-test("the real CLI driver audits independently, checks production files, publishes checkpoints and verifies PR delivery", async (t) => {
+for (const closeDuringUpload of [false, true]) test(`the real CLI driver audits, publishes and ${closeDuringUpload ? "rejects PR closure during final upload" : "verifies PR delivery"}`, async (t) => {
   const f=await fixture(t),r=await repository(f),source=await portableSource(f);
   await installSkillSource(f.job,executionSource,source,0,f.log);
   await githubFixture(f,r,{body:"Closes #2"});
@@ -59,10 +59,17 @@ test("the real CLI driver audits independently, checks production files, publish
   const git=new TaskGit(r.cwd,f.job.env,f.log,r.branch),plan="Complete greeting.js and deliver an audited PR.";
   let artifactId=40;const uploads=[];
   const result=await drive({job:f.job,git,log:f.log,plan,planSource:"inline",issueNumber:"2",authorization:{repository:"fixture/repo",plan_sha256:hash(plan),request:"Implement through PR delivery with accomplishment checkpoints"},repository:"fixture/repo",taskId:"fixture-task",base:r.base,budgetMs:240000,started:Date.now(),skills:[executionSource],lineage:{run_id:"13"},
-    checkpoint:(input)=>durableCheckpoint(f.job,input,f.log,sha=>git.verify(sha),async(name,files,root)=>{uploads.push({name,files,root});return{id:++artifactId};}),
+    checkpoint:(input)=>durableCheckpoint(f.job,input,f.log,sha=>git.verify(sha),async(name,files,root)=>{
+      uploads.push({name,files,root});
+      if (closeDuringUpload && uploads.length === 3) {
+        const path = join(f.job.root, "api-state.json"), state = JSON.parse(await readFile(path, "utf8"));
+        await writeFile(path, JSON.stringify({ ...state, closed:true }));
+      }
+      return {id:++artifactId};
+    }),
     complete:(url,receiptPath,validation,timeoutMs)=>verifyDelivery({job:f.job,git,log:f.log,repository:"fixture/repo",login:"fixture-actor",baseBranch:"main",url,receiptPath,policy:validation,timeoutMs,issueNumber:"2"}),
   });
-  assert.equal(result.status,"completed");assert.equal(result.checkpoint.artifact_id,43);assert.equal(uploads.length,3);
+  assert.equal(result.status,closeDuringUpload?"failed":"completed");assert.equal(result.checkpoint.artifact_id,43);assert.equal(uploads.length,3);
   assert.equal(await git.remoteHead(),result.checkpoint.checkpoint_sha);
   assert.equal(await readFile(join(f.job.root,"pr-created"),"utf8"),"yes");
   const manifest=JSON.parse(await readFile(join(uploads.at(-1).root,"manifest.json"),"utf8"));
@@ -73,6 +80,12 @@ test("the real CLI driver audits independently, checks production files, publish
   assert.ok(f.records.some(record=>record.event==="runtime.delivery"&&record.outcome==="automation_clean"));
   const auditRequest=api.requests.find(body=>JSON.stringify(body).includes("RAW AUDIT CONTRACT:"));
   assert.ok(auditRequest);assert.doesNotMatch(JSON.stringify(auditRequest),/Fixture accomplishment/);
+  if (closeDuringUpload) {
+    const failure = f.records.findLast(record => record.event === "runtime.failed" && record.reason === "pr_identity_mismatch");
+    assert.equal(failure.last_durable_checkpoint.artifact_id, 43);
+    assert.equal(f.records.findLast(record => record.event === "runtime.complete").status, "failed");
+    return;
+  }
   const verification={job:f.job,git,log:f.log,repository:"fixture/repo",login:"fixture-actor",baseBranch:"main",url:"https://github.com/fixture/repo/pull/9",receiptPath:receipt,policy,timeoutMs:10000};
   await assert.rejects(verifyDelivery({...verification,issueNumber:"3"}),{reason:"pr_identity_mismatch"});
   await writeFile(join(f.job.root,"api-state.json"),JSON.stringify({stale:true}));

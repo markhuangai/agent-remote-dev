@@ -149,7 +149,11 @@ Portable delivery instructions:\n${guidance}`;
         progress: { turn, kind: result.kind, summary: result.summary, validation_policy: policy, pr_url: prUrl, delivery_receipt: deliveryReceipt },
         lineage: input.lineage, audit, previous: last };
       last = await input.checkpoint(checkpointInput);
-      if (result.kind === "complete") return finish("completed");
+      if (result.kind === "complete") {
+        requireValue(policy && prUrl && result.review_receipt, "invalid_completion_identity", "delivery");
+        await input.complete(prUrl, result.review_receipt, policy, Math.max(1, remaining() - 10000));
+        return finish("completed");
+      }
       prompt = protocol + "\nVerified durable checkpoint:\n" + JSON.stringify(last) +
         "\nContinue the approved plan in this conversation. Current audit receipt:\n" + JSON.stringify(audit);
     }
