@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { configure, installSkillSource } from "../.build/setup.js";
+import { configure, installSkillSource, safeTree } from "../.build/setup.js";
 import { runCodex } from "../.build/codex.js";
 import { TaskGit } from "../.build/git.js";
 import { drive } from "../.build/driver.js";
@@ -102,6 +103,60 @@ for (const closeDuringUpload of [false, true]) test(`the real CLI driver audits,
     assert.equal(error.reason, "pr_identity_mismatch"); assert.deepEqual(error.details.missing_gates, ["head_sha"]);
     assert.equal(error.details.expected_sha, result.checkpoint.checkpoint_sha); assert.equal(error.details.observed_sha, "b".repeat(40)); return true;
   });
+});
+for (const clears of [true, false]) test(`missing real auditor session preserves one reconsideration before ${clears ? "conformance" : "dispute exhaustion"}`, async (t) => {
+  const f = await fixture(t), r = await repository(f), source = await portableSource(f);
+  await installSkillSource(f.job, executionSource, source, 0, f.log);
+  const marker = join(f.job.root, "validation-passed"), validation = { ...policy,
+    local_checks:["node -e " + quote(`require('node:fs').writeFileSync(${JSON.stringify(marker)},'passed')`)] };
+  const finding = { plan_item:"Fixture criterion", category:"missing_behavior", evidence:"README.md:1",
+    gap:"Disputed fixture finding", required_outcome:"Independent reconsideration", guidance:"Inspect the evidence" };
+  const audit = (conformant = false) => ({ verdict:conformant ? "conformant" : "nonconformant", findings:conformant ? [] : [finding],
+    summary:"Fixture audit", auditor:{session:"not exposed by CLI",model:"not exposed by CLI"},base_sha:r.base,audited_state:"Complete fixture worktree" });
+  let missingSession;
+  const api = await provider(t, async (_request, ordinal) => {
+    if (ordinal === 1) return [message(turn("audit", {validation_policy:validation}))];
+    if (ordinal === 2 || ordinal === 4) return [message(audit())];
+    if (ordinal === 3) {
+      missingSession = JSON.parse(await readFile(join(f.job.root, "audit-receipt.json"), "utf8")).auditor_session;
+      let removed = false;
+      for (const path of await safeTree(join(f.job.codexHome, "sessions"))) {
+        if (!path.endsWith(".jsonl")) continue;
+        const first = JSON.parse((await readFile(path, "utf8")).split("\n")[0]);
+        if (first.payload?.id !== missingSession) continue;
+        await rename(path, join(f.job.root, "unavailable-auditor.jsonl")); removed = true;
+      }
+      assert.ok(removed);
+      const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
+      try { assert.equal(db.prepare("DELETE FROM threads WHERE id = ?").run(missingSession).changes, 1); }
+      finally { db.close(); }
+      return [message(turn("audit", {summary:"first-reconsideration-evidence-8512",validation_policy:validation}))];
+    }
+    if (ordinal === 5) return [message(turn("audit", {summary:"replacement-reconsideration-evidence-9613",validation_policy:validation}))];
+    if (ordinal === 6) return [message(audit(clears))];
+    if (ordinal === 7) return [message(turn(clears ? "blocked" : "audit", {validation_policy:validation}))];
+    throw new Error("Unexpected auditor recovery fixture request " + ordinal);
+  });
+  await configure(f.job, api.config, f.log);
+  const git = new TaskGit(r.cwd, f.job.env, f.log, r.branch), plan = "Obtain independent fixture conformance before validation.";
+  const result = await drive({ job:f.job,git,log:f.log,plan,planSource:"inline",
+    authorization:{repository:"fixture/repo",plan_sha256:hash(plan),request:"Implement the fixture with independent auditing"},
+    repository:"fixture/repo",taskId:"fixture-task",base:r.base,budgetMs:240000,started:Date.now(),skills:[executionSource],lineage:{run_id:"13"},
+    checkpoint:async () => { throw new Error("Audit-only fixture must not publish"); },
+    complete:async () => { throw new Error("Audit-only fixture must not claim delivery"); },
+  });
+  const failures = JSON.stringify(f.records.filter(record => record.event === "runtime.failed"));
+  assert.equal(result.status, clears ? "blocked" : "failed", failures); assert.equal(api.requests.length, 7, failures);
+  const replacement = JSON.stringify(api.requests[3]), reconsideration = JSON.stringify(api.requests[5]);
+  assert.match(replacement, /RAW AUDIT CONTRACT/); assert.doesNotMatch(replacement, /Evidence-backed reconsideration|first-reconsideration-evidence-8512/);
+  assert.match(reconsideration, /Evidence-backed reconsideration/); assert.match(reconsideration, /replacement-reconsideration-evidence-9613/);
+  const rounds = JSON.parse(await readFile(join(f.job.root, "audit-history.json"), "utf8"));
+  assert.equal(rounds.length, 3); assert.equal(rounds[0].receipt.auditor_session, missingSession);
+  assert.notEqual(rounds[1].receipt.auditor_session, missingSession); assert.equal(rounds[1].receipt.auditor_session, rounds[2].receipt.auditor_session);
+  const unavailable = f.records.find(record => record.event === "runtime.audit" && record.reason === "auditor_session_unavailable" && record.previous_session === missingSession);
+  assert.ok(unavailable); assert.match(unavailable.native_cause, /no rollout found for thread id/);
+  if (clears) { assert.equal(await readFile(marker, "utf8"), "passed"); assert.equal(rounds[2].receipt.verdict, "conformant"); }
+  else { await assert.rejects(readFile(marker), {code:"ENOENT"}); assert.ok(f.records.some(record => record.reason === "audit_dispute_unresolved")); }
 });
 test("a real worker Git commit reports both heads and preserves the preceding published checkpoint", async (t) => {
   const f = await fixture(t), r = await repository(f), source = await portableSource(f);

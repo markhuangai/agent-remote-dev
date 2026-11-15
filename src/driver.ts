@@ -68,19 +68,24 @@ Portable delivery instructions:\n${guidance}`;
         const auditInstructions = await readFile(join(job.codexHome, "skills/plan-audit/SKILL.md"), "utf8");
         const rawContract = { repository_root: git.cwd, base_sha: input.base, branch: git.branch, head: await git.head(),
           approved_plan_verbatim: input.plan, validation_assignments: policy, pre_existing_baseline: "clean; no tracked, untracked or ignored task state" };
-        let reconsideration = "";
+        let reconsideration = "", reconsiderationKey: string | undefined;
         if (audit?.verdict === "nonconformant" && audit.state_hash === before) {
           const key = hash(JSON.stringify(audit.findings));
           if (reconsidered.has(key)) throw new RunnerError("audit_dispute_unresolved", "audit", "The independent auditor did not clear the disputed findings.");
-          reconsidered.add(key);
+          reconsiderationKey = key;
           reconsideration = "\nEvidence-backed reconsideration request from the implementer; independently verify it and rescan the whole plan:\n" + result.summary;
         }
         const rawAuditPrompt = `You are the independent read-only auditor launched by the plan-audit coordinator. Execution is full-access/YOLO, but your task is strictly read-only. Inspect every item against the complete committed, staged, unstaged and relevant untracked implementation. Rescan the whole plan, including prior findings when this is a resumed audit. Do not run tests or mutate any state. Do not launch another auditor. Return the complete pinned receipt schema. If the CLI does not expose your identity/model, use 'not exposed by CLI'; the supervisor records actual observed metadata.\n${auditInstructions}\nRAW AUDIT CONTRACT:\n${JSON.stringify(rawContract)}`;
         const auditPrompt = rawAuditPrompt + reconsideration;
         let assessed;
-        try { assessed = await runCodex(job, git.cwd, auditPrompt, log, Math.max(1, remaining() - 120000), `audit-${turn}`, auditSession, auditSchema); }
+        try {
+          assessed = await runCodex(job, git.cwd, auditPrompt, log, Math.max(1, remaining() - 120000), `audit-${turn}`, auditSession, auditSchema);
+          if (reconsiderationKey) reconsidered.add(reconsiderationKey);
+        }
         catch (error) {
-          if (!auditSession || !(error instanceof RunnerError) || !/Session not found/i.test(error.nativeCause)) throw error;
+          if (!auditSession || !(error instanceof RunnerError)) throw error;
+          if (!/Session not found/i.test(error.nativeCause) &&
+              !error.nativeCause.includes(`no rollout found for thread id ${auditSession} (code -32600)`)) throw error;
           log.event("runtime.audit", "WARN", { reason: "auditor_session_unavailable", previous_session: auditSession, native_cause: error.nativeCause });
           assessed = await runCodex(job, git.cwd, rawAuditPrompt, log, Math.max(1, remaining() - 120000), `audit-fresh-${turn}`, undefined, auditSchema);
         }
