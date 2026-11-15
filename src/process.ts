@@ -10,6 +10,7 @@ import { Diagnostics } from "./diagnostics.js";
 export type CommandOptions = { cwd: string; env: NodeJS.ProcessEnv; stage: string; log?: Diagnostics; timeoutMs?: number;
   stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown> };
 export async function command(executable: string, args: string[], options: CommandOptions) {
+  if (options.env.CODEX_TASK_CANCELLED === "1") throw new RunnerError("command_cancelled", options.stage, "Task cancellation is latched; no new operation was started.");
   const started = Date.now();
   const timeoutMs = Math.min(options.timeoutMs ?? 180000, Number(options.env.CODEX_TASK_DEADLINE_MS ?? Infinity) - started - 11000);
   if (timeoutMs <= 0) throw new RunnerError("command_timeout", options.stage, "Task budget exhausted before command startup.");

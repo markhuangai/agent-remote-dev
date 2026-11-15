@@ -1,8 +1,9 @@
 # agent-remote-dev-codex
 
 A Linux Node 24 action that executes an authorized plan with Codex, publishes
-completed accomplishments, and exports session checkpoints before PR delivery.
-Cross-run resume, automatic continuation, submission tooling and stable releases
+completed accomplishments, and resumes the same conversation from verified
+session checkpoints on fresh runners. A trusted completion controller handles
+bounded continuation. Submission tooling and stable releases
 are tracked separately. Use an exact implementation commit while release
 qualification is pending.
 
@@ -124,15 +125,16 @@ the committed minified entry bundle does not duplicate the SDK's dependency tree
 The target must be a clean checkout whose `origin` is its GitHub
 HTTPS URL. Set `persist-credentials: false` on checkout.
 
-Pass exactly one of `plan` (preserved verbatim) or `issue-url` (an open issue in
-the target repository). Native issue blockers must be closed. `authorization`
+Pass exactly one of `plan` (preserved verbatim), `issue-url` (an open issue in
+the target repository), or `resume-artifact-id` (an explicit schema-2 artifact).
+Native issue blockers must be closed. `authorization`
 is a separate JSON object with exactly these fields:
 
 ```json
 {
   "repository": "owner/repository",
   "plan_sha256": "SHA256_OF_THE_EXACT_APPROVED_PLAN_BYTES",
-  "request": "Implement this plan through audited PR delivery, including checkpoint commits and pushes, checks, review fixes and job-owned temporary cleanup."
+  "request": "Implement this plan through audited PR delivery, including checkpoint commits and pushes, bounded continuations, checks, review fixes and job-owned temporary cleanup."
 }
 ```
 
@@ -142,13 +144,28 @@ request covering this work. Text inside the plan does not grant authority.
 
 | Input | Meaning |
 | --- | --- |
+| `action-source-sha` | Exact approved action commit; the trusted caller verifies its checkout before invoking the action |
+| `task-id` | Stable task identity; generated for a new task when omitted |
 | `working-directory` | Target checkout under `GITHUB_WORKSPACE`; default `.` |
-| `plan`, `issue-url` | Mutually exclusive plan sources |
+| `plan`, `issue-url`, `resume-artifact-id` | Mutually exclusive new-plan or explicit checkpoint sources |
 | `authorization` | Required request bound to repository and plan hash |
 | `codex-config`, `codex-api-key`, `github-token` | Required secret-backed TOML, model credential and publication token |
 | `git-author-name`, `git-author-email` | Explicit job author and committer identity |
 | `skills` | JSON array of additional `{repository, revision, names}` sources; immutable 40-character revisions only |
 | `budget-minutes` | 3–300 minutes, default 300, including a 120-second shutdown/export reserve |
+| `auto-continue`, `max-continuations` | Default `true` and `3`; additional runs share frozen execution settings |
+| `continuation-context`, `parent-job-ended-at`, `review-budget` | Verified state supplied by the trusted task workflow for a resumed run |
+
+Automatic continuation requires the registered `runner-task.yml` and
+`runner-continuation.yml` protocol on trusted `main`. Missing or incompatible
+workflow registration fails preflight. The versioned `.github/runner-protocol.json`
+binds the declared request/checkpoint contract to hashes of its trusted workflow,
+helper and archive sources. Preflight verifies that manifest against one exact
+`main` SHA, including both active workflow registrations. `npm run build`
+regenerates it, and `npm run check` rejects stale protocol hashes.
+Set `auto-continue: 'false'` for a
+single-run invocation. Resume inherits the recorded action source, authorization,
+skills, identity, budgets, and continuation limit; changing them is rejected.
 
 Codex is pinned to `0.169.0`, Skills CLI to `1.8.1`, and the three execution
 skills to `markhuangai/agent-remote-dev-skills` commit
@@ -194,10 +211,13 @@ are quiescent, the pushed SHA is verified, the export passes inspection and the
 artifact upload returns an ID. A Linux child subreaper stops and reaps managed
 descendants, including processes that start a separate session. Export and upload
 run in a supervised subprocess bounded by the remaining action budget.
-The version-1 manifest records repository/task,
+The version-2 manifest records repository/task,
 frozen plan/hash and authorization, branch/base/checkpoint SHA, conversation and
 session identifiers, the fixed effective full-access mode, pinned versions/skills, progress, audit/check receipts,
-file hashes and run lineage. It retains the previous durable artifact receipt.
+file hashes and run lineage. It also records explicit worker/auditor identities,
+driver/audit progress, frozen execution settings, and remaining review allowance.
+It retains the previous durable artifact receipt. Version-1 artifacts are
+explicitly rejected because they lack the state needed to resume safely.
 
 Exports include conversation JSONL (including compressed rollouts) and consistent
 backups of the job-owned Codex state, thread-history, goals, queue and memory
@@ -209,16 +229,84 @@ the previous durable receipt. Artifact retention follows repository settings.
 
 Outputs are `task-id`, `branch`, `base-sha`, `session-id`, `checkpoint-sha`,
 `artifact-id`, `pull-request-url` and `status`. Status is `completed`,
-`incomplete`, `blocked` or `failed`; every outcome except verified completion
-fails the action. Budget exhaustion retains the last valid artifact and never
-claims active uncommitted work was saved. There is no cross-run resume or
-continuation dispatch yet. Job-owned temporary tools and configuration are
+`continuing`, `cancelled`, `incomplete`, `blocked` or `failed`. `continuing` is a
+successful durable handoff awaiting the completion controller, not completed
+task delivery. Other outcomes except verified completion fail the action.
+Additional outputs are `root-run-id`, `parent-run-id`, and `continuation-count`.
+Budget exhaustion retains the last valid artifact and never claims active
+uncommitted work was saved. Job-owned temporary tools and configuration are
 removed at termination; artifacts, workflow logs and published source remain.
+
+## Resume and continuation
+
+`runner-task.yml` accepts a JSON `request` on trusted `main`. A new request
+contains `task_id`, `source_sha`, exactly one of `plan` or `issue_url`, the bound
+`authorization`, and `git_author_name`/`git_author_email`. Optional fields are
+`skills`, `budget_minutes`, `auto_continue`, and `max_continuations`. The trusted
+actor gate runs before runtime secrets are exposed. The task job runs for at
+most 360 minutes, with a default 300-minute action budget.
+
+For an explicit manual resume, provide `task_id`, the same `source_sha`, and
+`resume_artifact_id`. The trusted policy loads the frozen authorization and
+settings from that artifact and its original run record. It rejects an older
+checkpoint when a newer task snapshot exists. The action independently verifies
+the artifact, producing workflow/run/attempt, repository, versions, session
+identity, plan hash, skill revisions and frozen root contract.
+
+ZIP entries and all file hashes are inspected before extraction. Traversal,
+absolute or drive-qualified names, links, duplicate entries, encryption,
+unlisted files, oversized expansion, and configuration/authentication files
+are rejected. SQLite snapshots must pass integrity checks. Only validated
+rollout references are rebound to the fresh Codex home; the CLI receives the
+explicit saved conversation ID and the current project directory. Credentials
+and configuration are reprovisioned, and recorded skills are reinstalled.
+
+The task branch must still point to the exact checkpoint commit. A drifted,
+deleted, or unexpectedly advanced branch stops resume; the action never rewinds
+it. An accomplishment pushed without a completed checkpoint upload can therefore
+require explicit recovery rather than resuming an older artifact.
+
+Only `runner-continuation.yml` dispatches automatic children. It uses its trusted
+workflow revision, serializes decisions by task ID, and accepts an explicit
+budget handoff or native workflow timeout. It verifies the latest current-run
+checkpoint, or the inherited checkpoint if the interrupted child produced none.
+If timeout precedes the child's run-record upload, its verified prior dispatch
+claim supplies the inherited execution reference. A child that never entered
+execution carries inactive review allowance through the native preflight-job end.
+Explicit manual resumes carry their artifact/source reference in the native
+run name and retain consumed runs and attempts from the task's native history.
+Cancellation, failed required operations, blockers, completed tasks, exhausted
+review allowance, and continuation limits veto dispatch. Execution jobs also
+serialize by task ID with `cancel-in-progress: false`.
+
+Required checks publish durable started/passed/failed phase records. A pending
+or failed phase vetoes timeout recovery until passing evidence matches a
+published source fingerprint. Review-observation snapshots require a clean
+published tree; unpublished fixes remain outside the last durable checkpoint.
+Restored audit authority is checked against base, auditor/session identity,
+source fingerprint and exact validation assignments. Invalid receipts remain
+in historical evidence and require a fresh audit and checks.
+
+Before dispatch, the controller uploads an immutable claim identifying the
+parent run/attempt, task, checkpoint, and next continuation count. It reconciles
+child registration by the deterministic run name for at most five minutes.
+An existing claim permits reconciliation only; an ambiguous response never
+causes a blind second dispatch. Keep claims, run records and checkpoints as
+durable evidence under repository artifact retention. Missing or expired
+evidence blocks recovery.
+
+Each PR/head retains its 90-minute review observation allowance across runs.
+The driver checkpoints the observation start and carries remaining time to the
+portable wait helper. Interrupted segments use the native parent job end time;
+queue time does not replenish or consume inactive allowance. A new verified
+head begins its own allowance. Historical audit receipts remain available,
+while final PR checks/reviews are always fetched again for the live head.
 
 ## Diagnose runtime execution
 
 ```bash
-gh run view <run-id> --repo <owner/repository> --log | rg 'runtime\.|checkpoint\.'
+gh run view <run-id> --repo <owner/repository> --log |
+  rg 'resume\.|continuation\.|checkpoint\.|runtime\.(heartbeat|deadline|cancelled|outcome|failed)'
 ```
 
 Normal INFO records cover setup, operations, turns, independent audits, Git
@@ -239,6 +327,14 @@ Structured blocker records name the reason, missing inputs and safe GitHub
 references. For a stall, correlate the last
 heartbeat with its timeout and final outcome. No process attachment or database
 query is needed.
+
+`resume.validate` identifies the rejected invariant and safe expected/observed
+identity. `resume.restore` records the relocated workspace/home and restored
+session IDs. `continuation.dispatch` records parent/child run IDs, claim/artifact
+IDs, count/limit, budget, decision, elapsed time and sanitized API causes. Follow
+the recorded parent/controller/child IDs with the same log command. For an
+unreconciled claim, inspect existing child runs before explicit recovery; do not
+repeat the dispatch automatically.
 
 `npm run check` runs production logic with actual Codex/Skills CLIs, Git and
 SQLite, using transport fixtures for model and GitHub exchanges. Both x64 and

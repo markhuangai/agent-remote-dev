@@ -68,7 +68,7 @@ export async function provider(t, replies) {
     if (request.method !== "POST" || !request.url.endsWith("/responses")) { response.writeHead(404); response.end(); return; }
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString()); requests.push(body);
-    const next = typeof replies === "function" ? await replies(body, requests.length) : replies.shift();
+    const next = typeof replies === "function" ? await replies(body, requests.length, request.headers) : replies.shift();
     if (!next) { response.writeHead(400); response.end('{"error":{"message":"Unexpected fixture request"}}'); return; }
     if (next.hang) return;
     if (next.status) { response.writeHead(next.status, { "content-type": "application/json" }); response.end(JSON.stringify(next.body)); return; }

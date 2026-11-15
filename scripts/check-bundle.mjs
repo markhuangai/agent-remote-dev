@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { build, clean, files } from "./build.mjs";
+import { build, clean, files, protocolManifest } from "./build.mjs";
 
 const root = resolve(import.meta.dirname, "..");
+assert.deepEqual(JSON.parse(await readFile(join(root, ".github/runner-protocol.json"), "utf8")), await protocolManifest(), "Stale trusted runner protocol manifest");
 const temporary = await mkdtemp(join(tmpdir(), "codex-bundle-"));
 try {
   await build(temporary);

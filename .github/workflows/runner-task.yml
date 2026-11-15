@@ -1,0 +1,113 @@
+name: Codex task runner
+run-name: Codex task ${{ fromJSON(inputs.request).task_id }} / ${{ fromJSON(inputs.request).dispatch_key || (fromJSON(inputs.request).resume_artifact_id && format('manual-resume-{0}-{1}', fromJSON(inputs.request).resume_artifact_id, fromJSON(inputs.request).source_sha)) || 'manual' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Approved task request or controller-issued resume reference, as JSON
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: read
+
+env:
+  TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+  CODEX_RUNNER_PROTOCOL: '2'
+
+jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      task_id: ${{ steps.request.outputs.task_id }}
+      source_sha: ${{ steps.request.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TASK_REQUEST: ${{ inputs.request }}
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { prepareTaskRequest } = await import(pathToFileURL(
+              process.env.GITHUB_WORKSPACE + '/.github/scripts/continuation-policy.mjs').href);
+            const request = await prepareTaskRequest({ github, context, core });
+            core.setOutput('task_id', request.task_id);
+            core.setOutput('source_sha', request.source_sha);
+
+  execute:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout trusted task policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Revalidate after acquiring the task lock
+        id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TASK_REQUEST: ${{ inputs.request }}
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { prepareTaskRequest } = await import(pathToFileURL(
+              process.env.GITHUB_WORKSPACE + '/trusted/.github/scripts/continuation-policy.mjs').href);
+            core.setOutput('parameters', JSON.stringify(await prepareTaskRequest({ github, context, core })));
+      - name: Checkout immutable action source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          path: action-source
+          persist-credentials: false
+      - name: Checkout target repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          path: target
+          persist-credentials: false
+      - name: Verify immutable action checkout
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: test "$(git -C action-source rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Execute authorized task
+        uses: ./action-source
+        with:
+          working-directory: target
+          action-source-sha: ${{ needs.resolve.outputs.source_sha }}
+          task-id: ${{ needs.resolve.outputs.task_id }}
+          plan: ${{ fromJSON(steps.request.outputs.parameters).plan }}
+          issue-url: ${{ fromJSON(steps.request.outputs.parameters).issue_url }}
+          resume-artifact-id: ${{ fromJSON(steps.request.outputs.parameters).resume_artifact_id }}
+          authorization: ${{ fromJSON(steps.request.outputs.parameters).authorization }}
+          skills: ${{ fromJSON(steps.request.outputs.parameters).skills }}
+          git-author-name: ${{ fromJSON(steps.request.outputs.parameters).git_author_name }}
+          git-author-email: ${{ fromJSON(steps.request.outputs.parameters).git_author_email }}
+          continuation-context: ${{ fromJSON(steps.request.outputs.parameters).execution }}
+          parent-job-ended-at: ${{ fromJSON(steps.request.outputs.parameters).parent_job_ended_at }}
+          parent-job-name: ${{ fromJSON(steps.request.outputs.parameters).parent_job_name }}
+          review-budget: ${{ fromJSON(steps.request.outputs.parameters).review_budget }}
+          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
+          codex-api-key: ${{ secrets.CODEX_API_KEY }}
+          github-token: ${{ secrets.REMOTE_DEV_PAT }}

@@ -5,13 +5,16 @@ import { zstdDecompressSync } from "node:zlib";
 import { Authorization, executionMode, hash, requireValue, RunnerError, SkillSource, versions } from "./contracts.js";
 import { safeTree, Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
+import { checkpointName } from "../.github/scripts/checkpoint-policy.mjs";
+import type { DriverState, Execution } from "./continuation.js";
 
 export const checkpointLimit = 256 * 1024 * 1024;
 const databases = ["state_5.sqlite", "thread_history_1.sqlite", "goals_1.sqlite", "queue_1.sqlite", "memories_1.sqlite", "memories_v2_1.sqlite"];
 export type DurableCheckpoint = { artifact_id: number; checkpoint_sha: string; sequence: number };
 export type CheckpointInput = { task_id: string; repository: string; branch: string; base_sha: string; checkpoint_sha: string;
   plan: string; plan_source: string; authorization: Authorization; sessions: string[]; skills: SkillSource[];
-  progress: unknown; lineage: Record<string, unknown>; audit: unknown; previous: DurableCheckpoint | null };
+  progress: unknown; lineage: Record<string, unknown>; audit: unknown; previous: DurableCheckpoint | null;
+  execution?: Execution; driver?: DriverState; workspace?: string; source_state_hash?: string };
 export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Diagnostics, limit = checkpointLimit) {
   const checkDeadline = () => { if (Date.now() >= Number(job.env.CODEX_TASK_DEADLINE_MS ?? Infinity)) throw new RunnerError("command_timeout", "checkpoint", "Checkpoint export reached the action deadline."); };
   const inspect = (value: unknown, reason: string): void => {
@@ -98,7 +101,8 @@ export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Di
     inventory.push({ path: relative(root, file), sha256: hash(data), bytes: data.length });
   }
   requireValue(input.sessions.every((id) => identifiers.some((entry) => entry.thread_id === id)), "missing_session_history", "checkpoint");
-  const manifest = { schema_version: 1, ...input, permission_mode: executionMode, session_identifiers: identifiers, plan_sha256: hash(input.plan), versions, sequence, files: inventory,
+  const manifest = { schema_version: 2, ...input, workspace: input.workspace ?? process.cwd(), codex_home: job.codexHome,
+    permission_mode: executionMode, session_identifiers: identifiers, plan_sha256: hash(input.plan), versions, sequence, files: inventory,
     limits: { max_bytes: limit }, created_at: new Date().toISOString() };
   const encoded = JSON.stringify(manifest, null, 2) + "\n";
   inspect(manifest, "credential_in_manifest"); inspect(encoded, "credential_in_manifest");
@@ -112,7 +116,7 @@ export async function durableCheckpoint(job: Job, input: CheckpointInput, log: D
   await verify(input.checkpoint_sha);
   const exported = await exportCheckpoint(job, input, log);
   await verify(input.checkpoint_sha);
-  const name = `codex-${input.task_id}-${exported.sequence}`;
+  const name = checkpointName({ ...input, sequence: exported.sequence });
   log.event("checkpoint.upload", "INFO", { stage: "upload", artifact_name: name, intended_sha: input.checkpoint_sha, observed_sha: input.checkpoint_sha, last_durable_checkpoint: input.previous, outcome: "started" });
   let result;
   try { result = await upload(name, exported.files, exported.root); }
