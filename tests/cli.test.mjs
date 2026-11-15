@@ -103,6 +103,31 @@ for (const closeDuringUpload of [false, true]) test(`the real CLI driver audits,
     assert.equal(error.details.expected_sha, result.checkpoint.checkpoint_sha); assert.equal(error.details.observed_sha, "b".repeat(40)); return true;
   });
 });
+test("a real worker Git commit reports both heads and preserves the preceding published checkpoint", async (t) => {
+  const f = await fixture(t), r = await repository(f), source = await portableSource(f);
+  await installSkillSource(f.job, executionSource, source, 0, f.log);
+  const api = await provider(t, [
+    [tool("printf '%s\\n' 'console.log(42);' > greeting.js")],
+    [message(turn("accomplishment", { paths:["greeting.js"], commit_message:"Publish fixture increment" }))],
+    [tool("git commit --allow-empty -m 'Unexpected worker commit'", "unexpected-history")],
+    [message(turn("accomplishment"))],
+  ]);
+  await configure(f.job, api.config, f.log);
+  const git = new TaskGit(r.cwd, f.job.env, f.log, r.branch), plan = "Complete fixture increments with supervisor publication.";
+  let uploads = 0;
+  const result = await drive({ job:f.job, git, log:f.log, plan, planSource:"inline",
+    authorization:{repository:"fixture/repo",plan_sha256:hash(plan),request:"Implement through audited PR delivery with checkpoint pushes"},
+    repository:"fixture/repo",taskId:"fixture-task",base:r.base,budgetMs:240000,started:Date.now(),skills:[executionSource],lineage:{run_id:"13"},
+    checkpoint:input => durableCheckpoint(f.job, input, f.log, sha => git.verify(sha), async () => { uploads++; return { id:41 }; }),
+    complete:async () => { throw new Error("Unexpected delivery in history-drift fixture"); },
+  });
+  assert.equal(result.status, "failed"); assert.equal(uploads, 1); assert.equal(result.checkpoint.artifact_id, 41);
+  const failure = f.records.findLast(record => record.event === "runtime.failed" && record.reason === "worker_changed_git_history");
+  assert.equal(failure.expected_sha, result.checkpoint.checkpoint_sha); assert.equal(failure.observed_sha, await git.head());
+  assert.notEqual(failure.expected_sha, failure.observed_sha); assert.equal(await git.remoteHead(), failure.expected_sha);
+  assert.equal(failure.last_durable_checkpoint.artifact_id, 41); assert.equal(failure.session_id, result.session);
+  assert.match(failure.native_cause, /outside supervisor publication/);
+});
 test("an unsupported completion claim cannot bypass the driver audit and delivery gates", async(t)=>{
   const f=await fixture(t),r=await repository(f),source=await portableSource(f);
   await installSkillSource(f.job,executionSource,source,0,f.log);

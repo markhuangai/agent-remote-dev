@@ -81,8 +81,11 @@ export class TaskGit {
     return digest.digest("hex");
   }
   async publish(paths: string[], message: string, expectedHead: string, previousRemote: string | null) {
-    requireValue((await this.run(["branch", "--show-current"])).trim() === this.branch && this.branch !== "main", "task_branch_changed", "publication");
-    requireValue(await this.head() === expectedHead, "worker_changed_git_history", "publication");
+    const observedBranch = (await this.run(["branch", "--show-current"])).trim(), observedHead = await this.head();
+    if (observedBranch !== this.branch || this.branch === "main") throw new RunnerError("task_branch_changed", "publication", "Publication requires the prepared non-main task branch.",
+      { expected_branch: this.branch, observed_branch: observedBranch, expected_sha: expectedHead, observed_sha: observedHead });
+    if (observedHead !== expectedHead) throw new RunnerError("worker_changed_git_history", "publication", "Git history changed outside supervisor publication.",
+      { expected_sha: expectedHead, observed_sha: observedHead });
     const observed = await this.remoteHead();
     if (observed !== previousRemote) throw new RunnerError("remote_branch_drift", "publication", "Normal publication refused divergent remote state.",
       { expected_sha: previousRemote, observed_sha: observed, intended_sha: expectedHead });

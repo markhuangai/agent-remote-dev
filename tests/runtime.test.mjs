@@ -109,6 +109,17 @@ test("actual Git publication verifies pushed commits, upstream, deletions and re
   assert.equal(await git.remoteHead(), sha);
   await assert.rejects(git.verify(r.base),error=>{f.log.failure(error);assert.equal(error.details.expected_sha,r.base);assert.equal(error.details.observed_sha,sha);return true;});
   assert.equal(await r.git("rev-list", "--left-right", "--count", "HEAD...@{upstream}"), "0\t0");
+  await assert.rejects(git.publish([], "", r.base, sha), error => {
+    assert.equal(error.reason, "worker_changed_git_history"); assert.equal(error.details.expected_sha, r.base);
+    assert.equal(error.details.observed_sha, sha); return true;
+  });
+  await r.git("switch", "main");
+  await assert.rejects(git.publish([], "", sha, sha), error => {
+    assert.equal(error.reason, "task_branch_changed"); assert.equal(error.details.expected_branch, r.branch);
+    assert.equal(error.details.observed_branch, "main"); assert.equal(error.details.expected_sha, sha);
+    assert.equal(error.details.observed_sha, r.base); return true;
+  });
+  await r.git("switch", r.branch);
   await assert.rejects(git.publish([], "", sha, r.base), { reason: "remote_branch_drift" });
   await r.git("rm", "README.md");
   const next = await git.publish(["README.md"], "Remove fixture file", sha, sha);
@@ -320,6 +331,33 @@ test("checkpoint rejects escaped manifest credentials before upload and retains 
   assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
   assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
 });
+for (const [scheme, header, provider, encoding] of [["Bearer", "authorization", false, "utf8"], ["Basic", "Authorization", true, "utf8"], ["Basic", "Proxy-Authorization", false, "latin1"]]) {
+  for (const representation of scheme === "Basic" ? ["payload", "pair", "password"] : ["payload"]) for (const storage of ["JSONL", "SQLite"]) test("configured " + scheme + " " + header + " " + representation + " is excluded from real " + storage + " state before upload", async (t) => {
+    const f = await fixture(t);
+    const password = "fixture-auth-pässword:8721", pair = "fixture-auth-user:" + password;
+    const payload = scheme === "Bearer" ? "fixture-mcp-token-8721" : Buffer.from(pair, encoding).toString("base64");
+    const content = { payload, pair, password }[representation];
+    const value = (scheme === "Bearer" ? "bEaReR" : scheme) + " " + payload;
+    const section = provider ? "model_providers.fixture" : "mcp_servers.fixture";
+    const config = provider ? 'model="gpt-5.1"\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Fixture provider"\nbase_url="https://example.invalid/v1"\nwire_api="responses"\nenv_key="CODEX_API_KEY"\n' : '[mcp_servers.fixture]\nurl="https://example.invalid/mcp"\n';
+    await configure(f.job, config + "[" + section + ".http_headers]\n" + JSON.stringify(header) + "=" + JSON.stringify(value) + "\n", f.log);
+    assert.ok(f.log.protectedValues.includes(value));
+    await history(f, storage === "JSONL" ? content : "Completed fixture turn");
+    if (storage === "SQLite") {
+      const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
+      try { db.exec("CREATE TABLE tool_error (value TEXT)"); db.prepare("INSERT INTO tool_error VALUES (?)").run(content); }
+      finally { db.close(); }
+    }
+    const previous = { sequence:3, artifact_id:9, checkpoint_sha:"a".repeat(40) };
+    let uploaded = false;
+    await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+      uploaded = true; return { id:10 };
+    }), error => { assert.equal(error.reason, "credential_in_checkpoint"); f.log.failure(error, previous); return true; });
+    assert.equal(uploaded, false); assert.deepEqual(previous, { sequence:3, artifact_id:9, checkpoint_sha:"a".repeat(40) });
+    assert.ok(!f.records.some(record => record.event === "checkpoint.complete"));
+    assert.ok(!JSON.stringify(f.records).includes(content));
+  });
+}
 test("non-secret environment flags permit export while configured MCP credentials remain excluded",async(t)=>{
   const f=await fixture(t),secret="fixture-mcp-credential-9371";
   await configure(f.job,`[mcp_servers.fixture.env]\nDEBUG="1"\nMCP_API_TOKEN="${secret}"\n`,f.log);

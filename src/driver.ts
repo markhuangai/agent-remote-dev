@@ -48,7 +48,9 @@ Portable delivery instructions:\n${guidance}`;
       log.fields.session_id = session;
       const result = parseTurn(response.result);
       if (result.pr_url) prUrl = result.pr_url;
-      requireValue(await git.head() === expectedHead, "worker_changed_git_history", "worker");
+      const observedHead = await git.head();
+      if (observedHead !== expectedHead) throw new RunnerError("worker_changed_git_history", "worker", "The worker changed Git history outside supervisor publication.",
+        { expected_sha: expectedHead, observed_sha: observedHead });
       if (result.validation_policy) {
         requireValue(!policy || JSON.stringify(policy) === JSON.stringify(result.validation_policy), "validation_policy_changed", "worker");
         policy = result.validation_policy;

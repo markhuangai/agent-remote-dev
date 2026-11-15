@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
-import { requireValue, turnSchema } from "./contracts.js";
+import { RunnerError, turnSchema } from "./contracts.js";
 
 export function codexArgs(job: Job, cwd: string, schemaPath: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
@@ -16,15 +16,17 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
   const schemaPath = join(job.root, `schema-${ordinal}.json`), output = join(job.root, `result-${ordinal}.json`);
   await writeFile(schemaPath, JSON.stringify(schema), { mode: 0o600 });
   let observed: string | undefined;
+  const stage = ordinal.startsWith("audit-") ? "audit" : "worker";
   await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, schemaPath, output, session), {
-    cwd, env: job.env, stage: ordinal.startsWith("audit-") ? "audit" : "worker", log, timeoutMs, stdin: prompt, collect: false,
+    cwd, env: job.env, stage, log, timeoutMs, stdin: prompt, collect: false,
     onLine(line) {
       let value: any;
       try { value = JSON.parse(line); } catch { return; }
       if (value.type === "thread.started" && typeof value.thread_id === "string") observed = value.thread_id;
     },
   });
-  requireValue(observed && (!session || observed === session), "conversation_identity_changed", "worker");
+  if (!observed || (session && observed !== session)) throw new RunnerError("conversation_identity_changed", stage,
+    "Codex did not return the expected conversation identity.", { expected_session: session ?? null, observed_session: observed ?? null, ordinal });
   return { session: observed, result: await readFile(output, "utf8") };
 }
 export const auditSchema = { type: "object", additionalProperties: false, properties: {

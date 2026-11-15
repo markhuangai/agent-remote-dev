@@ -31,7 +31,22 @@ export async function configure(job: Job, raw: string, log: Diagnostics) {
   try { config = parse(raw); } catch { throw new RunnerError("invalid_codex_config", "configuration", "Codex TOML could not be parsed; configuration contents withheld."); }
   const protect = (value: any, key = "") => {
     if (/\.(env_key|env_vars)$/.test(key)) return;
-    if (typeof value === "string" && (/key|token|secret|password|auth|credential|signature/i.test(key.split(".").at(-1)!) || /\.(?:http_headers|headers)\./i.test(key))) log.protect(value);
+    if (typeof value === "string" && (/key|token|secret|password|auth|credential|signature/i.test(key.split(".").at(-1)!) || /\.(?:http_headers|headers)\./i.test(key))) {
+      log.protect(value);
+      if (/\.(?:http_headers|headers)\.(?:proxy-)?authorization$/i.test(key)) {
+        const credentials = /^\s*(Bearer|Basic)\s+(\S+)\s*$/i.exec(value);
+        if (credentials) {
+          log.protect(credentials[2]);
+          if (credentials[1].toLowerCase() === "basic") {
+            const bytes = Buffer.from(credentials[2], "base64");
+            for (const encoding of ["utf8", "latin1"] as const) {
+              const pair = bytes.toString(encoding), separator = pair.indexOf(":");
+              if (separator >= 0) { log.protect(pair); log.protect(pair.slice(separator + 1)); }
+            }
+          }
+        }
+      }
+    }
     else if (value && typeof value === "object") for (const [childKey, child] of Object.entries(value)) protect(child, key + "." + childKey);
   };
   protect(config);

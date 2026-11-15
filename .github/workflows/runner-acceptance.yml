@@ -90,6 +90,14 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
+      - name: Verify action checkout
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          set -euo pipefail
+          observed_source="$(git -C action-source rev-parse HEAD)"
+          printf 'Authorized action source: expected %s, observed %s\n' "$SOURCE_SHA" "$observed_source"
+          test "$observed_source" = "$SOURCE_SHA"
       - name: Execute explicitly authorized acceptance task
         uses: ./action-source
         with:
