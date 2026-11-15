@@ -29,6 +29,7 @@ on:
 permissions:
   contents: read
   issues: read
+  actions: read
 
 jobs:
   acceptance:
@@ -102,6 +103,7 @@ jobs:
         uses: ./action-source
         with:
           working-directory: target
+          action-source-sha: ${{ inputs.source-sha }}
           plan: ${{ inputs.plan }}
           issue-url: ${{ inputs.issue-url }}
           authorization: ${{ inputs.authorization }}

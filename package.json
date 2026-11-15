@@ -6,7 +6,7 @@
   "engines": { "node": ">=24 <25" },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs && node scripts/check-bundle.mjs"
+    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs tests/continuation.test.mjs && node scripts/check-bundle.mjs"
   },
   "dependencies": {
     "@actions/artifact": "6.3.1",

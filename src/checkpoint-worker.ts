@@ -7,6 +7,7 @@ import { RunnerError, requireValue, versions } from "./contracts.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
+import { recordName } from "../.github/scripts/checkpoint-policy.mjs";
 
 export async function checkpointWorker(requestPath: string) {
   const request = JSON.parse(await readFile(requestPath, "utf8"));
@@ -14,16 +15,45 @@ export async function checkpointWorker(requestPath: string) {
   const log = new Diagnostics(request.fields, { info: emit, warning: emit, error: emit, debug: emit });
   for (const secret of request.secrets) log.protect(secret);
   try {
-    const git = new TaskGit(request.cwd, request.job.env, log, request.input.branch);
     const artifactRoot = join(request.job.tools, "node_modules", "@actions", "artifact");
     const metadata = JSON.parse(await readFile(join(artifactRoot, "package.json"), "utf8"));
     requireValue(metadata.name === "@actions/artifact" && metadata.version === versions.artifact_sdk, "artifact_sdk_version_mismatch", "checkpoint");
     const { DefaultArtifactClient } = await import(/* webpackIgnore: true */ pathToFileURL(join(artifactRoot, "lib", "artifact.js")).href);
     const artifacts = new DefaultArtifactClient();
+    if (request.kind === "record") {
+      const receipt = await artifacts.uploadArtifact(request.name, [request.file], request.root);
+      requireValue(Number.isSafeInteger(receipt.id) && receipt.id > 0, "missing_artifact_receipt", "continuation");
+      await writeFile(request.resultPath, JSON.stringify({ artifact_id: receipt.id }), { mode: 0o600 });
+      return;
+    }
+    const git = new TaskGit(request.cwd, request.job.env, log, request.input.branch);
     const receipt = await durableCheckpoint(request.job, request.input, log, (sha) => git.verify(sha),
       (name, files, root) => artifacts.uploadArtifact(name, files, root));
     await writeFile(request.resultPath, JSON.stringify(receipt), { mode: 0o600 });
-  } catch (error) { log.failure(error, request.input.previous); process.exitCode = 1; }
+  } catch (error) { log.failure(error, request.input?.previous ?? null); process.exitCode = 1; }
+}
+export async function isolatedRecord(job: Job, kind: "run" | "outcome" | `validation-${number}-${"started" | "passed" | "failed"}`, value: any, log: Diagnostics,
+  environment: NodeJS.ProcessEnv = process.env, entry = process.argv[1]) {
+  const name = recordName(kind, value.task_id, String(value.lineage.run_id), String(value.lineage.run_attempt));
+  const root = join(job.exports, name), file = join(root, "record.json"), resultPath = join(job.root, `${kind}-receipt.json`);
+  const inspect = (data: unknown): void => {
+    if (typeof data === "string") for (const secret of log.protectedValues) requireValue(!data.includes(secret), "credential_in_manifest", "continuation");
+    else if (data && typeof data === "object") for (const [key, child] of Object.entries(data)) { inspect(key); inspect(child); }
+  };
+  inspect(value);
+  const encoded = JSON.stringify(value);
+  requireValue(Buffer.byteLength(encoded) <= 2 * 1024 * 1024, "continuation_record_size_limit", "continuation");
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(root, { mode: 0o700 });
+  await writeFile(file, encoded, { mode: 0o600 });
+  const requestPath = join(job.root, `${kind}-request.json`);
+  await writeFile(requestPath, JSON.stringify({ kind: "record", job, name, file, root, resultPath, fields: log.fields, secrets: log.protectedValues }), { mode: 0o600 });
+  await command(process.execPath, [entry, "--checkpoint-worker", requestPath], { cwd: job.root,
+    env: { ...environment, CODEX_TASK_DEADLINE_MS: job.env.CODEX_TASK_DEADLINE_MS }, stage: "continuation_record", log, collect: false });
+  const receipt = JSON.parse(await readFile(resultPath, "utf8"));
+  requireValue(Number.isSafeInteger(receipt.artifact_id) && receipt.artifact_id > 0, "invalid_record_receipt", "continuation");
+  log.event("continuation.record", "INFO", { kind, artifact_id: receipt.artifact_id, artifact_name: name, outcome: "durable" });
+  return receipt;
 }
 export async function isolatedCheckpoint(job: Job, cwd: string, input: CheckpointInput, log: Diagnostics, verify: (sha: string) => Promise<void>,
   environment: NodeJS.ProcessEnv = process.env, entry = process.argv[1]): Promise<DurableCheckpoint> {

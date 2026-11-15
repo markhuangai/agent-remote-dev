@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { runnerVersions } from "../.github/scripts/checkpoint-policy.mjs";
 
-export const versions = { codex: "0.169.0", skills_cli: "1.8.1", artifact_sdk: "6.3.1", execution_skills: "224a5be4ddf40c6cf0a50b97885cb353e8522e2e" };
+export const versions = runnerVersions;
 export const shaPattern = /^[a-f0-9]{40}$/;
 export const executionMode = "full-access";
-export type Status = "completed" | "incomplete" | "blocked" | "failed";
+export type Status = "completed" | "continuing" | "cancelled" | "incomplete" | "blocked" | "failed";
 export type Authorization = { repository: string; plan_sha256: string; request: string };
 export type SkillSource = { repository: string; revision: string; names: string[] };
 export type ValidationPolicy = { checks: string[]; reviewers: string[]; local_checks: string[]; marked_review_count: number };

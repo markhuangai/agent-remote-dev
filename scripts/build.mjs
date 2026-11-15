@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdtemp, readdir, rmdir, unlink } from "node:fs/promises";
+import { cp, mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { digest, protocolContract, protocolFiles } from "../.github/scripts/checkpoint-policy.mjs";
 
 export const root = resolve(import.meta.dirname, "..");
+export async function protocolManifest() {
+  const inventory = {};
+  for (const path of protocolFiles) inventory[path] = digest(await readFile(join(root, path)));
+  return { ...protocolContract, files: inventory };
+}
 export async function files(path) {
   const output = [];
   for (const entry of await readdir(path, { withFileTypes: true })) {
@@ -25,9 +31,10 @@ export async function clean(path) {
 }
 export async function build(destination) {
   await promisify(execFile)(process.execPath, [join(root, "node_modules/@vercel/ncc/dist/ncc/cli.js"), "build", "src/entry.ts", "-o", destination, "--minify", "--license", "licenses.txt"], { cwd: root });
-  await cp(join(root,"src/supervise.py"),join(destination,"supervise.py"));
+  for (const name of ["supervise.py", "archive.py"]) await cp(join(root,"src",name),join(destination,name));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  await writeFile(join(root, ".github/runner-protocol.json"), JSON.stringify(await protocolManifest(), null, 2) + "\n");
   const temporary = await mkdtemp(join(tmpdir(), "codex-build-"));
   try {
     await build(temporary);

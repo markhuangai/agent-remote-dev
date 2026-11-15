@@ -253,7 +253,7 @@ for(const interruption of ["budget","SIGTERM","SIGINT"]) test(`${interruption} i
     checkpoint:async input=>{const receipt=await durableCheckpoint(f.job,input,f.log,sha=>git.verify(sha),async()=>({id:++uploads}));
       if(interruption!=="budget"){const send=()=>{if(process.listenerCount(interruption)>0)process.kill(process.pid,interruption);else signalTimer=setTimeout(send,10);};signalTimer=setTimeout(send,1000);}return receipt;},
     complete:async()=>{throw Error("Interrupted work cannot complete");}});
-  assert.equal(result.status,"incomplete");assert.equal(uploads,1);assert.equal(result.checkpoint.artifact_id,1);
+  assert.equal(result.status,interruption === "budget" ? "incomplete" : "cancelled");assert.equal(uploads,1);assert.equal(result.checkpoint.artifact_id,1);
   assert.equal(await git.remoteHead(),result.checkpoint.checkpoint_sha);
-  assert.equal(f.records.findLast(record=>record.event==="runtime.complete").status,"incomplete");
+  assert.equal(f.records.findLast(record=>record.event==="runtime.complete").status,interruption === "budget" ? "incomplete" : "cancelled");
 });
