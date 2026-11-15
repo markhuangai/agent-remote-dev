@@ -34,14 +34,25 @@ export class TaskGit {
     return new Map((await this.run(["ls-files", "--stage", "-z"])).split("\0").filter((entry) => entry.startsWith("160000 "))
       .map((entry) => [entry.slice(entry.indexOf("\t") + 1), entry.split(" ")[1]]));
   }
+  private async worktreeEntry(path: string, gitlinks: Map<string, string>) {
+    const parts = path.split("/");
+    try {
+      for (let index = 1; index < parts.length; index++) {
+        if (!(await lstat(join(this.cwd, ...parts.slice(0, index)))).isDirectory()) return null;
+      }
+      const stat = await lstat(join(this.cwd, path));
+      if (stat.isDirectory() && !gitlinks.has(path)) return null;
+      requireValue(stat.isFile() || stat.isSymbolicLink() || stat.isDirectory(), "unsupported_worktree_entry", "git");
+      return stat;
+    } catch (error: any) { if (["ENOENT", "ENOTDIR"].includes(error.code)) return null; throw error; }
+  }
   async fingerprint() {
     const digest = createHash("sha256");
     const gitlinks = await this.gitlinks();
     const paths = [...new Set((await this.run(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean))].sort();
     for (const path of paths) {
-      let stat;
-      try { stat = await lstat(join(this.cwd, path)); }
-      catch (error: any) { if (error.code === "ENOENT") continue; throw error; }
+      const stat = await this.worktreeEntry(path, gitlinks);
+      if (!stat) continue;
       digest.update(path + "\0");
       digest.update(stat.isSymbolicLink() ? "symlink" : String(stat.mode & 0o777));
       if (stat.isDirectory() && gitlinks.has(path)) {
@@ -75,7 +86,8 @@ export class TaskGit {
     for (const path of paths) {
       let bytes: Buffer;
       try {
-        const stat = await lstat(join(this.cwd, path));
+        const stat = await this.worktreeEntry(path, gitlinks);
+        if (!stat) continue;
         if (stat.isDirectory() && gitlinks.has(path)) {
           const nested = new TaskGit(join(this.cwd, path), this.env, this.log, this.branch);
           requireValue((await nested.run(["rev-parse", "--show-toplevel"])).trim() === nested.cwd, "uninitialized_submodule", "publication");
@@ -89,7 +101,8 @@ export class TaskGit {
     if (paths.length) {
       requireValue(message.trim().length > 0, "missing_commit_message", "publication");
       const unstaged = (await this.run(["ls-files", "-m", "-d", "-o", "--exclude-standard", "-z"])).split("\0").filter(Boolean);
-      const staging = paths.filter((path) => unstaged.includes(path));
+      const pending = paths.filter((path) => unstaged.includes(path));
+      const staging = pending.filter((path) => !pending.some((parent) => path.startsWith(parent + "/")));
       if (staging.length) await this.run(["add", "--all", "--", ...staging]);
       await this.run(["commit", "-m", message]);
     }

@@ -14,6 +14,20 @@ export type CheckpointInput = { task_id: string; repository: string; branch: str
   progress: unknown; lineage: Record<string, unknown>; audit: unknown; previous: DurableCheckpoint | null };
 export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Diagnostics, limit = checkpointLimit) {
   const checkDeadline = () => { if (Date.now() >= Number(job.env.CODEX_TASK_DEADLINE_MS ?? Infinity)) throw new RunnerError("command_timeout", "checkpoint", "Checkpoint export reached the action deadline."); };
+  const inspect = (value: unknown, reason: string): void => {
+    checkDeadline();
+    if (typeof value === "string" || value instanceof Uint8Array) {
+      const bytes = Buffer.from(value);
+      for (const secret of log.protectedValues) requireValue(!bytes.includes(Buffer.from(secret)), reason, "checkpoint");
+      if (typeof value === "string" && /^[\s]*[\[{"]/.test(value)) {
+        let decoded: unknown;
+        try { decoded = JSON.parse(value); } catch { return; }
+        inspect(decoded, reason);
+      }
+    } else if (value && typeof value === "object") {
+      for (const [key, child] of Object.entries(value)) { inspect(key, reason); inspect(child, reason); }
+    }
+  };
   checkDeadline();
   const sequence = (input.previous?.sequence ?? 0) + 1;
   log.event("checkpoint.export", "INFO", { stage: "export", outcome: "started", sequence, intended_sha: input.checkpoint_sha, last_durable_checkpoint: input.previous });
@@ -41,10 +55,18 @@ export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Di
     await mkdir(join(root, "codex"), { recursive: true });
     const db = new DatabaseSync(source, { readOnly: true });
     try { await backup(db, join(root, "codex", name)); } finally { db.close(); }
+    requireValue((await lstat(join(root, "codex", name))).size <= limit, "checkpoint_size_limit", "checkpoint");
     const saved = new DatabaseSync(join(root, "codex", name));
     try {
       requireValue(saved.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode === "delete", "sqlite_snapshot_journal_failed", "checkpoint");
       requireValue(saved.prepare("PRAGMA integrity_check").all().every((row) => Object.values(row)[0] === "ok"), "sqlite_integrity_failed", "checkpoint");
+      const schema = saved.prepare("SELECT * FROM sqlite_schema").all();
+      inspect(schema, "credential_in_checkpoint");
+      for (const table of schema.filter((entry) => entry.type === "table")) {
+        const statement = saved.prepare(`SELECT * FROM "${String(table.name).replaceAll('"', '""')}"`);
+        statement.setReadBigInts(true);
+        for (const row of statement.iterate()) inspect(row, "credential_in_checkpoint");
+      }
     }
     finally { saved.close(); }
   }
@@ -58,9 +80,18 @@ export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Di
     bytes += data.length;
     requireValue(bytes <= limit, "checkpoint_size_limit", "checkpoint");
     const decoded = file.endsWith(".zst") ? zstdDecompressSync(data, { maxOutputLength: limit }) : data;
-    for (const secret of log.protectedValues) requireValue(!data.includes(Buffer.from(secret)) && !decoded.includes(Buffer.from(secret)), "credential_in_checkpoint", "checkpoint");
+    inspect(data, "credential_in_checkpoint"); inspect(decoded, "credential_in_checkpoint");
     if (/\.jsonl(?:\.zst)?$/.test(file)) {
-      const meta = JSON.parse(decoded.toString("utf8").split("\n", 1)[0]);
+      const lines = decoded.toString("utf8").trimEnd().split("\n");
+      let meta: any;
+      for (const [index, line] of lines.entries()) {
+        checkDeadline();
+        let record;
+        try { record = JSON.parse(line); }
+        catch { throw new RunnerError("invalid_session_history", "checkpoint", "Session history contains malformed JSON."); }
+        inspect(record, "credential_in_checkpoint");
+        if (index === 0) meta = record;
+      }
       requireValue(meta.type === "session_meta" && typeof meta.payload?.id === "string", "invalid_session_metadata", "checkpoint");
       identifiers.push({ thread_id: meta.payload.id, session_id: meta.payload.session_id ?? meta.payload.id });
     }
@@ -70,7 +101,7 @@ export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Di
   const manifest = { schema_version: 1, ...input, permission_mode: executionMode, session_identifiers: identifiers, plan_sha256: hash(input.plan), versions, sequence, files: inventory,
     limits: { max_bytes: limit }, created_at: new Date().toISOString() };
   const encoded = JSON.stringify(manifest, null, 2) + "\n";
-  for (const secret of log.protectedValues) requireValue(!encoded.includes(secret), "credential_in_manifest", "checkpoint");
+  inspect(manifest, "credential_in_manifest"); inspect(encoded, "credential_in_manifest");
   requireValue(bytes + Buffer.byteLength(encoded) <= limit, "checkpoint_size_limit", "checkpoint");
   await writeFile(join(root, "manifest.json"), encoded, { mode: 0o600 });
   log.event("checkpoint.export", "INFO", { stage: "export", outcome: "complete", sequence, checkpoint_sha: input.checkpoint_sha, file_count: files.length + 1, bytes: bytes + Buffer.byteLength(encoded) });

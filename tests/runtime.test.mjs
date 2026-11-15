@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, lstat, mkdir, readFile, readdir, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
@@ -130,6 +130,42 @@ for (const change of ["deletion", "rename"]) test(`audited ${change} fingerprint
   await writeFile(join(r.cwd, "renamed.md"), "Later implementation change\n");
   assert.notEqual(await git.fingerprint(), audited);
 });
+for (const replacement of ["file-to-directory", "directory-to-file", "directory-to-symlink"]) for (const staged of [false, true]) {
+  test("real " + replacement + " preserves audit identity and publication with " + (staged ? "staged" : "unstaged") + " changes", async (t) => {
+    const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
+    const initial = replacement === "file-to-directory" ? "shape" : "shape/old.ts";
+    await mkdir(join(r.cwd, initial, ".."), { recursive: true });
+    await writeFile(join(r.cwd, initial), "Original fixture\n");
+    await r.git("add", "shape"); await r.git("commit", "-m", "Prepare replacement fixture");
+    const base = await git.head(), original = await git.fingerprint();
+    await unlink(join(r.cwd, initial));
+    if (replacement !== "file-to-directory") await rmdir(join(r.cwd, "shape"));
+    const current = replacement === "file-to-directory" ? "shape/new.ts" : "shape";
+    const outside = join(f.temporary, "outside");
+    if (replacement === "directory-to-symlink") {
+      await mkdir(outside); await writeFile(join(outside, "old.ts"), f.job.env.CODEX_API_KEY);
+      await symlink(outside, join(r.cwd, current));
+    } else {
+      await mkdir(join(r.cwd, current, ".."), { recursive: true });
+      await writeFile(join(r.cwd, current), "Replacement fixture\n");
+    }
+    const audited = await git.fingerprint(), paths = await git.changedPaths();
+    assert.notEqual(audited, original);
+    if (staged) { await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited); }
+    if (replacement !== "directory-to-symlink") {
+      await writeFile(join(r.cwd, current), f.job.env.CODEX_API_KEY);
+      await assert.rejects(git.publish(paths, "Reject contaminated replacement", base, null), { reason: "credential_in_commit" });
+      assert.equal(await git.head(), base); assert.equal(await git.remoteHead(), null);
+      await writeFile(join(r.cwd, current), "Replacement fixture\n");
+      assert.equal(await git.fingerprint(), audited);
+    }
+    const sha = await git.publish(paths, "Publish " + replacement, base, null);
+    assert.equal(await git.remoteHead(), sha); assert.equal(await git.fingerprint(), audited);
+    assert.equal(await r.git("status", "--porcelain"), "");
+    const published = await exec("git", ["--git-dir", r.remote, "show", sha + ":" + current], { env: f.job.env });
+    assert.equal(published.stdout, replacement === "directory-to-symlink" ? outside : "Replacement fixture\n");
+  });
+}
 test("real submodule fingerprints and publication preserve clean references and reject unpublished child work",async(t)=>{
   const f=await fixture(t),r=await repository(f),source=join(f.temporary,"module-source");
   await mkdir(source);
@@ -210,6 +246,54 @@ for (const compressed of [false, true]) test(`credential exclusion scans ${compr
     const { unlink } = await import("node:fs/promises"); await unlink(path);
   }
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+for (const storage of ["TEXT", "BLOB"]) test("checkpoint rejects a credential reconstructed across real SQLite " + storage + " overflow pages before upload", async (t) => {
+  const f = await fixture(t); await history(f);
+  const secret = "fixture-sqlite-credential-" + "x".repeat(1500) + "-9371";
+  f.log.protect(secret);
+  const path = join(f.job.codexHome, "state_5.sqlite"), db = new DatabaseSync(path);
+  db.exec("PRAGMA page_size=512; CREATE TABLE protected_value (value " + storage + ");");
+  db.prepare("INSERT INTO protected_value VALUES (?)").run(storage === "TEXT" ? secret : Buffer.from(secret));
+  assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+  const stored = db.prepare("SELECT value FROM protected_value").get().value;
+  assert.equal(storage === "TEXT" ? stored : Buffer.from(stored).toString(), secret);
+  db.close();
+  assert.equal((await readFile(path)).includes(Buffer.from(secret)), false);
+  const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
+  let uploaded = false;
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+    uploaded = true; return { id: 10 };
+  }), { reason: "credential_in_checkpoint" });
+  assert.equal(uploaded, false); assert.deepEqual(previous, { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) });
+  assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
+});
+for (const compressed of [false, true]) test("checkpoint decodes escaped credentials in " + (compressed ? "compressed" : "plain") + " JSONL before upload", async (t) => {
+  const f = await fixture(t), secret = 'fixture-"escaped\\credential\n9371';
+  await configure(f.job, "[mcp_servers.fixture.env]\nPASSWORD=" + JSON.stringify(secret) + "\n", f.log);
+  await history(f, secret);
+  const path = join(f.job.codexHome, "sessions/rollout.jsonl"), data = await readFile(path);
+  assert.equal(data.includes(Buffer.from(secret)), false);
+  if (compressed) { await writeFile(path + ".zst", zstdCompressSync(data)); await unlink(path); }
+  const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
+  let uploaded = false;
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+    uploaded = true; return { id: 10 };
+  }), { reason: "credential_in_checkpoint" });
+  assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
+  assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
+});
+test("checkpoint rejects escaped manifest credentials before upload and retains its preceding receipt", async (t) => {
+  const f = await fixture(t), secret = 'fixture-"manifest\\credential\n9371';
+  await configure(f.job, "[mcp_servers.fixture.env]\nPASSWORD=" + JSON.stringify(secret) + "\n", f.log); await history(f);
+  const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
+  const input = checkpoint({ previous, progress: { detail: secret } });
+  assert.equal(JSON.stringify(input).includes(secret), false);
+  let uploaded = false;
+  await assert.rejects(durableCheckpoint(f.job, input, f.log, async () => {}, async () => {
+    uploaded = true; return { id: 10 };
+  }), { reason: "credential_in_manifest" });
+  assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
+  assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
 });
 test("non-secret environment flags permit export while configured MCP credentials remain excluded",async(t)=>{
   const f=await fixture(t),secret="fixture-mcp-credential-9371";
