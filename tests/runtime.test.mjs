@@ -24,10 +24,12 @@ async function history(f, content = "completed turn") {
   const data = JSON.stringify({ type: "session_meta", payload: { id: "fixture-session", session_id: "root-session" } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
   await writeFile(join(f.job.codexHome, "sessions/rollout.jsonl"), data);
 }
-test("plan selection and direct authorization bind exact bytes and repository without a mode selector", () => {
-  assert.equal(selectPlanSource(plan, "", "fixture/repo").plan, plan);
-  assert.equal(selectPlanSource("", "https://github.com/fixture/repo/issues/2", "fixture/repo").issueNumber, "2");
-  for (const args of [[plan,"https://github.com/fixture/repo/issues/2"], ["", ""], ["", "https://github.com/other/repo/issues/2"]]) assert.throws(() => selectPlanSource(...args, "fixture/repo"));
+test("prompt selection preserves exact bytes and issue references without a mode selector", () => {
+  assert.equal(selectPlanSource(plan).plan, plan);
+  const issuePrompt = "Implement https://github.com/fixture/repo/issues/2 using $chosen-skill.";
+  assert.equal(selectPlanSource(issuePrompt).plan, issuePrompt);
+  assert.equal(selectPlanSource("", "41").resumeArtifactId, 41);
+  for (const args of [[plan, "41"], ["", ""], ["", "invalid"]]) assert.throws(() => selectPlanSource(...args));
   assert.deepEqual(authorize(JSON.stringify(auth), "fixture/repo", plan), auth);
   for (const changed of [{ ...auth, permission_mode: "sandboxed" }, { ...auth, permission_mode: "full-access" }, { ...auth, plan_sha256: hash(plan.trim()) }, { ...auth, request: "" }, { ...auth, repository: "other/repo" }]) {
     assert.throws(() => authorize(JSON.stringify(changed), "fixture/repo", plan));

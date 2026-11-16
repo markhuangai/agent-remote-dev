@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs tests/continuation.test.mjs tests/submission.test.mjs tests/release.test.mjs && node scripts/check-bundle.mjs",
+    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs tests/continuation.test.mjs tests/submission.test.mjs tests/project-config.test.mjs tests/release.test.mjs && node scripts/check-bundle.mjs",
     "test:skill-install": "tsc && node scripts/copy-test-resources.mjs && node --test tests/skill-install.test.mjs"
   },
   "dependencies": {
@@ -16,7 +16,8 @@
     "@actions/core": "3.0.1",
     "@openai/codex": "0.169.0",
     "skills": "1.8.1",
-    "smol-toml": "1.9.1"
+    "smol-toml": "1.9.1",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@types/node": "24.10.1",

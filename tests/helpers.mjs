@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { Diagnostics } from "../.build/diagnostics.js";
 import { createJob, removeJob } from "../.build/setup.js";
-import { versions } from "../.build/contracts.js";
+import { hash, versions } from "../.build/contracts.js";
 
 export const root = resolve(import.meta.dirname, "..");
 export const exec = promisify(execFile);
@@ -146,5 +146,6 @@ else{process.stderr.write('Unexpected skill transport endpoint');process.exitCod
 }
 
 export const executionSource = { repository: 'markhuangai/agent-remote-dev-skills', revision: '224a5be4ddf40c6cf0a50b97885cb353e8522e2e', names: ['sdlc-plan-implementation', 'plan-audit', 'pr-review-loop'] };
-export const execution = (extra = {}) => ({ source_repository: 'action/source', source_sha: 'a'.repeat(40), runner: ['ubuntu-latest'], auto_continue: true, max_continuations: 3, continuation_count: 0, budget_minutes: 3, root_run_id: '13', root_run_attempt: '1', activation_run_id: '13', parent_run_id: null, parent_run_attempt: null, git_author_name: 'Fixture Author', git_author_email: 'fixture@example.invalid', user_agents_url: null, user_agents_sha256: null, ...extra });
+export const projectConfig = { revision: 'a'.repeat(40), content: 'allowed-actors: [Z-M-Huang]\nskills: []\n', sha256: hash('allowed-actors: [Z-M-Huang]\nskills: []\n') };
+export const execution = (extra = {}) => ({ request_id: 'fixture-request', project_config: projectConfig, source_repository: 'action/source', source_sha: 'a'.repeat(40), runner: ['ubuntu-latest'], auto_continue: true, max_continuations: 3, continuation_count: 0, budget_minutes: 3, root_run_id: '13', root_run_attempt: '1', activation_run_id: '13', parent_run_id: null, parent_run_attempt: null, git_author_name: 'Fixture Author', git_author_email: 'fixture@example.invalid', user_agents_url: null, user_agents_sha256: null, ...extra });
 export const lineage = { repository: 'fixture/repo', workflow_ref: 'fixture/repo/.github/workflows/runner-task.yml@refs/heads/main', workflow_sha: 'a'.repeat(40), run_id: '13', run_attempt: '1', actor: 'Z-M-Huang', triggering_actor: 'Z-M-Huang' };

@@ -8,11 +8,12 @@ import { exportCheckpoint } from '../.build/checkpoint.js';
 import { unpackArchive, validateCheckpoint } from '../.build/resume.js';
 import { verifyResumeSettings } from '../.build/continuation.js';
 import { checkpointName, recordName, registrationKey, validateManifest, validateProducer } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { childRunName, continuationDecision, prepareTaskRequest, runController, requireActive } from '../.github/remote-codex/continuation-policy.mjs';
+import { childRunName, continuationDecision, prepareTaskRequest, runController, requireActive, cancelTaskRuns } from '../.github/remote-codex/continuation-policy.mjs';
 import { verifyProtocol } from '../.github/remote-codex/protocol-policy.mjs';
+import { parseProjectConfig } from '../.github/remote-codex/project-config.mjs';
 import { exec, execution, fixture, lineage as fixtureLineage, root } from './helpers.mjs';
 
-const repo = 'fixture/repo', taskId = 'fixture-task', branch = 'skill/selected-branch', sourceSha = 'a'.repeat(40);
+const repo = 'fixture/repo', taskId = '13', branch = 'skill/selected-branch', sourceSha = 'a'.repeat(40);
 const lineage = fixtureLineage;
 const json = value => JSON.stringify(value);
 const registered = value => json({ ...value, registration_key: registrationKey(value) });
@@ -80,7 +81,8 @@ async function protocolFixture(t, supplied) {
   model.protocol = JSON.parse(await readFile(join(root, '.github/remote-codex/protocol.json'), 'utf8'));
   model.sources = new Map();
   for (const path of Object.keys(model.protocol.files)) model.sources.set(path, await readFile(join(root, path)));
-  model.jobs = new Map();
+  model.sources.set('remote-codex.yml', await readFile(join(root, 'remote-codex.yml')));
+  model.jobs = new Map(); model.cancelled = [];
   const api = async (endpoint, options = {}) => {
     const method = options.method ?? 'GET';
     if (endpoint.includes('/collaborators/')) return { permission: model.permission ?? 'write' };
@@ -95,6 +97,7 @@ async function protocolFixture(t, supplied) {
       return endpoint.endsWith('/zip') ? payloads.get(id) : artifacts.get(id);
     }
     if (endpoint === `/repos/action/source/commits/${sourceSha}` || endpoint === `/repos/${repo}/commits/${sourceSha}`) return { sha: sourceSha };
+    if (method === 'POST' && /\/actions\/runs\/[0-9]+\/cancel$/.test(endpoint)) { model.cancelled.push(Number(endpoint.match(/runs\/([0-9]+)/)[1])); return undefined; }
     if (/\/actions\/runs\/[0-9]+(?:\/attempts\/[0-9]+)?$/.test(endpoint)) return model.runs.get(Number(endpoint.match(/runs\/([0-9]+)/)[1]));
     if (endpoint === `/repos/${repo}/actions/workflows/7`) return { path: parent.path, state: 'active' };
     if (endpoint === `/repos/${repo}/actions/workflows/runner-task.yml`) return { path: '.github/workflows/runner-task.yml', state: 'active' };
@@ -106,7 +109,7 @@ async function protocolFixture(t, supplied) {
     }
     if (endpoint === `/repos/${repo}/git/ref/heads/${branch}`) return { object: { sha: model.observedHead } };
     if (/\/actions\/runs\/[0-9]+\/attempts\/[0-9]+\/jobs\?/.test(endpoint)) return { jobs: model.jobs.get(Number(endpoint.match(/runs\/([0-9]+)/)[1])) ?? [{ id: 70, name: 'execute', status: 'completed', completed_at: model.endedAt }] };
-    if (endpoint.startsWith(`/repos/${repo}/actions/workflows/runner-task.yml/runs?`)) return { workflow_runs: [model.parent, ...model.children] };
+    if (endpoint.startsWith(`/repos/${repo}/actions/runs?`) || endpoint.startsWith(`/repos/${repo}/actions/workflows/runner-task.yml/runs?`)) return { workflow_runs: [model.parent, ...model.children] };
     if (method === 'POST' && endpoint.endsWith('/runner-task.yml/dispatches')) {
       const submitted = JSON.parse(options.inputs.request); model.dispatches.push(submitted);
       if (model.registration !== 'absent') {
@@ -122,7 +125,7 @@ async function protocolFixture(t, supplied) {
   };
   const github = { request: async (route, options) => ({ data: await api(route.slice(route.indexOf(' ') + 1), { ...options, method: route.split(' ')[0] }) }) };
   const env = { ...process.env, GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: repo, GITHUB_RUN_ID: '99', GITHUB_RUN_ATTEMPT: '1',
-    GITHUB_WORKFLOW_SHA: sourceSha, RUNNER_TEMP: f.temporary, CONTINUATION_MODE: 'resolve', GITHUB_JOB: 'resolve', TRIGGERING_ACTOR: 'github-actions[bot]' };
+    GITHUB_WORKFLOW_SHA: sourceSha, GITHUB_WORKFLOW_REF: `${repo}/.github/workflows/runner-task.yml@refs/heads/main`, RUNNER_TEMP: f.temporary, CONTINUATION_MODE: 'resolve', GITHUB_JOB: 'resolve', TRIGGERING_ACTOR: 'github-actions[bot]' };
   env.CODEX_RUNNER_PROTOCOL = '3';
   const context = { repo: { owner: 'fixture', repo: 'repo' }, actor: 'github-actions[bot]', eventName: 'workflow_run', payload: { workflow_run: { ...parent } } };
   return { ...f, runtimeRecords: f.records, model, api, github, env, context, addArtifact, ...normalCore() };
@@ -158,20 +161,101 @@ test('trusted protocol verification rejects missing, changed and incompatible re
 
 test('trusted fresh requests freeze selected setup and reject unlisted or read-only operators', async t => {
   const f = await protocolFixture(t), plan = 'Run an arbitrary selected workflow.';
-  const request = { task_id: 'new-task', source_repository: 'action/source', source_sha: sourceSha, plan,
-    authorization: { repository: repo, plan_sha256: hash(plan), request: 'Run this prompt remotely.' }, skills: [], runner: ['self-hosted', 'Linux', 'X64'],
-    git_author_name: 'Fixture Author', git_author_email: 'fixture@example.invalid' };
+  const content = 'allowed-actors: [Z-M-Huang]\nrunner: [self-hosted, Linux, X64]\ngit-author: {name: Fixture Author, email: fixture@example.invalid}\n';
+  f.model.sources.set('remote-codex.yml', Buffer.from(content));
+  const { allowed_actors, ...settings } = parseProjectConfig(content);
+  const request = { request_id: 'new-request', source_repository: 'action/source', source_sha: sourceSha, plan, plan_sha256: hash(plan),
+    ...settings, user_agents_sha256: null, project_config: { revision: sourceSha, sha256: hash(content), content } };
   const env = { ...f.env, GITHUB_RUN_ID: '200', GITHUB_JOB: 'fresh', GITHUB_RUN_ATTEMPT: '1', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request) };
   const context = { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' };
   const result = await prepareTaskRequest({ github: f.github, context, core: f.core, env });
   const fixed = JSON.parse(result.execution);
   assert.deepEqual(fixed.runner, request.runner); assert.equal(fixed.source_repository, 'action/source'); assert.equal(fixed.budget_minutes, 300);
-  assert.equal(result.skills, '[]'); assert.equal(fixed.activation_run_id, '200');
+  assert.equal(result.skills, '[]'); assert.equal(fixed.activation_run_id, '200'); assert.equal(result.task_id, '200');
+  assert.equal(fixed.project_config.sha256, hash(content));
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env: { ...env, TASK_REQUEST: json({ ...request, plan: 'Changed bytes', registration_key: registrationKey(request) }) } }), /request_registration_mismatch/);
+  const changed = content + 'budget-minutes: 5\n';
+  f.model.sources.set('remote-codex.yml', Buffer.from(changed));
+  await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env }), /project_config_hash_mismatch/);
+  const failure = f.records.findLast(record => record.reason === 'project_config_hash_mismatch');
+  assert.equal(failure.expected, hash(content)); assert.equal(failure.observed, hash(changed));
+  f.model.sources.set('remote-codex.yml', Buffer.from(content));
   await assert.rejects(prepareTaskRequest({ github: f.github, context: { ...context, actor: 'outsider' }, core: f.core, env }), /untrusted_task_actor/);
   f.model.permission = 'read';
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env }), /operator_write_permission_required/);
   assert.ok(f.records.some(record => record.event === 'submission.resolve' && record.reason === 'operator_write_permission_required'));
+});
+
+test('a stop received before root run registration fences the initial request nonce', async t => {
+  const f = await protocolFixture(t), content = await readFile(join(root, 'remote-codex.yml'), 'utf8');
+  const { allowed_actors, ...settings } = parseProjectConfig(content), plan = 'Run this prompt.';
+  const request = { request_id: 'not-yet-registered', source_repository: 'action/source', source_sha: sourceSha, plan, plan_sha256: hash(plan),
+    ...settings, user_agents_sha256: null, project_config: { revision: sourceSha, content, sha256: hash(content) } };
+  f.model.children.push({ ...f.model.parent, id: 150, display_title: `Codex stop ${request.request_id} / ${'e'.repeat(32)}` });
+  await assert.rejects(prepareTaskRequest({ github: f.github, context: { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' }, core: f.core,
+    env: { ...f.env, GITHUB_RUN_ID: '200', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request) } }), /request_stopped/);
+  assert.equal(f.model.dispatches.length, 0);
+  assert.ok(f.records.some(record => record.reason === 'request_stopped' && record.submission_id === request.request_id));
+});
+test('stop refuses unrelated workflow run IDs without cancelling any jobs', async t => {
+  const f = await protocolFixture(t);
+  Object.assign(f.model.parent, { status: 'in_progress', path: '.github/workflows/release.yml', display_title: 'Publish release' });
+  f.model.artifacts.delete(40);
+  await assert.rejects(cancelTaskRuns({ github: f.github, context: { ...f.context, actor: 'Z-M-Huang' }, core: f.core, taskId,
+    env: { ...f.env, TRIGGERING_ACTOR: 'Z-M-Huang' } }), /unproven_task_root/);
+  assert.deepEqual(f.model.cancelled, []);
+});
+test('stop verifies a standalone root record and cancels only its root, children and controllers', async t => {
+  const f = await protocolFixture(t);
+  Object.assign(f.model.parent, { status: 'in_progress', path: '.github/workflows/custom.yml', display_title: 'Remote Codex' });
+  f.model.request.lineage = { ...f.model.request.lineage, workflow_ref: `${repo}/.github/workflows/custom.yml@refs/heads/main` };
+  f.model.payloads.set(40, await zipEntries(f, 'standalone-root-record', [{ name: 'record.json', text: json(f.model.request) }]));
+  f.model.artifacts.get(40).size_in_bytes = f.model.payloads.get(40).length;
+  f.model.children.push(
+    { ...f.model.parent, id: 200, path: '.github/workflows/runner-task.yml', display_title: childRunName(taskId, 'e'.repeat(64)), status: 'queued' },
+    { ...f.model.parent, id: 201, path: '.github/workflows/runner-continuation.yml', display_title: 'Codex continuation / 13' },
+    { ...f.model.parent, id: 202, path: '.github/workflows/ci.yml', display_title: 'Unrelated CI' },
+  );
+  const cancelled = await cancelTaskRuns({ github: f.github, context: { ...f.context, actor: 'Z-M-Huang' }, core: f.core, taskId,
+    env: { ...f.env, TRIGGERING_ACTOR: 'Z-M-Huang' } });
+  assert.deepEqual(cancelled, [13, 200, 201]); assert.deepEqual(f.model.cancelled, [13, 200, 201]);
+});
+test('a queued kit root is cancellable before its first durable record', async t => {
+  const f = await protocolFixture(t);
+  Object.assign(f.model.parent, { status: 'queued', display_title: `Codex request queued-fixture / request-${'e'.repeat(64)}` });
+  f.model.artifacts.delete(40);
+  const cancelled = await cancelTaskRuns({ github: f.github, context: { ...f.context, actor: 'Z-M-Huang' }, core: f.core, taskId,
+    env: { ...f.env, TRIGGERING_ACTOR: 'Z-M-Huang' } });
+  assert.deepEqual(cancelled, [13]);
+});
+test('a pre-registration stop also fences later deadline transport until explicit activation', async t => {
+  const f = await protocolFixture(t), stop = { ...f.model.parent, id: 12, display_title: `Codex stop fixture-request / ${'e'.repeat(32)}` };
+  f.model.children.push(stop);
+  await assert.rejects(requireActive(f.api, repo, taskId, '13', 'fixture-request'), { reason: 'task_stopped' });
+  const io = async (id, kind) => ({ artifact: f.model.artifacts.get(id), value: kind === 'checkpoint' ? f.model.manifest : f.model.request });
+  assert.equal((await continuationDecision({ api: f.api, io, repository: repo, parent: f.model.parent })).reason, 'task_stopped');
+  await requireActive(f.api, repo, taskId, '200', 'fixture-request');
+});
+
+test('qualification overrides require the actual trusted registry artifact and exact recorded settings', async t => {
+  const f = await protocolFixture(t), content = await readFile(join(root, 'remote-codex.yml'), 'utf8');
+  const task = { task_id: 'qual-fixture-fresh', labels: ['ubuntu-latest'], scenario: 'fresh' };
+  const registry = { repository: repo, run_id: '170', source_sha: sourceSha, author: 'Fixture Author', email: 'fixture@example.invalid', tasks: [task] };
+  f.model.runs.set(170, { ...f.model.parent, id: 170, path: '.github/workflows/runner-acceptance.yml' });
+  f.addArtifact(180, 'linux-qualification-170-registry', await zipEntries(f, 'qualification-registry', [{ name: 'record.json', text: json(registry) }]), 170);
+  const plan = 'Use the selected fixture skill.';
+  const request = { request_id: task.task_id, source_repository: repo, source_sha: sourceSha, plan, plan_sha256: hash(plan), qualification_artifact_id: 180,
+    project_config: { revision: sourceSha, content, sha256: hash(content) }, runner: task.labels, budget_minutes: 5, max_continuations: 3, auto_continue: false,
+    git_author_name: registry.author, git_author_email: registry.email, user_agents_url: null, user_agents_sha256: null,
+    skills: [{ repository: repo, revision: sourceSha, names: ['runner-acceptance'] }] };
+  const context = { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' };
+  const env = { ...f.env, GITHUB_RUN_ID: '200', GITHUB_JOB: 'qualification', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request) };
+  assert.equal((await prepareTaskRequest({ github: f.github, context, core: f.core, env })).task_id, '200');
+  await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
+    env: { ...env, GITHUB_JOB: 'altered-qualification', TASK_REQUEST: registered({ ...request, runner: ['self-hosted', 'Linux'] }) } }), /qualification_settings_mismatch/);
+  f.model.runs.get(170).path = '.github/workflows/unrelated.yml';
+  await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
+    env: { ...env, GITHUB_JOB: 'untrusted-qualification' } }), /untrusted_parent_run/);
 });
 
 test('controller claims reconcile an ambiguous dispatch and cannot blindly issue it twice', async t => {
@@ -225,13 +309,15 @@ test('a native stop request fences existing claims and later queued execution; e
   const context = { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' };
   const resumed = await prepareTaskRequest({ github: f.github, context, core: f.core, env });
   assert.equal(JSON.parse(resumed.execution).activation_run_id, '200'); assert.equal(JSON.parse(resumed.execution).continuation_count, 1);
+  assert.deepEqual(JSON.parse(resumed.execution).project_config, f.model.manifest.execution.project_config);
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env: { ...env, TASK_REQUEST: registered({ ...request, runner: ['ubuntu-latest'] }) } }), /resume_settings_changed/);
 });
 
 test('resume setting comparison freezes runner, instruction and source identities', () => {
   const recorded = execution(), resumed = { ...recorded, parent_run_id: '13', parent_run_attempt: '1', continuation_count: 1, activation_run_id: '15' };
   verifyResumeSettings(recorded, resumed);
-  for (const change of [{ runner: ['self-hosted', 'Linux'] }, { source_sha: 'f'.repeat(40) }, { user_agents_sha256: 'b'.repeat(64), user_agents_url: 'https://example.invalid/AGENTS.md' }]) assert.throws(() => verifyResumeSettings(recorded, { ...resumed, ...change }), { reason: 'resume_settings_changed' });
+  for (const change of [{ runner: ['self-hosted', 'Linux'] }, { source_sha: 'f'.repeat(40) }, { project_config: { ...recorded.project_config, content: 'changed', sha256: hash('changed') } },
+    { user_agents_sha256: 'b'.repeat(64), user_agents_url: 'https://example.invalid/AGENTS.md' }]) assert.throws(() => verifyResumeSettings(recorded, { ...resumed, ...change }), { reason: 'resume_settings_changed' });
 });
 
 for (const variant of ['traversal', 'absolute', 'drive', 'symlink', 'duplicate', 'unexpected', 'hash', 'schema', 'encrypted', 'oversized', 'malformed']) test(`actual ZIP restoration rejects ${variant} before creating its destination`, async t => {

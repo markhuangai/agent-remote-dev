@@ -33,6 +33,10 @@ export async function build(destination) {
   await promisify(execFile)(process.execPath, [join(root, "node_modules/@vercel/ncc/dist/ncc/cli.js"), "build", "src/entry.ts", "-o", destination, "--minify", "--license", "licenses.txt"], { cwd: root });
   await cp(join(root,"src/supervise.py"),join(destination,"supervise.py"));
   await cp(join(root,".github/remote-codex/archive.py"),join(destination,"archive.py"));
+  for (const name of ['yaml.cjs', 'yaml-licenses.txt']) await cp(join(root, '.github/remote-codex', name), join(destination, name));
+}
+export async function buildYaml(destination) {
+  await promisify(execFile)(process.execPath, [join(root, 'node_modules/@vercel/ncc/dist/ncc/cli.js'), 'build', 'scripts/yaml-entry.cjs', '-o', destination, '--minify', '--license', 'yaml-licenses.txt'], { cwd: root });
 }
 export async function buildSkill(destination) {
   await mkdir(destination, { recursive: true });
@@ -42,16 +46,21 @@ export async function buildSkill(destination) {
   await mkdir(join(consumer, ".github/workflows"), { recursive: true });
   await cp(join(root, ".github/remote-codex"), join(consumer, ".github/remote-codex"), { recursive: true });
   for (const name of ["runner-task.yml", "runner-continuation.yml"]) await cp(join(root, ".github/workflows", name), join(consumer, ".github/workflows", name));
-  await writeFile(join(consumer, ".github/remote-codex/config.json"), JSON.stringify({ allowed_actors: [] }, null, 2) + "\n");
+  await writeFile(join(consumer, 'remote-codex.yml'), 'allowed-actors: [REPLACE_WITH_YOUR_LOGIN]\nskills: []\nauto-continue: false\n');
   await writeFile(join(consumer, ".github/remote-codex/protocol.json"), JSON.stringify(await protocolManifest(consumer), null, 2) + "\n");
   const inventory = {};
   for (const path of (await files(destination)).sort()) inventory[path.slice(destination.length + 1).replaceAll("\\", "/")] = digest(await readFile(path));
   await writeFile(join(destination, "resources.json"), JSON.stringify({ protocol_version: 3, files: inventory }, null, 2) + "\n");
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  await writeFile(join(root, ".github/remote-codex/protocol.json"), JSON.stringify(await protocolManifest(), null, 2) + "\n");
   const temporary = await mkdtemp(join(tmpdir(), "codex-build-"));
   try {
+    const yaml = join(temporary, 'yaml');
+    await buildYaml(yaml);
+    await cp(join(yaml, 'index.cjs'), join(root, '.github/remote-codex/yaml.cjs'));
+    await cp(join(yaml, 'yaml-licenses.txt'), join(root, '.github/remote-codex/yaml-licenses.txt'));
+    await clean(yaml);
+    await writeFile(join(root, ".github/remote-codex/protocol.json"), JSON.stringify(await protocolManifest(), null, 2) + "\n");
     await build(temporary);
     const destination = join(root, "dist");
     try { await files(destination); await clean(destination); } catch (error) { if (error.code !== "ENOENT") throw error; }

@@ -26,7 +26,7 @@ export async function installWorkflows(directory, actors) {
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   for (const relative of paths) { await mkdir(join(root, relative, '..'), { recursive: true }); await cp(join(source, relative), join(root, relative), { errorOnExist: true, force: false }); }
-  await writeFile(join(root, '.github/remote-codex/config.json'), JSON.stringify({ allowed_actors: actors }, null, 2) + '\n');
+  await writeFile(join(root, 'remote-codex.yml'), `allowed-actors: ${JSON.stringify(actors)}\nskills: []\nauto-continue: false\n`);
   const { digest, protocolContract, protocolFiles } = await import('../assets/consumer/.github/remote-codex/checkpoint-policy.mjs');
   const files = {};
   for (const path of protocolFiles) files[path] = digest(await readFile(join(root, path)));

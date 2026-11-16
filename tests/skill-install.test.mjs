@@ -28,7 +28,7 @@ else if(endpoint.endsWith('/git/ref/heads/main'))result={object:{sha:'a'.repeat(
 else if(endpoint.includes('/contents/')){const name=endpoint.split('/contents/')[1].split('?')[0];const bytes=fs.readFileSync(path.join(root,name));result={size:bytes.length,encoding:'base64',content:bytes.toString('base64')};}
 else if(endpoint.includes('/commits/'))result={sha:'a'.repeat(40)};
 else if(method==='POST'&&endpoint.endsWith('/dispatches')){const request=JSON.parse(JSON.parse(input).inputs.request);state.dispatches.push(request);fs.writeFileSync(statePath,JSON.stringify(state));result=null;}
-else if(endpoint.includes('/runner-task.yml/runs?'))result={workflow_runs:state.dispatches.length?[{id:15,display_title:'Codex task '+state.dispatches[0].task_id+' / request-'+state.dispatches[0].registration_key,actor:{login:'Z-M-Huang'},path:'.github/workflows/runner-task.yml',head_branch:'main',head_sha:'a'.repeat(40),repository:{full_name:'fixture/repo'},html_url:'https://github.com/fixture/repo/actions/runs/15'}]:[]};
+else if(endpoint.includes('/actions/runs?'))result={workflow_runs:state.dispatches.length?[{id:15,display_title:'Codex request '+state.dispatches[0].request_id+' / request-'+state.dispatches[0].registration_key,actor:{login:'Z-M-Huang'},path:'.github/workflows/runner-task.yml',head_branch:'main',head_sha:'a'.repeat(40),repository:{full_name:'fixture/repo'},html_url:'https://github.com/fixture/repo/actions/runs/15'}]:[]};
 else if(endpoint.includes('/actions/workflows/'))result={path:'.github/workflows/'+endpoint.split('/').pop(),state:'active'};
 else{process.stderr.write('Unexpected fixture route');process.exit(1);}
 process.stdout.write(JSON.stringify(result));
@@ -36,12 +36,11 @@ process.stdout.write(JSON.stringify(result));
 `, { mode: 0o700 });
   const env = { ...f.job.env, PATH: `${bin}:${f.job.env.PATH}` }, prompt = join(f.temporary, 'prompt.txt'), prepared = join(f.temporary, 'prepared.json');
   await writeFile(prompt, 'An authorized arbitrary workflow prompt.\n');
-  const dry = await exec(process.execPath, [helper, 'queue', '--repo', 'fixture/repo', '--plan-file', prompt, '--request-text', 'Execute this fixture remotely.',
-    '--git-author-name', 'Fixture Author', '--git-author-email', 'fixture@example.invalid', '--source-repository', 'action/source', '--source-ref', 'a'.repeat(40), '--dry-run'], { cwd: f.temporary, env });
+  const dry = await exec(process.execPath, [helper, 'queue', '--repo', 'fixture/repo', '--plan-file', prompt, '--source-repository', 'action/source', '--source-ref', 'a'.repeat(40), '--dry-run'], { cwd: f.temporary, env });
   const frozen = JSON.parse(dry.stdout); await writeFile(prepared, JSON.stringify(frozen));
   assert.deepEqual(frozen.request.skills, []); assert.equal(frozen.request.source_repository, 'action/source');
   const queued = JSON.parse((await exec(process.execPath, [helper, 'queue', '--prepared', prepared], { cwd: f.temporary, env })).stdout);
-  assert.equal(queued.run_id, 15); assert.equal(queued.task_id, frozen.request.task_id);
+  assert.equal(queued.run_id, 15); assert.equal(queued.root_run_id, '15'); assert.equal(frozen.request.task_id, undefined);
   const repeated = JSON.parse((await exec(process.execPath, [helper, 'queue', '--prepared', prepared], { cwd: f.temporary, env })).stdout);
   assert.equal(repeated.run_id, 15); assert.equal(JSON.parse(await readFile(state, 'utf8')).dispatches.length, 1);
   assert.doesNotMatch(dry.stdout + dry.stderr, /unwanted-host|fixture-api-credential|fixture-github-credential/);

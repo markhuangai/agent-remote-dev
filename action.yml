@@ -1,40 +1,11 @@
 name: Codex skill runner
 description: Run native Codex with selected skills on Linux and transport verified session checkpoints
 inputs:
-  action-source-repository:
-    description: Repository containing the immutable action implementation
-    default: markhuangai/agent-remote-dev-codex
-  action-source-sha:
-    description: Exact approved action implementation commit verified by the trusted caller
-    required: true
-  task-id:
-    description: Stable task identity from the trusted dispatch request
-    required: true
-  task-request:
-    description: Original JSON request independently revalidated before native execution
-    required: true
-  continuation-context:
-    description: Frozen execution settings supplied by the trusted task workflow
-    required: true
-  resume-artifact-id:
-    description: Explicit schema-3 checkpoint; mutually exclusive with plan and issue-url
   working-directory:
     description: Target checkout relative to GITHUB_WORKSPACE
     default: .
   plan:
-    description: Exact approved prompt; mutually exclusive with issue-url
-  issue-url:
-    description: Open issue containing the approved prompt in the target repository
-  authorization:
-    description: JSON binding the direct user request, repository, and prompt hash
-    required: true
-  skills:
-    description: Complete selection of immutable repository/revision/names skill sources
-    default: '[]'
-  user-agents-url:
-    description: Optional public HTTPS URL for isolated user-level AGENTS.md
-  user-agents-sha256:
-    description: Expected SHA-256 of the exact approved user instructions
+    description: Prompt passed verbatim to Codex, including any issue references; continuation restores the frozen prompt
   codex-config:
     description: Secret-backed Codex TOML configuration
     required: true
@@ -44,15 +15,7 @@ inputs:
   github-token:
     description: Secret task credential; never persisted in Git configuration
     required: true
-  git-author-name:
-    description: Explicit job Git author and committer name
-    required: true
-  git-author-email:
-    description: Explicit job Git author and committer email
-    required: true
 outputs:
-  task-id:
-    description: Task identity
   branch:
     description: Skill-chosen branch observed at the last durable checkpoint, empty for detached HEAD
   base-sha:

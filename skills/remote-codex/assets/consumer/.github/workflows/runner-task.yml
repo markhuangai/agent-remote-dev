@@ -1,11 +1,11 @@
 name: Codex task runner
-run-name: ${{ fromJSON(inputs.request).operation == 'stop' && format('Codex stop {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).stop_key) || format('Codex task {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).dispatch_key || (fromJSON(inputs.request).resume_artifact_id && format('manual-resume-{0}-{1}-{2}', fromJSON(inputs.request).resume_artifact_id, fromJSON(inputs.request).source_sha, fromJSON(inputs.request).registration_key)) || format('request-{0}', fromJSON(inputs.request).registration_key)) }}
+run-name: ${{ fromJSON(inputs.request).operation == 'stop' && format('Codex stop {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).stop_key) || (fromJSON(inputs.request).resume_artifact_id && format('Codex task {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).dispatch_key || format('manual-resume-{0}-{1}-{2}', fromJSON(inputs.request).resume_artifact_id, fromJSON(inputs.request).source_sha, fromJSON(inputs.request).registration_key))) || format('Codex request {0} / request-{1}', fromJSON(inputs.request).request_id, fromJSON(inputs.request).registration_key) }}
 
 on:
   workflow_dispatch:
     inputs:
       request:
-        description: Authorized native task, explicit resume, or stop request as JSON
+        description: Internal submission, resume, or stop envelope prepared by the optional client
         required: true
         type: string
 
@@ -88,7 +88,7 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ github.workflow_sha }}
           path: target
           persist-credentials: false
       - name: Verify immutable action checkout
@@ -100,20 +100,7 @@ jobs:
         uses: ./action-source
         with:
           working-directory: target
-          action-source-repository: ${{ fromJSON(steps.request.outputs.parameters).source_repository }}
-          action-source-sha: ${{ fromJSON(steps.request.outputs.parameters).source_sha }}
-          task-id: ${{ needs.resolve.outputs.task_id }}
-          task-request: ${{ inputs.request }}
           plan: ${{ fromJSON(steps.request.outputs.parameters).plan }}
-          issue-url: ${{ fromJSON(steps.request.outputs.parameters).issue_url }}
-          resume-artifact-id: ${{ fromJSON(steps.request.outputs.parameters).resume_artifact_id }}
-          authorization: ${{ fromJSON(steps.request.outputs.parameters).authorization }}
-          skills: ${{ fromJSON(steps.request.outputs.parameters).skills }}
-          user-agents-url: ${{ fromJSON(steps.request.outputs.parameters).user_agents_url }}
-          user-agents-sha256: ${{ fromJSON(steps.request.outputs.parameters).user_agents_sha256 }}
-          git-author-name: ${{ fromJSON(steps.request.outputs.parameters).git_author_name }}
-          git-author-email: ${{ fromJSON(steps.request.outputs.parameters).git_author_email }}
-          continuation-context: ${{ fromJSON(steps.request.outputs.parameters).execution }}
           codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
           codex-api-key: ${{ secrets.CODEX_API_KEY }}
           github-token: ${{ secrets.REMOTE_DEV_PAT }}

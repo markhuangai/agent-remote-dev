@@ -19,10 +19,8 @@ export async function drive(input: DriverInput): Promise<DriverResult> {
   let status: Status = "failed", quiescent = false;
   let nativeDetails: Record<string, unknown> = {};
   const nativeDeadline = input.started + input.budgetMs - 120000;
-  const prompt = `DIRECT USER REQUEST (scope authority):\n${input.authorization.request}\n\nFROZEN TASK CONTENT:\n${input.plan}\n\nExecution context: ${JSON.stringify({ task_id: input.taskId,
-    deadline: new Date(input.started + input.budgetMs - 120000).toISOString(), resumed: Boolean(input.resume), source_sha: execution.source_sha })}\nFollow the selected skills and applicable instructions. The host manages process lifetime and session transport only. It does not publish source or decide workflow phases. Progress needed on another runner must be published by your workflow; uncommitted files and arbitrary temporary files are not exported.`;
   try {
-    const result = await runCodex(job, git.cwd, prompt, log, Math.max(1, input.started + input.budgetMs - Date.now() - 120000), "native", session ?? undefined,
+    const result = await runCodex(job, git.cwd, input.plan, log, Math.max(1, input.started + input.budgetMs - Date.now() - 120000), "native", session ?? undefined,
       id => { session = id; log.fields.session_id = id; });
     response = result.result; session = result.session; nativeOutcome = "succeeded"; reason = "native_return"; quiescent = true; status = "completed";
   } catch (error) {

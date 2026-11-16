@@ -116,60 +116,114 @@ retains logs under its existing policy; records include `GITHUB_RETENTION_DAYS`.
 No additional log sink or payload artifact is created. Temporary tools live
 outside the checkout; preserve workflow logs and CodeQL results as evidence.
 
-## Submit a task
+## Run the action
 
-Install the complete `remote-codex` skill from this repository with Skills CLI
-1.8.1. Its [usage guide](skills/remote-codex/references/usage.md) describes bootstrap,
-permissions, request preparation, status, resume and stop. The installed helper
-uses Node 24, GitHub CLI and Python 3.12+ without checkout-relative dependencies.
-It never reads or transfers local Codex session history.
+Commit `remote-codex.yml` in the target repository root:
 
-Each consuming repository owns its workflows, checkout, runs and artifacts.
-The bundled installer creates a complete workflow kit under
-`.github/remote-codex/` plus `runner-task.yml` and `runner-continuation.yml`.
-It refuses existing resources or linked destinations. Review and merge the kit
-through the consumer's normal process before dispatch; it does not publish or
-configure the repository for you.
+```yaml
+allowed-actors: [YOUR_GITHUB_LOGIN]
+skills:
+  - repository: https://github.com/markhuangai/agent-remote-dev-skills
+    ref: 224a5be4ddf40c6cf0a50b97885cb353e8522e2e
+    names: [sdlc-plan-implementation, plan-audit, pr-review-loop]
+user-level-agents.md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md
+git-author:
+  name: YOUR_GIT_NAME
+  email: YOUR_GIT_EMAIL
+budget-minutes: 300
+auto-continue: false
+max-continuations: 3
+runner: [ubuntu-latest]
+```
+
+The skills and URL above are examples. Omit `skills` for no external packages and
+omit `user-level-agents.md-url` for no downloaded user instructions. Git identity
+defaults to `github-actions[bot]` in the isolated child. Unknown keys, malformed
+YAML, duplicate keys, aliases, invalid identities and unsupported runners fail
+explicitly. Keep credentials in GitHub secrets rather than this file.
+
+A normal workflow can call the action directly, without the local submission
+skill or consumer kit:
+
+```yaml
+name: Remote Codex
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: Prompt for Codex, including any issue references
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: markhuangai/agent-remote-dev-codex@v1
+        with:
+          plan: ${{ inputs.plan }}
+          github-token: ${{ secrets.REMOTE_DEV_PAT }}
+          codex-api-key: ${{ secrets.CODEX_API_KEY }}
+          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
+```
+
+Use an exact published version or commit when pinning; `v1` becomes available
+only after the separately authorized release process. The action derives and
+verifies the installed implementation's exact source from `uses:` metadata or
+a local action checkout. If a moving ref changes between download and source
+verification, mismatched resources reject execution. Callers do not provide
+source identities, task IDs, authorization JSON or continuation context.
+
+Run manual workflows on trusted `main`. The exact prompt is passed to Codex;
+issue URLs, issue content and dependency decisions belong to the selected skills.
+For example, `plan: Implement https://github.com/OWNER/REPO/issues/4 using $my-skill`.
+The repository PAT authenticates Codex's GitHub operations. Both workflow actors
+must also be allowlisted with repository write permission.
+
+Skill repositories accept URLs or objects with `repository`, optional `ref`, and
+optional `names`. Omit `names` to install all discovered packages; omit `ref` to
+resolve the default branch once. Resolved commits and names, project configuration
+bytes/hash, and user instructions are frozen for checkpoint restoration. Complete
+packages install in the isolated user scope; repository skills and instructions
+remain native checkout content. Instruction URLs must be public HTTPS; downloads
+have a 20-second timeout and 64 KiB limit, with strict encoding/hash/redirect checks.
+
+## Optional local client and continuation kit
+
+Install the complete `remote-codex` skill with Skills CLI 1.8.1 when a local agent
+should submit and manage tasks. Its [usage guide](skills/remote-codex/references/usage.md)
+describes Node 24, GitHub CLI and Python 3.12+ prerequisites. It never transfers
+local Codex history or credentials. The client reads the target's committed
+`remote-codex.yml` rather than requiring settings on every invocation.
+
+The bundled installer creates `remote-codex.yml`, `.github/remote-codex/` resources,
+`runner-task.yml` and `runner-continuation.yml`. Review and merge this kit before
+using its queue/resume/stop commands. Installation refuses existing resources and
+linked destinations; it does not commit, push, configure secrets or register runners.
+Set `auto-continue: true` only after the complete compatible kit is installed.
+The kit resolves configured runner labels before allocating the execution job.
+A standalone action uses its workflow's `runs-on`; it cannot move an existing job.
 
 ```bash
 node <installed-skill>/scripts/install-workflows.mjs --directory . --actors LOGIN
 node <installed-skill>/scripts/remote-codex.mjs queue --repo OWNER/REPO \
-  --plan-file approved-prompt.md --request-text '<direct execution request>' \
-  --git-author-name '<verified name>' --git-author-email '<verified email>' \
-  --skills-file selected-skills.json --runner '["ubuntu-latest"]' --dry-run
+  --plan-file prompt.md --dry-run
 node <installed-skill>/scripts/remote-codex.mjs queue --prepared prepared-task.json
 ```
 
-Save the dry-run JSON as `prepared-task.json` in a task-owned temporary directory.
-Authorization binds the exact prompt bytes and target repository. A direct user
-execution request is required; issue content or instructions cannot grant it.
-An existing authorization remains valid within its scope. Inline prompts travel
-as workflow input data. Larger prompts must use an existing issue because the
-serialized workflow request is limited to 65,535 bytes. Native blockers must be
-closed and closing implementation commits merged into `main`; issue/hash drift
-rejects execution. No storage issue is created automatically.
-
-Select any skill sources, for example:
-
-```json
-[{"repository":"https://github.com/markhuangai/agent-remote-dev-skills","ref":"224a5be4ddf40c6cf0a50b97885cb353e8522e2e","names":["sdlc-plan-implementation","plan-audit","pr-review-loop"]}]
-```
-
-These are an example selection, not mandatory dependencies. Omit `names` to
-select all skills discovered in that repository; omit `ref` to resolve its default
-branch once. Dispatch records immutable revisions and explicit names. The default
-external selection is empty. Complete packages install in the isolated Codex user
-scope; repository skills and AGENTS files remain checkout content and use native
-discovery.
-
-`--user-agents-url` optionally supplies a public HTTPS user-level instructions file.
-For example:
-`https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md`.
-The helper freezes its exact SHA-256; the runner verifies the downloaded bytes and
-writes `$CODEX_HOME/AGENTS.md`. Downloads have a 20-second timeout and 64 KiB limit;
-invalid encoding, unsafe redirects, embedded credentials, changed hashes and
-truncation fail explicitly. Resume restores the frozen content without refetching
-that URL. The example URL is not installed by default.
+Save dry-run JSON as `prepared-task.json` in a task-owned temporary directory.
+Prompt and configuration hashes are rechecked before one dispatch. Workflow
+requests are limited to 65,535 bytes; use a short prompt referencing an existing
+issue for larger task descriptions. A request identity exists only to reconcile
+ambiguous pre-dispatch responses. The resulting GitHub run ID identifies the
+task and remains its root through continuation. Initial-run reruns are rejected;
+use an explicit resume for retained checkpoints.
 
 ## Runners, credentials and trust
 
@@ -180,10 +234,11 @@ The selected labels are frozen across continuation. A self-hosted runner must
 already be provisioned; the action does not install host packages or register it.
 
 Both the original and triggering user must appear in reviewed
-`.github/remote-codex/config.json` and have repository write/maintain/admin
+`remote-codex.yml` under `allowed-actors` and have repository write/maintain/admin
 permission. The initial allowlist here is `Z-M-Huang`; consumer installation
-requires explicit logins. Checks run on trusted `main` before runtime secrets are
-exposed and again after acquiring the per-task lock. Automatic bot children need
+requires explicit logins. The kit checks actors on trusted `main` before the secret-bearing execution
+step and again after acquiring the per-task lock; standalone action setup checks
+actors before native execution. Automatic bot children need
 a unique verified controller claim. This policy is separate from AI-review trust.
 
 Provision these runtime secrets:
@@ -204,7 +259,7 @@ Codex is pinned to `0.169.0`, Skills CLI to `1.8.1`, and the artifact SDK to `6.
 Tools, user home, credentials, configuration and npm cache are job-owned under
 `RUNNER_TEMP`. Host Git identity, global configuration and authentication files
 remain untouched by setup. The checkout uses `persist-credentials: false` and its
-HTTPS origin. Task Git identity is supplied explicitly for the isolated child.
+HTTPS origin. Task Git identity comes from project configuration for the isolated child.
 
 Execution always uses Codex's explicit full-access/YOLO bypass. There is no
 permission-mode selector, and legacy mode fields are rejected. Isolated homes
@@ -220,7 +275,7 @@ can finish without creating a PR. A normal invocation return does not certify
 business success; inspect the selected skill's opaque final response.
 
 Default action budget is 300 minutes inside a 360-minute task job, including a
-120-second shutdown/export reserve. Three additional runs are allowed by default.
+120-second shutdown/export reserve. Automatic continuation is disabled by default; when enabled, three additional runs are allowed unless configured otherwise.
 The trusted completion controller handles only deadline transport and verified
 native timeouts. Failure, cancellation, stop requests and exhausted limits do not
 automatically restart a task. Task execution and child dispatch are serialized.
@@ -228,12 +283,12 @@ Ambiguous dispatch responses reconcile by deterministic identity for five minute
 a persisted claim never permits a blind second POST.
 
 Schema-3 checkpoints contain native conversation JSONL, supported SQLite snapshots,
-frozen prompt/authorization, selected skill revisions, user instructions, source
+frozen prompt and project configuration, selected skill revisions, user instructions, source
 identity and run lineage. They contain no runner-owned business phases or review
 budgets. Exports require managed-process quiescence, a clean checkout and an exact
 remote branch/revision chosen by the skill. The runner never stages, commits,
 pushes, resets or creates a task branch to make checkpointing succeed. Unpublished
-files, source archives, arbitrary temporary state, credentials, configuration and
+files, source archives, arbitrary temporary state, credentials, secret provider configuration and
 caches are not exported. A checkpoint failure retains the preceding durable
 receipt and does not reinterpret the skill's response.
 
@@ -245,17 +300,17 @@ Changed settings, expired artifacts, producer mismatches and source drift stop
 resume without rewinding Git. Versions 1 and 2 are explicitly rejected, with no
 migration of their SDLC state.
 
-Outputs describe infrastructure: `task-id`, observed `branch`, `base-sha`,
+Outputs describe infrastructure: observed `branch`, `base-sha`,
 `checkpoint-sha`, `session-id`, `artifact-id`, `result-artifact-id`, `native-outcome`,
 `status`, `root-run-id`, `parent-run-id`, and `continuation-count`. `completed` means
 the native invocation returned; `continuing` means a durable deadline handoff.
 The response artifact is protected task output, not an execution authority.
 
 ```bash
-node <installed-skill>/scripts/remote-codex.mjs status --repo OWNER/REPO --task-id TASK
-node <installed-skill>/scripts/remote-codex.mjs status --repo OWNER/REPO --task-id TASK --show-result
-node <installed-skill>/scripts/remote-codex.mjs resume --repo OWNER/REPO --task-id TASK --artifact-id ID
-node <installed-skill>/scripts/remote-codex.mjs stop --repo OWNER/REPO --task-id TASK
+node <installed-skill>/scripts/remote-codex.mjs status --repo OWNER/REPO --run-id ROOT_RUN_ID
+node <installed-skill>/scripts/remote-codex.mjs status --repo OWNER/REPO --run-id ROOT_RUN_ID --show-result
+node <installed-skill>/scripts/remote-codex.mjs resume --repo OWNER/REPO --run-id ROOT_RUN_ID --artifact-id ID
+node <installed-skill>/scripts/remote-codex.mjs stop --repo OWNER/REPO --run-id ROOT_RUN_ID
 ```
 
 Stop requests persist a cancellation receipt and fence child dispatch and queued

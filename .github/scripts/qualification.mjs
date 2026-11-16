@@ -8,6 +8,7 @@ import { readArtifact } from '../remote-codex/artifact-io.mjs';
 import { dispatchOnce, githubAPI, inspectTask, log, resolveSource } from '../../skills/remote-codex/scripts/submission.mjs';
 import { qualificationCases } from './release-policy.mjs';
 import { safeError } from '../remote-codex/runtime-log.mjs';
+import { readProjectConfig } from '../remote-codex/project-config.mjs';
 
 const repository = 'markhuangai/agent-remote-dev-codex';
 export function registryFor({ runId, sourceSha, action, selfHosted, authorization, author, email, nonce = randomBytes(4).toString('hex') }) {
@@ -32,6 +33,7 @@ export async function prepareQualification({ github, context, core, env = proces
     invariant(action.sha === env.SOURCE_SHA, 'qualification_alias_source_mismatch');
     const registry = registryFor({ runId: env.GITHUB_RUN_ID, sourceSha: env.SOURCE_SHA, action, selfHosted: JSON.parse(env.SELF_HOSTED_LABELS), authorization: env.QUALIFICATION_AUTHORIZATION,
       author: env.GIT_AUTHOR_NAME, email: env.GIT_AUTHOR_EMAIL });
+    registry.project_config = (await readProjectConfig(api, repository, env.GITHUB_WORKFLOW_SHA)).snapshot;
     const root = join(env.RUNNER_TEMP, 'qualification-registry');
     await mkdir(root, { mode: 0o700 }); await writeFile(join(root, 'record.json'), JSON.stringify(registry), { mode: 0o600, flag: 'wx' });
     core.info(JSON.stringify({ event: 'runtime.qualification', level: 'INFO', outcome: 'authorized', source_sha: registry.source_sha, run_id: registry.run_id, targets: registry.targets,
@@ -55,7 +57,7 @@ async function waitRun(api, id, timeout = 1800000) {
     await pause(10000);
   }
 }
-async function state(api, task, root) { return inspectTask(api, repository, task.task_id, join(root, `observation-${randomBytes(6).toString('hex')}`), true); }
+async function state(api, task, root) { return inspectTask(api, repository, task.root_run_id ?? task.task_id, join(root, `observation-${randomBytes(6).toString('hex')}`), true); }
 async function follow(api, task, root, initialId) {
   const ids = [], started = Date.now(); let id = initialId;
   for (;;) {
@@ -74,11 +76,11 @@ async function follow(api, task, root, initialId) {
     invariant(next, 'qualification_child_missing'); id = next.run_id;
   }
 }
-function taskRequest(registry, task) {
+function taskRequest(registry, task, artifactId) {
   const context = { ...task, qualification_run_id: registry.run_id };
   const plan = `Use $runner-acceptance for this explicitly authorized smoke case. Follow its workflow; the runner does not implement its phases. Qualification context:\n${JSON.stringify(context)}`;
-  return { task_id: task.task_id, source_repository: repository, source_sha: registry.source_sha, plan,
-    authorization: { repository, plan_sha256: digest(plan), request: registry.authorization }, skills: [{ repository, revision: registry.source_sha, names: ['runner-acceptance'] }],
+  return { request_id: task.task_id, source_repository: repository, source_sha: registry.source_sha, plan,
+    plan_sha256: digest(plan), project_config: registry.project_config, qualification_artifact_id: artifactId, user_agents_url: null, user_agents_sha256: null, skills: [{ repository, revision: registry.source_sha, names: ['runner-acceptance'] }],
     runner: task.labels, budget_minutes: 5, max_continuations: 3, auto_continue: task.scenario === 'deadline', git_author_name: registry.author, git_author_email: registry.email };
 }
 async function checkpoint(api, id, root) {
@@ -100,7 +102,11 @@ export async function runTarget(api, registry, targetKey, root, output) {
   await writeFile(output, JSON.stringify(proof), { mode: 0o600 });
   try {
     for (const task of registry.tasks.filter(task => task.target === targetKey)) {
-      const request = taskRequest(registry, task), receipt = await dispatchOnce(api, repository, request, actor);
+      const artifacts = await pages(api, `/repos/${repository}/actions/runs/${registry.run_id}/artifacts`, 'artifacts');
+      const matches = artifacts.filter(artifact => artifact.name === `linux-qualification-${registry.run_id}-registry`);
+      invariant(matches.length === 1, 'qualification_registry_artifact_missing');
+      const request = taskRequest(registry, task, matches[0].id), receipt = await dispatchOnce(api, repository, request, actor);
+      task.root_run_id = String(receipt.run_id);
       log('runtime.qualification', 'INFO', { task_id: task.task_id, scenario: task.scenario, runner: task.labels, source_sha: registry.source_sha, root_run_id: receipt.run_id, outcome: 'started' });
       let finished;
       if (task.scenario === 'cancellation') {
@@ -111,7 +117,7 @@ export async function runTarget(api, registry, targetKey, root, output) {
           if (!marker) await pause(10000);
         }
         invariant(marker, 'qualification_cancellation_setup_missing');
-        const stop = await dispatchOnce(api, repository, { operation: 'stop', task_id: task.task_id, stop_key: randomBytes(16).toString('hex') }, actor);
+        const stop = await dispatchOnce(api, repository, { operation: 'stop', task_id: task.root_run_id ?? task.task_id, stop_key: randomBytes(16).toString('hex') }, actor);
         invariant((await waitRun(api, stop.run_id)).conclusion === 'success', 'qualification_stop_incomplete');
         const native = await waitRun(api, receipt.run_id);
         invariant(native.conclusion === 'cancelled', 'qualification_cancellation_failed');
@@ -133,7 +139,7 @@ export async function runTarget(api, registry, targetKey, root, output) {
       if (task.scenario === 'cold-resume') {
         invariant(finished.current.infrastructure_status === 'incomplete' && positiveId(finished.current.checkpoint?.artifact_id), 'qualification_manual_checkpoint_missing');
         initial = await checkpoint(api, finished.current.checkpoint.artifact_id, join(root, 'cold-initial'));
-        const resumed = await dispatchOnce(api, repository, { task_id: task.task_id, source_repository: repository, source_sha: registry.source_sha, resume_artifact_id: finished.current.checkpoint.artifact_id, activation_key: randomBytes(16).toString('hex') }, actor);
+        const resumed = await dispatchOnce(api, repository, { task_id: task.root_run_id, source_repository: repository, source_sha: registry.source_sha, resume_artifact_id: finished.current.checkpoint.artifact_id, activation_key: randomBytes(16).toString('hex') }, actor);
         const second = await follow(api, task, root, resumed.run_id);
         finished = { ...second, ids: [...finished.ids, ...second.ids] };
       }
@@ -177,7 +183,11 @@ export async function cleanupRegistry(api, registry, root, output) {
   try {
     for (const task of registry.tasks) {
       invariant(taskPattern.test(task.task_id) && task.task_id.startsWith(`qual-${registry.run_id}-`) && task.branch === `qualification/${task.task_id}` && task.marker === `.runner-qualification/${task.task_id}.json`, 'unsafe_qualification_cleanup');
-      const stop = await dispatchOnce(api, repository, { operation: 'stop', task_id: task.task_id, stop_key: randomBytes(16).toString('hex') }, actor);
+      const runs = await pages(api, `/repos/${repository}/actions/runs?event=workflow_dispatch&branch=main`, 'workflow_runs');
+      const roots = runs.filter(run => run.path === '.github/workflows/runner-task.yml' && run.display_title?.startsWith(`Codex request ${task.task_id} / request-`));
+      invariant(roots.length <= 1, 'qualification_duplicate_root');
+      if (roots.length) task.root_run_id = String(roots[0].id);
+      const stop = await dispatchOnce(api, repository, { operation: 'stop', task_id: task.root_run_id ?? task.task_id, stop_key: randomBytes(16).toString('hex') }, actor);
       invariant((await waitRun(api, stop.run_id, 600000)).conclusion === 'success', 'qualification_stop_incomplete');
       const deadline = Date.now() + 300000; let observed;
       do { observed = await state(api, task, root); if (observed.runs.every(run => run.status === 'completed') && observed.controllers.every(run => run.status === 'completed')) break; await pause(10000); } while (Date.now() < deadline);

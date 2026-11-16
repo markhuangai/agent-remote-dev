@@ -17,7 +17,8 @@ export function registrationKey(request) {
 export const databases = ['state_5.sqlite', 'thread_history_1.sqlite', 'goals_1.sqlite', 'queue_1.sqlite', 'memories_1.sqlite', 'memories_v2_1.sqlite'];
 export const protocolContract = { protocol_version: 3, checkpoint_schema: 3, request_input: 'request', task_workflow: 'runner-task.yml', controller_workflow: 'runner-continuation.yml' };
 export const protocolFiles = ['.github/workflows/runner-task.yml', '.github/workflows/runner-continuation.yml',
-  ...['checkpoint-policy.mjs', 'continuation-policy.mjs', 'artifact-io.mjs', 'protocol-policy.mjs', 'runtime-log.mjs', 'instructions.mjs', 'archive.py', 'config.json'].map(name => `.github/remote-codex/${name}`)];
+  ...['checkpoint-policy.mjs', 'continuation-policy.mjs', 'artifact-io.mjs', 'protocol-policy.mjs', 'runtime-log.mjs', 'instructions.mjs', 'archive.py',
+    'project-config.mjs', 'sources.mjs', 'yaml.cjs', 'yaml-licenses.txt'].map(name => `.github/remote-codex/${name}`)];
 export const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const identity = value => value === null || typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value) ? value :
@@ -80,6 +81,10 @@ export function executionSettings(value) {
     !/[\r\n\0]/.test(value.git_author_name + value.git_author_email), 'invalid_git_identity');
   invariant(value.user_agents_url === null && value.user_agents_sha256 === null || typeof value.user_agents_url === 'string' && hashPattern.test(value.user_agents_sha256), 'invalid_user_agents_reference');
   if (value.user_agents_url !== null) instructionURL(value.user_agents_url);
+  invariant(object(value.project_config) && shaPattern.test(value.project_config.revision) &&
+    typeof value.project_config.content === 'string' && Buffer.byteLength(value.project_config.content) <= 65536 &&
+    digest(value.project_config.content) === value.project_config.sha256, 'project_config_hash_mismatch');
+  invariant(typeof value.request_id === 'string' && taskPattern.test(value.request_id), 'invalid_request_identity');
   return value;
 }
 export function validBranch(value) {
@@ -115,7 +120,8 @@ export function validateManifest(value, { repository, versions = runnerVersions,
   }
   invariant(bytes + Buffer.byteLength(JSON.stringify(value)) <= value.limits.max_bytes, 'checkpoint_size_limit');
   invariant(object(value.lineage) && positiveId(value.lineage.run_id) && positiveId(value.lineage.run_attempt) && shaPattern.test(value.lineage.workflow_sha) && value.lineage.repository === repository &&
-    ['runner-task.yml', 'runner-acceptance.yml'].some(name => value.lineage.workflow_ref === `${repository}/.github/workflows/${name}@refs/heads/main`), 'untrusted_checkpoint_producer');
+    typeof value.lineage.workflow_ref === 'string' && value.lineage.workflow_ref.startsWith(`${repository}/.github/workflows/`) &&
+    /^[A-Za-z0-9_.-]+\.ya?ml@refs\/heads\/main$/.test(value.lineage.workflow_ref.slice(`${repository}/.github/workflows/`.length)), 'untrusted_checkpoint_producer');
   invariant(typeof value.workspace === 'string' && value.workspace.startsWith('/') && typeof value.codex_home === 'string' && value.codex_home.startsWith('/'), 'invalid_checkpoint_locations');
   return value;
 }
@@ -127,7 +133,7 @@ export function validateProducer(artifact, run, manifest, repository) {
   invariant(artifact.workflow_run?.id === run.id && String(run.id) === String(manifest.lineage.run_id) && Number(run.run_attempt) === Number(manifest.lineage.run_attempt) &&
     run.repository?.full_name === repository && run.head_repository?.full_name === repository && run.head_sha === manifest.lineage.workflow_sha && run.event === 'workflow_dispatch' &&
     run.head_branch === 'main' && run.actor?.login === manifest.lineage.actor && run.triggering_actor?.login === manifest.lineage.triggering_actor &&
-    ['.github/workflows/runner-task.yml', '.github/workflows/runner-acceptance.yml'].includes(run.path), 'untrusted_checkpoint_producer');
+    manifest.lineage.workflow_ref === `${repository}/${run.path}@refs/heads/main`, 'untrusted_checkpoint_producer');
   return artifact;
 }
 export function frozenExecution(value) {

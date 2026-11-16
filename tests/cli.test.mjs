@@ -56,6 +56,8 @@ test('a native workflow chooses its branch, commits and pushes without superviso
   assert.equal(await r.git('log', '-1', '--format=%s'), 'Skill publishes its work');
   assert.equal(await observed.git.remoteHead(), await observed.git.head());
   assert.equal(observed.results[0].response.trim(), 'Finished without creating a PR.');
+  const userMessages = api.requests[0].input.filter(item => item.role === 'user');
+  assert.ok(userMessages.some(item => item.content?.some(part => part.text === plan)));
   const manifest = JSON.parse(await readFile(join(observed.exports[0].root, 'manifest.json'), 'utf8'));
   assert.equal(manifest.schema_version, 3); assert.equal(manifest.session_id, observed.result.session); assert.deepEqual(manifest.skills, []);
   assert.equal(manifest.branch, 'skill/chosen-branch'); assert.ok(!('driver' in manifest)); assert.ok(!('audit' in manifest));
@@ -102,6 +104,8 @@ test('real cold restore preserves the session and frozen user instructions while
   await exec('git', ['clone', '--branch', 'main', r.remote, cwd], { env: fresh.job.env });
   const secondProvider = await provider(t, [[tool("printf second > state.txt && git add state.txt && git commit -m 'Second skill turn' && git push origin HEAD")], [message('Resumed skill completed.')]]);
   await configure(fresh.job, secondProvider.config, fresh.log); await installUserAgents(fresh.job, manifest.user_agents, fresh.log);
+  assert.equal(manifest.execution.project_config.content, execution().project_config.content);
+  assert.equal(manifest.execution.project_config.sha256, execution().project_config.sha256);
   assert.equal(manifest.user_agents.sha256, hash(bytes)); assert.deepEqual(await readFile(join(fresh.job.codexHome, 'AGENTS.md')), bytes);
   const git = new TaskGit(cwd, fresh.job.env, fresh.log);
   await restoreCheckpoint(fresh.job, first.exports[0].root, manifest, git, fresh.log);

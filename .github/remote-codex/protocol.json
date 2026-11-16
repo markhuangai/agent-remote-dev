@@ -5,15 +5,18 @@
   "task_workflow": "runner-task.yml",
   "controller_workflow": "runner-continuation.yml",
   "files": {
-    ".github/workflows/runner-task.yml": "a381453ed080658363f8f838d16430016f30a143bfdd83dbd92afb645bca1d86",
+    ".github/workflows/runner-task.yml": "9700b4ea3b7c76888cdbbff63dca4b198469764d3c44fbc0e32acce8d6ba12d6",
     ".github/workflows/runner-continuation.yml": "01d1cf81e8616f4824e7f1559650b94d2c29547ab1e35bd0c679475da1b77f49",
-    ".github/remote-codex/checkpoint-policy.mjs": "8c5c9a4c30a6661c3dcae8e2629a00c156592d7a454ac7cc155182fa3d1ca91a",
-    ".github/remote-codex/continuation-policy.mjs": "adc1716eb82ca402d88b27745bad0d9c9e5996b510ca55425270b834db4ddc51",
+    ".github/remote-codex/checkpoint-policy.mjs": "a3f581dcea8a04fbfd85b78195f595d54804fea65069045c4eb04a906d49c34f",
+    ".github/remote-codex/continuation-policy.mjs": "71ad66467587b9596dd0a731aaf68780f7c95b51f1022385ded309f3099b8125",
     ".github/remote-codex/artifact-io.mjs": "be01d081f38f6cc93a48fa689a4273fe9481aee884de11649a50ac989150a680",
     ".github/remote-codex/protocol-policy.mjs": "06567e2412f113740cbdac7b0a6d30b00986a3e892d733a42f976b88817cf290",
     ".github/remote-codex/runtime-log.mjs": "66eda3d4e1de8b2e6f50908985fbbf923c99d8581f03839a60a8b83b4c7d8529",
     ".github/remote-codex/instructions.mjs": "e1bfdb843c71e8ed3847ad502a45e2f9b98d8335385f90ba9a7bf05db2ec8954",
     ".github/remote-codex/archive.py": "c855a4998d375a791e24ce41ce8c6ff609eb6910b52bc8cff0dec849738d1a51",
-    ".github/remote-codex/config.json": "51d83d3b86db2310e9bf39045f78a76b6180098d62a45a02a4b3456b33fbdf15"
+    ".github/remote-codex/project-config.mjs": "ee620505802e93eb547500b33f7a125a77e90b82e2805dc321448c9f8d76484e",
+    ".github/remote-codex/sources.mjs": "1bf60d3a8710ae95b8f74404113dab686a18f72e0d6c7fc48038c5c563f403fa",
+    ".github/remote-codex/yaml.cjs": "6ee5b3ce4d03e0d7ccc76c815334489e8a98703e0790f7e2f4e3ffdcde69d676",
+    ".github/remote-codex/yaml-licenses.txt": "d2c9e9d55943211169386c4ad4bf87b6ee97d835927e3bb230d584b0c7a377cc"
   }
 }
