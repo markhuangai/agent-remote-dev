@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parse } from 'yaml';
@@ -127,3 +128,67 @@ test('published aliases are invoked by separate gated jobs without a source-chec
     assert.ok(!execution.steps.some(step => step.uses?.startsWith('./') || step.with?.path === 'action-source'));
   }
 });
+
+for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_mismatch', 'qualification_mismatch',
+  'missing_workflow', 'workflow_failed', 'workflow_running', 'missing_job', 'job_failed', 'job_running'])
+  test(`actual release authorization script ${variant} emits only a qualified build source`, async t => {
+    const f = await publishedFixture(t), workflow = parse(await readFile(join(root, '.github/workflows/release.yml'), 'utf8'));
+    const gate = workflow.jobs.authorize.steps.find(step => step.id === 'gate');
+    assert.equal(workflow.jobs.authorize.outputs.qualified_source, '${{ steps.gate.outputs.source }}');
+    assert.equal(workflow.jobs.build.needs, 'authorize');
+    assert.equal(workflow.jobs.build.steps.find(step => step.name === 'Checkout exact qualified source').with.ref, '${{ needs.authorize.outputs.qualified_source }}');
+    assert.equal(workflow.jobs.build.env.SOURCE_SHA, '${{ needs.authorize.outputs.qualified_source }}');
+    if (variant === 'qualification_mismatch') { f.registry.source_sha = 'e'.repeat(40); await f.replaceRecord(1); }
+    const sourceRuns = [
+      { id: 801, path: '.github/workflows/ci.yml', names: ['CI', 'Runtime (linux-arm64)'] },
+      { id: 802, path: '.github/workflows/codeql.yml', names: ['Analyze (actions)', 'Analyze (javascript-typescript)', 'CodeQL analysis'] },
+    ].map(run => ({ ...run, head_sha: f.sourceSha, head_branch: 'main', status: 'completed', conclusion: 'success', run_attempt: 1 }));
+    if (variant === 'missing_workflow') sourceRuns.pop();
+    if (['workflow_failed', 'workflow_running'].includes(variant)) {
+      sourceRuns.unshift({ ...sourceRuns[1], id: 800 });
+      Object.assign(sourceRuns.at(-1), { status: variant === 'workflow_running' ? 'in_progress' : 'completed', conclusion: variant === 'workflow_running' ? null : 'failure' });
+    }
+    const api = async (path, options = {}) => {
+      assert.equal(options.method ?? 'GET', 'GET', 'Authorization must never mutate release state');
+      if (path.includes('/collaborators/')) return { permission: variant === 'maintainer' ? 'write' : 'admin' };
+      if (path.endsWith(`/commits/${f.sourceSha}`)) return { sha: variant === 'source_mismatch' ? 'e'.repeat(40) : f.sourceSha };
+      if (path.includes('/compare/')) return { status: variant === 'unmerged' ? 'diverged' : 'ahead' };
+      if (path.endsWith('/git/ref/tags/v1') || path.endsWith('/git/ref/tags/v1.0.0') || path.endsWith('/releases/tags/v1.0.0')) throw Object.assign(new Error('not found'), { status: 404 });
+      const release = { id: 9, tag_name: 'v1.0.0-rc.0', draft: false, prerelease: true, published_at: '2026-01-01T00:00:00Z' };
+      if (path.includes('/releases?')) return [release];
+      if (path.endsWith('/releases/9')) return release;
+      if (path.endsWith('/git/ref/tags/v1.0.0-rc.0')) return { object: { type: 'commit', sha: f.sourceSha } };
+      if (path.includes('/actions/runs?head_sha=')) return { workflow_runs: sourceRuns };
+      const matched = /\/actions\/runs\/(801|802)\/jobs\?/.exec(path);
+      if (matched) {
+        const run = sourceRuns.find(run => run.id === Number(matched[1]));
+        let jobs = run.names.map((name, index) => ({ id: run.id * 10 + index, name, run_attempt: 1, status: 'completed', conclusion: 'success' }));
+        if (run.id === 802 && variant === 'missing_job') jobs.pop();
+        if (run.id === 802 && ['job_failed', 'job_running'].includes(variant)) Object.assign(jobs[0], { status: variant === 'job_running' ? 'in_progress' : 'completed', conclusion: variant === 'job_running' ? null : 'failure' });
+        return { jobs };
+      }
+      return f.api(path, options);
+    };
+    const outputs = new Map(), records = [], core = { setOutput: (name, value) => outputs.set(name, value),
+      ...Object.fromEntries(['info', 'warning', 'error', 'debug'].map(level => [level, line => records.push(JSON.parse(line))])) };
+    const env = { GITHUB_WORKSPACE: root, GITHUB_REF: 'refs/heads/main', GITHUB_RUN_ID: '999', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'authorize',
+      RUNNER_TEMP: f.temporary, TRIGGERING_ACTOR: 'Z-M-Huang', SOURCE_SHA: f.sourceSha, RELEASE_VERSION: 'v1.0.0', QUALIFICATION_RUN_ID: '100' };
+    const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+    Object.assign(process.env, env);
+    try {
+      const context = { repo: { owner: 'markhuangai', repo: 'agent-remote-dev-codex' }, eventName: 'workflow_dispatch', actor: variant === 'actor' ? 'Outside-Operator' : 'Z-M-Huang' };
+      const github = { request: async (route, options) => ({ data: await api(route.replace(/^[A-Z]+ /, ''), options) }) };
+      const invoke = () => new (Object.getPrototypeOf(async function () {}).constructor)('require', 'github', 'context', 'core', gate.with.script)(createRequire(import.meta.url), github, context, core);
+      if (variant === 'qualified') {
+        await invoke(); assert.deepEqual([...outputs], [['source', f.sourceSha]]);
+        assert.ok(records.some(record => record.event === 'release.verify' && record.outcome === 'qualified' && record.source_sha === f.sourceSha));
+      } else {
+        const reason = ({ actor: 'untrusted_task_actor', maintainer: 'release_maintainer_required', unmerged: 'release_source_not_merged', source_mismatch: 'invalid_release_source',
+          qualification_mismatch: 'qualification_matrix_incomplete' })[variant] ?? (variant.startsWith('job_') || variant === 'missing_job' ? 'release_source_check_failed' : 'release_source_workflow_incomplete');
+        await assert.rejects(invoke(), new RegExp(reason)); assert.equal(outputs.size, 0);
+        assert.ok(records.some(record => record.event === 'release.verify' && record.level === 'ERROR' && record.reason === reason && record.outcome === 'blocked'));
+      }
+    } finally {
+      for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    }
+  });

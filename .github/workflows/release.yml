@@ -31,6 +31,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      qualified_source: ${{ steps.gate.outputs.source }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -39,13 +41,15 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      - id: gate
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           retries: 0
           script: |
             const { pathToFileURL } = require('node:url');
             const { releasePreflight } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
-            await releasePreflight({ github, context, core });
+            const plan = await releasePreflight({ github, context, core });
+            core.setOutput('source', plan.source_sha);
 
   build:
     name: Build and verify source
@@ -55,6 +59,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      SOURCE_SHA: ${{ needs.authorize.outputs.qualified_source }}
     outputs:
       artifact_id: ${{ steps.assets.outputs.artifact-id }}
       artifact_digest: ${{ steps.assets.outputs.artifact-digest }}
@@ -62,7 +68,7 @@ jobs:
       - name: Checkout exact qualified source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source-sha }}
+          ref: ${{ needs.authorize.outputs.qualified_source }}
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
