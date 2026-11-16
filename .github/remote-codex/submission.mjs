@@ -3,15 +3,15 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, readdir, lstat, rmdir, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { authorization, digest, executionSettings, invariant, positiveId, registrationKey, repositoryPattern, runnerLabels, shaPattern, sources, taskPattern } from '../assets/consumer/.github/remote-codex/checkpoint-policy.mjs';
-import { authorizeActors, loadVerifiedCheckpoint, manualRunName, pages, submissionRunName } from '../assets/consumer/.github/remote-codex/continuation-policy.mjs';
-import { verifyProtocol } from '../assets/consumer/.github/remote-codex/protocol-policy.mjs';
-import { fetchInstructions } from '../assets/consumer/.github/remote-codex/instructions.mjs';
-import { readArtifact } from '../assets/consumer/.github/remote-codex/artifact-io.mjs';
-import { logEvent, safeError } from '../assets/consumer/.github/remote-codex/runtime-log.mjs';
-import { freezeProjectConfig, readProjectConfig } from '../assets/consumer/.github/remote-codex/project-config.mjs';
-import { resolveSource, resolveSkills } from '../assets/consumer/.github/remote-codex/sources.mjs';
-export { resolveSource, resolveSkills } from '../assets/consumer/.github/remote-codex/sources.mjs';
+import { authorization, digest, executionSettings, invariant, positiveId, registrationKey, repositoryPattern, runnerLabels, shaPattern, sources, taskPattern } from './checkpoint-policy.mjs';
+import { authorizeActors, loadVerifiedCheckpoint, manualRunName, pages, submissionRunName } from './continuation-policy.mjs';
+import { verifyProtocol } from './protocol-policy.mjs';
+import { fetchInstructions } from './instructions.mjs';
+import { readArtifact } from './artifact-io.mjs';
+import { logEvent, safeError } from './runtime-log.mjs';
+import { freezeProjectConfig, readProjectConfig } from './project-config.mjs';
+import { resolveSource, resolveSkills } from './sources.mjs';
+export { resolveSource, resolveSkills } from './sources.mjs';
 
 const sink = Object.fromEntries(['info', 'warning', 'error', 'debug'].map(level => [level, line => { if (level !== 'debug') process.stderr.write(line + '\n'); }]));
 export const log = (event, level, fields) => logEvent(sink, event, level, fields);
@@ -46,8 +46,12 @@ export async function prepareQueue(api, options) {
   invariant(repositoryPattern.test(repository), 'invalid_repository');
   const actor = (await api('/user')).login;
   const revision = await authorizeActors(api, repository, actor, actor);
-  await verifyProtocol(api, repository);
-  const action = await resolveSource(api, options.source_repository ?? 'markhuangai/agent-remote-dev-codex', options.source_ref ?? 'v1');
+  const protocol = await verifyProtocol(api, repository);
+  const action = protocol.provider ?? await resolveSource(api, options.source_repository ?? 'markhuangai/agent-remote-dev-codex', options.source_ref ?? 'v1');
+  if (protocol.provider && (options.source_repository || options.source_ref)) {
+    const requested = await resolveSource(api, options.source_repository ?? action.repository, options.source_ref ?? action.sha);
+    invariant(requested.repository === action.repository && requested.sha === action.sha, 'provider_runtime_source_changed');
+  }
   const plan = options.plan;
   invariant(typeof plan === 'string' && plan.trim() && Buffer.byteLength(plan) <= 1024 * 1024, 'invalid_plan');
   const settings = await freezeProjectConfig(api, repository, revision);
@@ -98,7 +102,9 @@ export async function queuePrepared(api, prepared, timing) {
   const actor = (await api('/user')).login;
   invariant(actor === prepared.actor, 'authenticated_actor_changed');
   const revision = await authorizeActors(api, prepared.repository, actor, actor);
-  await verifyProtocol(api, prepared.repository);
+  const protocol = await verifyProtocol(api, prepared.repository);
+  if (protocol.provider) invariant(protocol.provider.repository === prepared.request.source_repository && protocol.provider.sha === prepared.request.source_sha,
+    'provider_runtime_source_changed', prepared.request.source_sha, protocol.provider.sha);
   await readProjectConfig(api, prepared.repository, revision, prepared.request.project_config?.sha256);
   invariant(typeof prepared.request.plan === 'string' && digest(prepared.request.plan) === prepared.request.plan_sha256, 'plan_hash_mismatch');
   sources(prepared.request.skills); runnerLabels(prepared.request.runner);

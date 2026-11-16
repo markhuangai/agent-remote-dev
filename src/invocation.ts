@@ -8,7 +8,8 @@ import { resolveSource } from '../.github/remote-codex/sources.mjs';
 import { safeError } from '../.github/remote-codex/runtime-log.mjs';
 import { requireValue, RunnerError } from './contracts.js';
 
-export const actionResources = ['action.yml', 'package.json', 'package-lock.json', 'dist/index.js', 'dist/package.json', 'dist/supervise.py', 'dist/archive.py', 'dist/yaml.cjs', 'dist/yaml-licenses.txt'];
+export const actionResources = ['action.yml', 'package.json', 'package-lock.json', 'dist/index.js', 'dist/package.json', 'dist/supervise.py', 'dist/archive.py', 'dist/yaml.cjs', 'dist/yaml-licenses.txt',
+  'dist/control.mjs', 'dist/control-licenses.txt', 'dist/client.mjs'];
 export async function invocationSource(api: (path: string, options?: any) => Promise<any>, root: string, env: NodeJS.ProcessEnv,
   git: (args: string[]) => Promise<string>) {
   let repository = env.GITHUB_ACTION_REPOSITORY, ref = env.GITHUB_ACTION_REF;
@@ -41,7 +42,12 @@ export async function prepareInvocation({ api, plan, source, core, env = process
   const actor = env.GITHUB_ACTOR ?? '', triggering = env.TRIGGERING_ACTOR || env.GITHUB_TRIGGERING_ACTOR || actor;
   requireValue(env.GITHUB_EVENT_NAME === 'workflow_dispatch' && env.GITHUB_REF === 'refs/heads/main', 'untrusted_task_context');
   let request: any;
-  if (env.GITHUB_EVENT_PATH && ['runner-task.yml', 'runner-published.yml'].some(name => env.GITHUB_WORKFLOW_REF === `${repository}/.github/workflows/${name}@refs/heads/main`)) {
+  if (env.CODEX_TASK_REQUEST) {
+    requireValue(Buffer.byteLength(env.CODEX_TASK_REQUEST) <= 65535, 'workflow_input_size_limit');
+    try { request = JSON.parse(env.CODEX_TASK_REQUEST); }
+    catch { throw new RunnerError('invalid_task_request', 'preflight', 'Task envelope could not be decoded; contents withheld.'); }
+    if (!request?.resume_artifact_id) requireValue(request?.plan === plan, 'plan_hash_mismatch');
+  } else if (env.GITHUB_EVENT_PATH && ['runner-task.yml', 'runner-published.yml'].some(name => env.GITHUB_WORKFLOW_REF === `${repository}/.github/workflows/${name}@refs/heads/main`)) {
     try {
       const event = JSON.parse(await readFile(env.GITHUB_EVENT_PATH, 'utf8'));
       if (event.inputs?.request) request = JSON.parse(event.inputs.request);

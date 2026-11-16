@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { digest, invariant, positiveId, runnerLabels, shaPattern, taskPattern } from '../remote-codex/checkpoint-policy.mjs';
 import { authorizeActors, pages } from '../remote-codex/continuation-policy.mjs';
 import { readArtifact } from '../remote-codex/artifact-io.mjs';
-import { dispatchOnce, githubAPI, inspectTask, log, resolveSource } from '../../skills/remote-codex/scripts/submission.mjs';
+import { dispatchOnce, githubAPI, inspectTask, log, resolveSource } from '../remote-codex/submission.mjs';
 import { qualificationCases } from './release-policy.mjs';
 import { safeError } from '../remote-codex/runtime-log.mjs';
 import { readProjectConfig } from '../remote-codex/project-config.mjs';

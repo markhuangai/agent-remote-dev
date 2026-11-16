@@ -37,7 +37,7 @@ export async function verifyReleaseArtifact({ api, plan, artifactId, artifactDig
       expected[action ? 'action.tar.gz' : 'remote-codex.tar.gz'][action ? entry.path : entry.path.slice('skills/'.length)] = { sha: entry.sha, size: entry.size, mode: entry.mode };
     }
     for (const [asset, required] of [['action.tar.gz', ['action.yml', 'package.json', 'package-lock.json', 'dist/index.js', 'dist/package.json', 'dist/archive.py', 'dist/supervise.py', 'dist/yaml.cjs', 'dist/yaml-licenses.txt']],
-      ['remote-codex.tar.gz', ['remote-codex/SKILL.md', 'remote-codex/resources.json', 'remote-codex/scripts/remote-codex.mjs', 'remote-codex/assets/consumer/.github/workflows/runner-published.yml']]])
+      ['remote-codex.tar.gz', ['remote-codex/SKILL.md', 'remote-codex/resources.json', 'remote-codex/scripts/remote-codex.mjs', 'remote-codex/dist/client.mjs', 'remote-codex/assets/runner-task.yml']]])
       invariant(required.every(path => expected[asset][path]) && Object.keys(expected[asset]).length <= 10000, 'incomplete_release_source');
     await mkdir(root, { recursive: true, mode: 0o700 });
     const archivePath = join(root, 'assets.zip'), expectedPath = join(root, 'expected.json'), output = join(root, 'verified');

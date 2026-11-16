@@ -5,7 +5,7 @@ import test from 'node:test';
 import { skillSources, hash } from '../.build/contracts.js';
 import { fetchInstructions } from '../.github/remote-codex/instructions.mjs';
 import { digest, registrationKey, runnerLabels } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { dispatchOnce, prepareQueue, queuePrepared, resolveSkills, resolveSource, waitForStop } from '../skills/remote-codex/scripts/submission.mjs';
+import { dispatchOnce, prepareQueue, queuePrepared, resolveSkills, resolveSource, waitForStop } from '../.github/remote-codex/submission.mjs';
 import { exec, root } from './helpers.mjs';
 
 test('the complete selected skill list defaults empty and permits SDLC names without reserved defaults', () => {

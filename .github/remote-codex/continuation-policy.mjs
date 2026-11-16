@@ -136,7 +136,7 @@ async function verifiedClaim(api, io, repository, artifactId) {
     positiveId(claim.activation_run_id) && positiveId(claim.activation_run_attempt) &&
     claim.dispatch_key === dispatchKey(repository, claim.task_id, { id: Number(claim.parent_run_id), run_attempt: Number(claim.parent_run_attempt) }, claim.artifact_id, claim.continuation_count) && loaded.artifact.name === `codex-claim-${claim.dispatch_key}`, 'invalid_dispatch_claim');
   const controller = await api(`/repos/${repository}/actions/runs/${claim.controller_run_id}/attempts/${claim.controller_run_attempt}`);
-  invariant(controller.path === controllerPath && controller.event === 'workflow_run' && controller.head_branch === 'main' && controller.repository?.full_name === repository &&
+  invariant([controllerPath, taskPath].includes(controller.path) && controller.event === 'workflow_run' && controller.head_branch === 'main' && controller.repository?.full_name === repository &&
     controller.head_repository?.full_name === repository && controller.head_sha === claim.controller_sha && Number(controller.run_attempt) === Number(claim.controller_run_attempt) && loaded.artifact.workflow_run?.id === controller.id, 'untrusted_dispatch_claim');
   return claim;
 }

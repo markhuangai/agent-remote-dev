@@ -5,10 +5,10 @@ Install the complete `remote-codex` package with Skills CLI 1.8.1, selecting an 
 For a new consumer, explicitly authorize bootstrap files in a clean target checkout:
 
 ```bash
-node <skill-directory>/scripts/install-workflows.mjs --directory . --actors LOGIN
+node <skill-directory>/scripts/install-workflows.mjs --directory . --actors LOGIN --ref v1
 ```
 
-The installer refuses existing resources and linked destinations. Review its complete `.github/remote-codex/` support directory and `runner-task.yml`, `runner-continuation.yml`, and maintainer-only `runner-published.yml` qualification workflow, then deliver them through the repository's normal PR and human merge process. This command does not commit, push, configure secrets, or register runners. Subsequent customization of protocol-owned files requires regenerating their SHA-256 inventory in `protocol.json`.
+The installer writes only root `remote-codex.yml` and `.github/workflows/runner-task.yml`, refusing existing files and linked destinations. The caller references the provider's reusable workflow at `--ref`; use an exact authorized commit before releases exist. Deliver those two files through the repository's normal PR and human merge process. The command does not commit, push, configure secrets or register runners. Helper bundles, archive resources, protocol manifests and qualification workflows stay in the provider package. No provider npm installation or build is required in the consumer checkout.
 
 Provision runtime secrets `CODEX_CONFIG_TOML`, `CODEX_API_KEY`, and `REMOTE_DEV_PAT`. The task credential needs Contents/Pull requests/Actions read-write, Checks/Commit statuses read, Issues read for issue plans, and Workflows write only when the selected task edits workflows. Give it read access to any selected private skill repositories. The allowlist is a separate gate: dispatching users need write/maintain/admin permission, and both original and triggering actors must be allowed. Self-hosted Linux requires Git, npm, `gh`, Python 3.12+ and a working Node 24 toolchain; default labels are `["self-hosted","Linux"]`, with optional architecture/custom labels.
 
@@ -30,8 +30,10 @@ Repository `.agents/skills` and AGENTS files remain native checkout content.
 
 Queue accepts `--plan TEXT` or `--plan-file PATH`, `--repo OWNER/REPO`, optional
 `--source-ref REF` and `--source-repository OWNER/REPO`, `--dry-run`, or
-`--prepared FILE`. The source defaults to `markhuangai/agent-remote-dev-codex@v1`;
-before releases exist, use an explicitly authorized immutable source SHA.
+`--prepared FILE`. The source comes from the target caller's provider reference.
+An explicit source override must resolve to that same provider commit; it cannot
+select consumer or unrelated executable code. Before releases exist, pin the
+caller to an explicitly authorized immutable source SHA.
 The helper freezes skills and instructions from repository configuration.
 `user-level-agents.md-url` can point to the supplied Golden Rules file, but has
 no default. Downloads allow public HTTPS, 20 seconds and 64 KiB. Keep secrets
@@ -53,9 +55,9 @@ Automatic children recheck both humans behind that explicit activation against
 current trusted configuration and repository write permission. Changing its run
 attempt invalidates those children; an authorized manual resume establishes new
 authority without relying on a revoked original submitter.
-The optional workflow kit is required for these dispatch/control commands and
-for `auto-continue: true`; it is not required for standalone action execution.
-Runner labels in configuration are read in kit preflight. An action's already
+The single caller template provides these dispatch/control commands and
+`auto-continue: true`; a simpler caller can run a fresh plan without the local client.
+Runner labels in configuration are read by reusable-workflow preflight. An action's already
 allocated runner is selected by the caller's workflow `runs-on`.
 
 `status` reports native runs, parent/child/controller URLs, artifacts, frozen identities and infrastructure outcomes. `--show-result` retrieves the opaque native response, which may describe completion, a blocker or anything else the selected skill decided. It never becomes authority for additional work. `resume --artifact-id ID` uses a specific unexpired schema-3 checkpoint; settings cannot change. `stop` requests cancellation of active/queued runs and fences automatic continuation. Inspect status after any uncertain operation rather than repeating dispatch.

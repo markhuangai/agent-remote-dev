@@ -142,8 +142,8 @@ defaults to `github-actions[bot]` in the isolated child. Unknown keys, malformed
 YAML, duplicate keys, aliases, invalid identities and unsupported runners fail
 explicitly. Keep credentials in GitHub secrets rather than this file.
 
-A normal workflow can call the action directly, without the local submission
-skill or consumer kit:
+A consumer needs one workflow, this configuration file, and three secrets.
+The reusable workflow loads our prebuilt implementation on the runner:
 
 ```yaml
 name: Remote Codex
@@ -156,22 +156,25 @@ on:
         type: string
 permissions:
   contents: read
-  actions: read
+  actions: write
 jobs:
   execute:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: markhuangai/agent-remote-dev-codex@v1
-        with:
-          plan: ${{ inputs.plan }}
-          github-token: ${{ secrets.REMOTE_DEV_PAT }}
-          codex-api-key: ${{ secrets.CODEX_API_KEY }}
-          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
+    uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1
+    with:
+      plan: ${{ inputs.plan }}
+    secrets:
+      github-token: ${{ secrets.REMOTE_DEV_PAT }}
+      codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
 ```
+
+No support scripts, parser bundles, protocol manifests or qualification workflows
+are copied into the consumer repository. GitHub checks out our exact referenced
+implementation into a temporary runner checkout. The reusable workflow selects
+configured runner labels, checks operator authority before using task credentials,
+then installs Codex, selected skills and optional user instructions and runs the
+plan in YOLO mode. Its write permission is confined to continuation and cancellation
+jobs; execution and preparation use read-only workflow tokens.
 
 Use an exact published version or commit when pinning; `v1` becomes available
 only after the separately authorized release process. The action derives and
@@ -179,6 +182,9 @@ verifies the installed implementation's exact source from `uses:` metadata or
 a local action checkout. If a moving ref changes between download and source
 verification, mismatched resources reject execution. Callers do not provide
 source identities, task IDs, authorization JSON or continuation context.
+You can also call the root action directly from an existing job with `plan`,
+the three secret inputs and an optional `working-directory`. That form uses
+the job's existing checkout and `runs-on` selection.
 
 Run manual workflows on trusted `main`. The exact prompt is passed to Codex;
 issue URLs, issue content and dependency decisions belong to the selected skills.
@@ -194,7 +200,7 @@ packages install in the isolated user scope; repository skills and instructions
 remain native checkout content. Instruction URLs must be public HTTPS; downloads
 have a 20-second timeout and 64 KiB limit, with strict encoding/hash/redirect checks.
 
-## Optional local client and continuation kit
+## Optional local client
 
 Install the complete `remote-codex` skill with Skills CLI 1.8.1 when a local agent
 should submit and manage tasks. Its [usage guide](skills/remote-codex/references/usage.md)
@@ -202,17 +208,17 @@ describes Node 24, GitHub CLI and Python 3.12+ prerequisites. It never transfers
 local Codex history or credentials. The client reads the target's committed
 `remote-codex.yml` rather than requiring settings on every invocation.
 
-The bundled installer creates `remote-codex.yml`, `.github/remote-codex/` resources,
-`runner-task.yml`, `runner-continuation.yml` and the maintainer-only
-`runner-published.yml` qualification entrypoint. Review and merge this kit before
-using its queue/resume/stop commands. Installation refuses existing resources and
-linked destinations; it does not commit, push, configure secrets or register runners.
-Set `auto-continue: true` only after the complete compatible kit is installed.
-The kit resolves configured runner labels before allocating the execution job.
-A standalone action uses its workflow's `runs-on`; it cannot move an existing job.
+The optional installer writes exactly two files: `remote-codex.yml` and
+`.github/workflows/runner-task.yml`. That caller template includes the internal
+request input and completion event needed for queue/resume/stop and optional
+automatic continuation. All executable helpers remain in our bundled package.
+Review and merge these two files before using the client. Installation refuses
+existing files and linked destinations; it does not commit, push, configure
+secrets or register runners. Set `auto-continue: true` only with this compatible
+single-file caller. Qualification and release tooling stays in this provider repository.
 
 ```bash
-node <installed-skill>/scripts/install-workflows.mjs --directory . --actors LOGIN
+node <installed-skill>/scripts/install-workflows.mjs --directory . --actors LOGIN --ref v1
 node <installed-skill>/scripts/remote-codex.mjs queue --repo OWNER/REPO \
   --plan-file prompt.md --dry-run
 node <installed-skill>/scripts/remote-codex.mjs queue --prepared prepared-task.json
@@ -226,6 +232,12 @@ ambiguous pre-dispatch responses. The resulting GitHub run ID identifies the
 task and remains its root through continuation. Initial-run reruns are rejected;
 use an explicit resume for retained checkpoints.
 
+`npm run build` in this provider repository produces the runtime, workflow helper
+and local client bundles in `dist/` and regenerates the self-contained skill
+package. These are prebuilt Node 24 programs for both supported Linux
+architectures. Consumers do not build them or install this project's npm
+dependencies. Separate native executables are unnecessary for GitHub Actions.
+
 ## Runners, credentials and trust
 
 Execution is Linux x64/arm64 with Node 24, Git, npm, GitHub CLI and Python 3.12+.
@@ -237,7 +249,7 @@ already be provisioned; the action does not install host packages or register it
 Both the original and triggering user must appear in reviewed
 `remote-codex.yml` under `allowed-actors` and have repository write/maintain/admin
 permission. The initial allowlist here is `Z-M-Huang`; consumer installation
-requires explicit logins. The kit checks actors on trusted `main` before the secret-bearing execution
+requires explicit logins. The reusable workflow checks actors on trusted `main` before the secret-bearing execution
 step and again after acquiring the per-task lock; standalone action setup checks
 actors before native execution. Automatic bot children need
 a unique verified controller claim. Each automatic dispatch and execution also

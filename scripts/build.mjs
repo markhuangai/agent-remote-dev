@@ -34,6 +34,14 @@ export async function build(destination) {
   await cp(join(root,"src/supervise.py"),join(destination,"supervise.py"));
   await cp(join(root,".github/remote-codex/archive.py"),join(destination,"archive.py"));
   for (const name of ['yaml.cjs', 'yaml-licenses.txt']) await cp(join(root, '.github/remote-codex', name), join(destination, name));
+  for (const [entry, name] of [['control.mjs', 'control'], ['submission.mjs', 'client']]) {
+    const temporary = await mkdtemp(join(tmpdir(), 'codex-helper-'));
+    try {
+      await promisify(execFile)(process.execPath, [join(root, 'node_modules/@vercel/ncc/dist/ncc/cli.js'), 'build', join(root, '.github/remote-codex', entry), '-o', temporary, '--minify', ...(name === 'control' ? ['--license', 'control-licenses.txt'] : [])], { cwd: root });
+      await cp(join(temporary, 'index.mjs'), join(destination, `${name}.mjs`));
+      if (name === 'control') await cp(join(temporary, 'control-licenses.txt'), join(destination, 'control-licenses.txt'));
+    } finally { await clean(temporary); }
+  }
 }
 export async function buildYaml(destination) {
   await promisify(execFile)(process.execPath, [join(root, 'node_modules/@vercel/ncc/dist/ncc/cli.js'), 'build', 'scripts/yaml-entry.cjs', '-o', destination, '--minify', '--license', 'yaml-licenses.txt'], { cwd: root });
@@ -42,12 +50,12 @@ export async function buildSkill(destination) {
   await mkdir(destination, { recursive: true });
   const source = join(root, "skills/remote-codex");
   for (const name of ["SKILL.md", "agents", "scripts", "references"]) await cp(join(source, name), join(destination, name), { recursive: true });
-  const consumer = join(destination, "assets/consumer");
-  await mkdir(join(consumer, ".github/workflows"), { recursive: true });
-  await cp(join(root, ".github/remote-codex"), join(consumer, ".github/remote-codex"), { recursive: true });
-  for (const name of ["runner-task.yml", "runner-continuation.yml", "runner-published.yml"]) await cp(join(root, ".github/workflows", name), join(consumer, ".github/workflows", name));
-  await writeFile(join(consumer, 'remote-codex.yml'), 'allowed-actors: [REPLACE_WITH_YOUR_LOGIN]\nskills: []\nauto-continue: false\n');
-  await writeFile(join(consumer, ".github/remote-codex/protocol.json"), JSON.stringify(await protocolManifest(consumer), null, 2) + "\n");
+  await mkdir(join(destination, 'assets'), { recursive: true });
+  await cp(join(source, 'assets/runner-task.yml'), join(destination, 'assets/runner-task.yml'), { recursive: true });
+  const runtime = join(destination, 'dist');
+  await mkdir(runtime, { recursive: true });
+  for (const name of ['client.mjs', 'archive.py', 'yaml.cjs', 'yaml-licenses.txt'])
+    await cp(join(root, 'dist', name), join(runtime, name));
   const inventory = {};
   for (const path of (await files(destination)).sort()) inventory[path.slice(destination.length + 1).replaceAll("\\", "/")] = digest(await readFile(path));
   await writeFile(join(destination, "resources.json"), JSON.stringify({ protocol_version: 3, files: inventory }, null, 2) + "\n");
@@ -67,9 +75,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     await cp(temporary, destination, { recursive: true });
     const skill = join(temporary, "skill-package");
     await buildSkill(skill);
-    const assets = join(root, "skills/remote-codex/assets");
-    try { await clean(assets); } catch (error) { if (error.code !== "ENOENT") throw error; }
-    await cp(join(skill, "assets"), assets, { recursive: true });
+    for (const name of ['assets', 'dist']) {
+      const destination = join(root, 'skills/remote-codex', name);
+      try { await clean(destination); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await cp(join(skill, name), destination, { recursive: true });
+    }
     await cp(join(skill, "resources.json"), join(root, "skills/remote-codex/resources.json"));
     console.log("Built dist from the locked dependencies.");
   } finally { await clean(temporary); }

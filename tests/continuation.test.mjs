@@ -11,6 +11,7 @@ import { checkpointName, recordName, registrationKey, validateManifest, validate
 import { authorizeActivation, childRunName, continuationDecision, prepareTaskRequest, runController, requireActive, cancelTaskRuns } from '../.github/remote-codex/continuation-policy.mjs';
 import { verifyProtocol } from '../.github/remote-codex/protocol-policy.mjs';
 import { parseProjectConfig } from '../.github/remote-codex/project-config.mjs';
+import { workflowCommand } from '../.github/remote-codex/control.mjs';
 import { exec, execution, fixture, lineage as fixtureLineage, root } from './helpers.mjs';
 
 const repo = 'fixture/repo', taskId = '13', branch = 'skill/selected-branch', sourceSha = 'a'.repeat(40);
@@ -85,6 +86,11 @@ async function protocolFixture(t, supplied) {
   model.jobs = new Map(); model.cancelled = [];
   const api = async (endpoint, options = {}) => {
     const method = options.method ?? 'GET';
+    if (endpoint.startsWith('/repos/markhuangai/agent-remote-dev-codex/contents/skills/remote-codex/assets/runner-task.yml?')) {
+      const bytes = await readFile(join(root, 'skills/remote-codex/assets/runner-task.yml'));
+      return { size: bytes.length, encoding: 'base64', content: bytes.toString('base64') };
+    }
+    if (endpoint === `/repos/markhuangai/agent-remote-dev-codex/commits/${sourceSha}`) return { sha: sourceSha };
     if (endpoint.includes('/collaborators/')) return { permission: model.permissions?.[endpoint.split('/collaborators/')[1].split('/')[0]] ?? model.permission ?? 'write' };
     if (endpoint === `/repos/${repo}/git/ref/heads/main`) return { object: { sha: sourceSha } };
     if (endpoint.startsWith(`/repos/${repo}/contents/`)) {
@@ -257,6 +263,46 @@ test('qualification overrides require the actual trusted registry artifact and e
   f.model.runs.get(170).path = '.github/workflows/unrelated.yml';
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
     env: { ...env, GITHUB_JOB: 'untrusted-qualification' } }), /untrusted_parent_run/);
+});
+
+test('a single consumer caller handles continuation claims and native child preparation without copied helpers', async t => {
+  const f = await protocolFixture(t);
+  f.model.sources.set('.github/workflows/runner-task.yml', Buffer.from((await readFile(join(root, 'skills/remote-codex/assets/runner-task.yml'), 'utf8')).replace('/remote-codex.yml@v1', `/remote-codex.yml@${sourceSha}`)));
+  f.model.controller.path = '.github/workflows/runner-task.yml';
+  assert.equal((await runController({ github: f.github, context: f.context, core: f.core, env: f.env })).eligible, true);
+  const prepared = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
+  f.addArtifact(43, prepared.claim_name, await zipEntries(f, 'single-workflow-claim', [{ name: 'record.json', text: await readFile(prepared.claim_path, 'utf8') }]), 99);
+  const result = await runController({ github: f.github, context: f.context, core: f.core,
+    env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'true' } });
+  assert.equal(f.model.dispatches.length, 1);
+  const child = await prepareTaskRequest({ github: f.github, context: { ...f.context, eventName: 'workflow_dispatch' }, core: f.core,
+    env: { ...f.env, GITHUB_RUN_ID: String(result.child_run_id), GITHUB_JOB: 'consumer-child', TASK_REQUEST: json(f.model.dispatches[0]) } });
+  assert.equal(JSON.parse(child.execution).root_run_id, taskId); assert.equal(child.resume_artifact_id, 41);
+  assert.ok(f.records.some(record => record.event === 'continuation.dispatch' && record.outcome === 'registered'));
+});
+
+test('reusable authorization and preparation preserve an older frozen provider revision and reject unrelated history', async t => {
+  const f = await protocolFixture(t), provider = 'markhuangai/agent-remote-dev-codex', currentSha = 'b'.repeat(40);
+  f.model.manifest.execution.source_repository = provider;
+  f.model.payloads.set(41, await replaceManifest(f, 'provider-resume', f.model.payloads.get(41), f.model.manifest));
+  f.model.artifacts.get(41).size_in_bytes = f.model.payloads.get(41).length;
+  f.model.payloads.set(40, await zipEntries(f, 'provider-root-record', [{ name: 'record.json', text: json(f.model.request) }]));
+  f.model.artifacts.get(40).size_in_bytes = f.model.payloads.get(40).length;
+  f.model.sources.set('.github/workflows/runner-task.yml', Buffer.from((await readFile(join(root, 'skills/remote-codex/assets/runner-task.yml'), 'utf8')).replace('/remote-codex.yml@v1', `/remote-codex.yml@${currentSha}`)));
+  const request = { task_id: taskId, source_repository: provider, source_sha: sourceSha, resume_artifact_id: 41, activation_key: 'a'.repeat(32) };
+  const event = join(f.temporary, 'provider-event.json'); await writeFile(event, json({ inputs: { request: registered(request) } }));
+  let history = 'ahead';
+  const api = (path, options) => path === `/repos/${provider}/commits/${currentSha}` ? { sha: currentSha } :
+    path === `/repos/${provider}/compare/${sourceSha}...${currentSha}` ? { status: history } : f.api(path, options);
+  const env = { ...f.env, GITHUB_RUN_ID: '200', GITHUB_ACTOR: 'Z-M-Huang', GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_EVENT_PATH: event,
+    GITHUB_JOB: 'consumer-resume', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request), PROVIDER_REPOSITORY: provider, PROVIDER_SHA: currentSha };
+  for (const mode of ['authorize', 'prepare', 'task']) {
+    const result = await workflowCommand(mode, { api, env, sink: f.core });
+    assert.equal(result.source_sha, sourceSha); assert.equal(JSON.parse(result.execution).source_sha, sourceSha);
+    assert.equal(result.resume_artifact_id, 41);
+  }
+  for (history of ['behind', 'diverged']) await assert.rejects(workflowCommand('task', { api, sink: f.core,
+    env: { ...env, GITHUB_JOB: `rejected-${history}` } }), { reason: 'provider_resume_revision_unverified' });
 });
 
 test('controller claims reconcile an ambiguous dispatch and cannot blindly issue it twice', async t => {

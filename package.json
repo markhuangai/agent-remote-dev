@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs tests/continuation.test.mjs tests/submission.test.mjs tests/project-config.test.mjs tests/release.test.mjs tests/release-artifact.test.mjs tests/release-published.test.mjs && node scripts/check-bundle.mjs",
+    "check": "tsc --noEmit && tsc && node scripts/copy-test-resources.mjs && node --test tests/runtime.test.mjs tests/cli.test.mjs tests/continuation.test.mjs tests/submission.test.mjs tests/project-config.test.mjs tests/consumer.test.mjs tests/release.test.mjs tests/release-artifact.test.mjs tests/release-published.test.mjs && node scripts/check-bundle.mjs",
     "test:skill-install": "tsc && node scripts/copy-test-resources.mjs && node --test tests/skill-install.test.mjs"
   },
   "dependencies": {

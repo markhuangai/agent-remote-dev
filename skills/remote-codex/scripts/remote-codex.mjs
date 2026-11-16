@@ -19,14 +19,15 @@ export async function verifyPackage(root = packageRoot) {
       if (!(await lstat(join(root, name))).isFile()) throw new Error(); data = await readFile(join(root, name));
     }
     catch { throw Object.assign(new Error('incomplete_skill_package'), { reason: 'incomplete_skill_package', details: { resource_path: name, protocol_version: 3 } }); }
-    if (createHash('sha256').update(data).digest('hex') !== expected) throw Object.assign(new Error('skill_resource_hash_mismatch'), { reason: 'skill_resource_hash_mismatch', details: { resource_path: name, protocol_version: 3 } });
+    const observed = createHash('sha256').update(data).digest('hex');
+    if (observed !== expected) throw Object.assign(new Error('skill_resource_hash_mismatch'), { reason: 'skill_resource_hash_mismatch', details: { resource_path: name, protocol_version: 3, expected, observed } });
   }
   return manifest;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     await verifyPackage();
-    const { cli } = await import('./submission.mjs');
+    const { cli } = await import('../dist/client.mjs');
     await cli(process.argv.slice(2));
   } catch (error) {
     process.stderr.write(JSON.stringify({ event: 'submission.failed', level: 'ERROR', reason: error.reason ?? 'helper_failed', ...error.details }) + '\n');
