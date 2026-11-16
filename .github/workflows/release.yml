@@ -1,0 +1,112 @@
+name: Publish qualified Linux release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact new v1 release, initially v1.0.0-rc.0 or v1.0.0
+        required: true
+        type: string
+      source-sha:
+        description: Exact merged and qualified source commit
+        required: true
+        type: string
+      qualification-run-id:
+        description: Successful trusted Linux qualification run including cleanup
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  SOURCE_SHA: ${{ inputs.source-sha }}
+  QUALIFICATION_RUN_ID: ${{ inputs.qualification-run-id }}
+
+jobs:
+  authorize:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { releasePreflight } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
+            await releasePreflight({ github, context, core });
+
+  publish:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: linux-release-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout trusted release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Checkout exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Verify source and complete distribution
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm run test:skill-install
+      - name: Prepare reproducible release assets
+        working-directory: source
+        run: |
+          mkdir "$RUNNER_TEMP/release-assets"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/action.tar" action.yml dist package.json package-lock.json
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/remote-codex.tar" -C skills remote-codex
+          gzip -n "$RUNNER_TEMP/release-assets/action.tar" "$RUNNER_TEMP/release-assets/remote-codex.tar"
+          cd "$RUNNER_TEMP/release-assets"
+          sha256sum action.tar.gz remote-codex.tar.gz > SHA256SUMS
+      - name: Revalidate and publish immutable version with forward alias
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const fs = require('node:fs/promises');
+            const path = require('node:path');
+            const { releasePreflight, publishRelease } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/trusted/.github/scripts/release-policy.mjs').href);
+            const plan = await releasePreflight({ github, context, core });
+            const directory = path.join(process.env.RUNNER_TEMP, 'release-assets');
+            await fs.writeFile(path.join(directory, 'release-manifest.json'), JSON.stringify({ ...plan, bundle_verified: true, protocol_version: 3 }, null, 2));
+            const assets = await Promise.all((await fs.readdir(directory)).map(async name => ({ name, data: await fs.readFile(path.join(directory, name)) })));
+            const api = async (route, options) => (await github.request(`${options?.method || 'GET'} ${route}`, options)).data;
+            const upload = async (release_id, asset) => {
+              const result = await github.rest.repos.uploadReleaseAsset({ ...context.repo, release_id, name: asset.name, data: asset.data,
+                headers: { 'content-type': 'application/octet-stream', 'content-length': asset.data.length } });
+              if (result.data.state !== 'uploaded' || result.data.size !== asset.data.length) throw new Error('release_asset_upload_unverified');
+            };
+            const receipt = await publishRelease({ api, upload, plan, assets });
+            core.info(JSON.stringify({ event: 'release.complete', level: 'INFO', ...receipt, run_id: context.runId, run_attempt: process.env.GITHUB_RUN_ATTEMPT }));

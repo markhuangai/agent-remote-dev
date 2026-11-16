@@ -1,4 +1,5 @@
 name: Codex continuation controller
+run-name: Codex continuation / ${{ github.event.workflow_run.id }}
 
 on:
   workflow_run:
@@ -10,7 +11,7 @@ permissions:
   actions: read
 
 env:
-  CODEX_RUNNER_PROTOCOL: '2'
+  CODEX_RUNNER_PROTOCOL: '3'
 
 jobs:
   resolve:
@@ -36,7 +37,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { runController } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/scripts/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
             const result = await runController({ github, context, core });
             for (const [name, value] of Object.entries(result)) core.setOutput(name, value);
 
@@ -69,7 +70,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { runController } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/scripts/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
             const result = await runController({ github, context, core });
             for (const [name, value] of Object.entries(result)) core.setOutput(name, value);
       - name: Persist dispatch claim before requesting a child
@@ -93,5 +94,5 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { runController } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/scripts/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
             await runController({ github, context, core });

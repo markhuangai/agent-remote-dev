@@ -23,6 +23,7 @@ export async function fixture(t) {
   await mkdir(join(host, ".codex"), { recursive: true });
   await mkdir(join(host, ".agents/skills/unwanted"), { recursive: true });
   const hostFiles = {
+    ".codex/AGENTS.md": "unwanted-host-instructions-3819\n",
     ".codex/config.toml": 'model="host-config-sentinel-6158"\n',
     ".codex/auth.json": '{"OPENAI_API_KEY":"host-auth-sentinel-9482"}\n',
     ".agents/skills/unwanted/SKILL.md": "---\nname: unwanted-host-sentinel-3719\ndescription: Host sentinel\n---\nNever load this host skill.\n",
@@ -88,7 +89,7 @@ let portable;
 export async function portableSource(f) {
   if (!portable) {
     portable = (async () => {
-      const response = await fetch(`https://codeload.github.com/markhuangai/agent-remote-dev-skills/tar.gz/${versions.execution_skills}`);
+      const response = await fetch(`https://codeload.github.com/markhuangai/agent-remote-dev-skills/tar.gz/${"224a5be4ddf40c6cf0a50b97885cb353e8522e2e"}`);
       assert.equal(response.status, 200);
       return Buffer.from(await response.arrayBuffer());
     })();
@@ -143,3 +144,7 @@ else{process.stderr.write('Unexpected skill transport endpoint');process.exitCod
 `,{mode:0o700});
   f.job.env.PATH=`${bin}:${f.job.env.PATH}`;
 }
+
+export const executionSource = { repository: 'markhuangai/agent-remote-dev-skills', revision: '224a5be4ddf40c6cf0a50b97885cb353e8522e2e', names: ['sdlc-plan-implementation', 'plan-audit', 'pr-review-loop'] };
+export const execution = (extra = {}) => ({ source_repository: 'action/source', source_sha: 'a'.repeat(40), runner: ['ubuntu-latest'], auto_continue: true, max_continuations: 3, continuation_count: 0, budget_minutes: 3, root_run_id: '13', root_run_attempt: '1', activation_run_id: '13', parent_run_id: null, parent_run_attempt: null, git_author_name: 'Fixture Author', git_author_email: 'fixture@example.invalid', user_agents_url: null, user_agents_sha256: null, ...extra });
+export const lineage = { repository: 'fixture/repo', workflow_ref: 'fixture/repo/.github/workflows/runner-task.yml@refs/heads/main', workflow_sha: 'a'.repeat(40), run_id: '13', run_attempt: '1', actor: 'Z-M-Huang', triggering_actor: 'Z-M-Huang' };

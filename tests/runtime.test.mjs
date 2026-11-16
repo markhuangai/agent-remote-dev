@@ -5,20 +5,20 @@ import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
 import { zstdCompressSync } from "node:zlib";
 import test from "node:test";
-import { authorize, executionSource, hash, parseTurn, skillSources } from "../.build/contracts.js";
+import { authorize, hash, skillSources } from "../.build/contracts.js";
 import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
 import { exportCheckpoint, durableCheckpoint } from "../.build/checkpoint.js";
-import { isolatedCheckpoint } from "../.build/checkpoint-worker.js";
+import { isolatedCheckpoint, isolatedRecord } from "../.build/checkpoint-worker.js";
+import { recordName } from "../.github/remote-codex/checkpoint-policy.mjs";
 import { TaskGit } from "../.build/git.js";
-import { reviewSurfaces, verifyReviewState, verifyTerminal } from "../.build/delivery.js";
 import { selectPlanSource } from "../.build/main.js";
 import { command } from "../.build/process.js";
-import { exec, fixture, logger, portableSource, repository, root, skillTransport, turn, policy } from "./helpers.mjs";
+import { exec, executionSource, execution, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
 
 const plan = "Implement the fixture plan.\n";
 const auth = { repository: "fixture/repo", plan_sha256: hash(plan), request: "Implement and deliver this plan, with checkpoint pushes." };
 const checkpoint = (extra = {}) => ({ task_id: "fixture-task", repository: "fixture/repo", branch: "codex/fixture-task", base_sha: "a".repeat(40), checkpoint_sha: "b".repeat(40),
-  plan, plan_source: "inline", authorization: auth, sessions: ["fixture-session"], skills: [executionSource], progress: { completed: ["fixture"] }, lineage: { run_id: "13" }, audit: null, previous: null, ...extra });
+  plan, plan_source: "inline", authorization: auth, session_id: "fixture-session", sessions: ["fixture-session"], skills: [executionSource], user_agents: null, lineage, execution: execution(), previous: null, ...extra });
 async function history(f, content = "completed turn") {
   await mkdir(join(f.job.codexHome, "sessions"));
   const data = JSON.stringify({ type: "session_meta", payload: { id: "fixture-session", session_id: "root-session" } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
@@ -38,12 +38,7 @@ test("the actual bundled entry rejects retired mode inputs before configuration 
     env:{...process.env,"INPUT_PERMISSION-MODE":mode,GITHUB_REPOSITORY:"fixture/repo",GITHUB_SERVER_URL:"https://github.com"},
   }),error=>{assert.equal(error.code,1);assert.match(error.stdout,/unsupported_mode_input/);assert.doesNotMatch(error.stdout,/runtime\.setup|runtime\.operation/);return true;});
 });
-test("skill sources preserve the three immutable defaults and refuse collisions and mutable refs", () => {
-  assert.deepEqual(skillSources("[]"), [executionSource]);
-  assert.throws(() => skillSources(JSON.stringify([{ repository: "fixture/skills", revision: "main", names: ["test"] }])));
-  assert.throws(() => skillSources(JSON.stringify([{ repository: "fixture/skills", revision: "a".repeat(40), names: ["plan-audit"] }])));
-  assert.throws(() => parseTurn(JSON.stringify({ ...turn("complete"), injected: true })));
-});
+
 test("configuration is isolated, rejects invalid TOML, and prevents permission and storage overrides", async (t) => {
   const f = await fixture(t);
   await configure(f.job, 'model="gpt-5.1"\nsandbox_mode="read-only"\nsqlite_home="/outside"\n[model_providers.fixture]\nenv_key="CODEX_API_KEY"\nhttp_headers={authorization="fixture-config-secret-4631"}', f.log);
@@ -102,159 +97,7 @@ test("safe tree and cleanup refuse export symlinks and never follow cleanup link
   await removeJob(f.job.home);
   assert.equal(await readFile(outside, "utf8"), "retain");
 });
-test("actual Git publication verifies pushed commits, upstream, deletions and remote drift", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  await writeFile(join(r.cwd, "greeting.js"), "console.log('fixture');\n");
-  const sha = await git.publish(["greeting.js"], "Fixture accomplishment", r.base, null);
-  assert.equal(await git.remoteHead(), sha);
-  await assert.rejects(git.verify(r.base),error=>{f.log.failure(error);assert.equal(error.details.expected_sha,r.base);assert.equal(error.details.observed_sha,sha);return true;});
-  assert.equal(await r.git("rev-list", "--left-right", "--count", "HEAD...@{upstream}"), "0\t0");
-  await assert.rejects(git.publish([], "", r.base, sha), error => {
-    assert.equal(error.reason, "worker_changed_git_history"); assert.equal(error.details.expected_sha, r.base);
-    assert.equal(error.details.observed_sha, sha); return true;
-  });
-  await r.git("switch", "main");
-  await assert.rejects(git.publish([], "", sha, sha), error => {
-    assert.equal(error.reason, "task_branch_changed"); assert.equal(error.details.expected_branch, r.branch);
-    assert.equal(error.details.observed_branch, "main"); assert.equal(error.details.expected_sha, sha);
-    assert.equal(error.details.observed_sha, r.base); return true;
-  });
-  await r.git("switch", r.branch);
-  await assert.rejects(git.publish([], "", sha, r.base), { reason: "remote_branch_drift" });
-  await r.git("rm", "README.md");
-  const next = await git.publish(["README.md"], "Remove fixture file", sha, sha);
-  assert.notEqual(next, sha);
-  await unlink(join(r.cwd, "greeting.js"));
-  const removed = await git.publish(["greeting.js"], "Remove unstaged fixture file", next, next);
-  assert.equal(await git.remoteHead(), removed);
-});
-for (const change of ["deletion", "rename"]) test(`audited ${change} fingerprints survive staging and real publication`, async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  const original = await git.fingerprint();
-  if (change === "deletion") await unlink(join(r.cwd, "README.md"));
-  else await rename(join(r.cwd, "README.md"), join(r.cwd, "renamed.md"));
-  const audited = await git.fingerprint(), paths = await git.changedPaths();
-  assert.notEqual(audited, original);
-  await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited);
-  const sha = await git.publish(paths, `Publish fixture ${change}`, r.base, null);
-  assert.equal(await git.fingerprint(), audited); assert.equal(await git.remoteHead(), sha);
-  await writeFile(join(r.cwd, "renamed.md"), "Later implementation change\n");
-  assert.notEqual(await git.fingerprint(), audited);
-});
-for (const replacement of ["file-to-directory", "directory-to-file", "directory-to-symlink"]) for (const staged of [false, true]) {
-  test("real " + replacement + " preserves audit identity and publication with " + (staged ? "staged" : "unstaged") + " changes", async (t) => {
-    const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-    const initial = replacement === "file-to-directory" ? "shape" : "shape/old.ts";
-    await mkdir(join(r.cwd, initial, ".."), { recursive: true });
-    await writeFile(join(r.cwd, initial), "Original fixture\n");
-    await r.git("add", "shape"); await r.git("commit", "-m", "Prepare replacement fixture");
-    const base = await git.head(), original = await git.fingerprint();
-    await unlink(join(r.cwd, initial));
-    if (replacement !== "file-to-directory") await rmdir(join(r.cwd, "shape"));
-    const current = replacement === "file-to-directory" ? "shape/new.ts" : "shape";
-    const outside = join(f.temporary, "outside");
-    if (replacement === "directory-to-symlink") {
-      await mkdir(outside); await writeFile(join(outside, "old.ts"), f.job.env.CODEX_API_KEY);
-      await symlink(outside, join(r.cwd, current));
-    } else {
-      await mkdir(join(r.cwd, current, ".."), { recursive: true });
-      await writeFile(join(r.cwd, current), "Replacement fixture\n");
-    }
-    const audited = await git.fingerprint(), paths = await git.changedPaths();
-    assert.notEqual(audited, original);
-    if (staged) { await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited); }
-    if (replacement !== "directory-to-symlink") {
-      await writeFile(join(r.cwd, current), f.job.env.CODEX_API_KEY);
-      await assert.rejects(git.publish(paths, "Reject contaminated replacement", base, null), { reason: "credential_in_commit" });
-      assert.equal(await git.head(), base); assert.equal(await git.remoteHead(), null);
-      await writeFile(join(r.cwd, current), "Replacement fixture\n");
-      assert.equal(await git.fingerprint(), audited);
-    }
-    const sha = await git.publish(paths, "Publish " + replacement, base, null);
-    assert.equal(await git.remoteHead(), sha); assert.equal(await git.fingerprint(), audited);
-    assert.equal(await r.git("status", "--porcelain"), "");
-    const published = await exec("git", ["--git-dir", r.remote, "show", sha + ":" + current], { env: f.job.env });
-    assert.equal(published.stdout, replacement === "directory-to-symlink" ? outside : "Replacement fixture\n");
-  });
-}
-test("real submodule fingerprints and publication preserve clean references and reject unpublished child work",async(t)=>{
-  const f=await fixture(t),r=await repository(f),source=join(f.temporary,"module-source");
-  await mkdir(source);
-  const moduleGit=async(...args)=>exec("git",args,{cwd:source,env:f.job.env});
-  await moduleGit("init","--initial-branch=main");await writeFile(join(source,"value.txt"),"original\n");
-  await moduleGit("add","value.txt");await moduleGit("commit","-m","Initial module fixture");
-  const originalModuleHead = (await moduleGit("rev-parse", "HEAD")).stdout.trim();
-  await exec("git",["submodule","add",source,"module"],{cwd:r.cwd,env:{...f.job.env,GIT_ALLOW_PROTOCOL:"file"}});
-  await r.git("commit","-am","Add fixture submodule");assert.equal(await r.git("status","--porcelain"),"");
-  const git=new TaskGit(r.cwd,f.job.env,f.log,r.branch),clean=await git.fingerprint();
-  assert.equal(await git.fingerprint(),clean);
-  await writeFile(join(r.cwd,"module/value.txt"),"changed\n");assert.notEqual(await git.fingerprint(),clean);
-  await writeFile(join(r.cwd,"module/value.txt"),"original\n");assert.equal(await git.fingerprint(),clean);
-  await writeFile(join(r.cwd,"module/untracked.txt"),"one");const untracked=await git.fingerprint();
-  await writeFile(join(r.cwd,"module/untracked.txt"),"two");assert.notEqual(await git.fingerprint(),untracked);
-  await unlink(join(r.cwd,"module/untracked.txt"));
-  const parent=await git.publish([],"",await git.head(),null);
-  await writeFile(join(source,"value.txt"),"published update\n");await moduleGit("commit","-am","Update module fixture");
-  const moduleHead=(await moduleGit("rev-parse","HEAD")).stdout.trim();
-  await exec("git",["-C",join(r.cwd,"module"),"fetch","origin"],{env:f.job.env});
-  await exec("git",["-C",join(r.cwd,"module"),"checkout","--detach",moduleHead],{env:f.job.env});
-  const audited = await git.fingerprint(); assert.notEqual(audited, clean);
-  await r.git("add", "module"); assert.equal(await git.fingerprint(), audited);
-  const published=await git.publish(["module"],"Publish module reference",parent,parent);
-  assert.equal(await git.fingerprint(), audited);
-  assert.equal(await git.remoteHead(),published);assert.match(await r.git("ls-tree","HEAD","module"),new RegExp(moduleHead));
-  await writeFile(join(r.cwd,"module/value.txt"),"unpublished work\n");
-  await assert.rejects(git.publish(["module"],"Invalid child work",published,published),{reason:"dirty_submodule"});
-  assert.equal(await git.head(),published);assert.equal(await git.remoteHead(),published);
-  await writeFile(join(r.cwd,"module/value.txt"), "published update\n");
-  await r.git("submodule", "deinit", "--force", "module");
-  const uninitialized = await git.fingerprint();
-  await r.git("update-index", "--cacheinfo", `160000,${originalModuleHead},module`);
-  assert.notEqual(await git.fingerprint(), uninitialized);
-});
-for (const staged of [false, true]) test("new submodules preserve audit identity with " + (staged ? "staged legacy" : "unstaged canonical") + " publication paths", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  const source = join(f.temporary, "new-module-source"); await mkdir(source);
-  const child = (...args) => exec("git", args, { cwd:source, env:f.job.env });
-  await child("init", "--initial-branch=main"); await writeFile(join(source, "value.txt"), "Published module\n");
-  await child("add", "value.txt"); await child("commit", "-m", "Prepare module fixture");
-  const moduleHead = (await child("rev-parse", "HEAD")).stdout.trim();
-  await exec("git", ["clone", source, join(r.cwd, "module")], { env:f.job.env });
-  await writeFile(join(r.cwd, ".gitmodules"), '[submodule "module"]\n\tpath = module\n\turl = ' + source + "\n");
-  const paths = await git.changedPaths(), audited = await git.fingerprint();
-  assert.deepEqual(paths, [".gitmodules", "module"]);
-  await writeFile(join(r.cwd, "module/value.txt"), "Dirty module\n");
-  assert.notEqual(await git.fingerprint(), audited);
-  await assert.rejects(git.publish(paths, "Reject dirty new module", r.base, null), { reason:"dirty_submodule" });
-  assert.equal(await git.head(), r.base); assert.equal(await git.remoteHead(), null);
-  await writeFile(join(r.cwd, "module/value.txt"), "Published module\n");
-  assert.equal(await git.fingerprint(), audited);
-  if (staged) { await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited); }
-  const supplied = paths.map(path => staged && path === "module" ? "module/" : path);
-  const sha = await git.publish(supplied, "Publish new module", r.base, null);
-  assert.equal(await git.remoteHead(), sha); assert.equal(await git.fingerprint(), audited);
-  assert.equal(await r.git("status", "--porcelain"), "");
-  const tree = (await exec("git", ["--git-dir", r.remote, "ls-tree", sha, "module"], { env:f.job.env })).stdout;
-  assert.match(tree, new RegExp("160000 commit " + moduleHead + "\\tmodule"));
-});
-test("publication rejects a staged credential without advancing local or remote history",async(t)=>{
-  const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);
-  await writeFile(join(r.cwd,"credential.txt"),f.job.env.CODEX_API_KEY);await r.git("add","credential.txt");
-  await assert.rejects(git.publish(["credential.txt"],"Rejected fixture",r.base,null),{reason:"credential_in_commit"});
-  assert.equal(await git.head(),r.base);assert.equal(await git.remoteHead(),null);
-  assert.equal(await r.git("diff","--cached","--name-only"),"credential.txt");
-});
-test("real rejected push records intended/observed SHA and never pretends it is durable", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  await writeFile(join(r.remote, "hooks/pre-receive"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
-  await writeFile(join(r.cwd, "greeting.js"), "console.log('fixture');\n");
-  await assert.rejects(git.publish(["greeting.js"], "Fixture rejected push", r.base, null), (error) => {
-    f.log.failure(error, { artifact_id: 7 });
-    assert.equal(error.reason, "push_failed"); assert.equal(error.details.observed_sha, null); assert.match(error.details.intended_sha, /^[a-f0-9]{40}$/); return true;
-  });
-  const evidence = f.records.find((record) => record.event === "runtime.failed");
-  assert.equal(evidence.stage, "publication"); assert.equal(evidence.last_durable_checkpoint.artifact_id, 7);
-});
+
 test("checkpoint exports exact session state and consistent SQLite backups, excluding secrets and caches", async (t) => {
   const f = await fixture(t); await history(f);
   const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
@@ -322,7 +165,7 @@ test("checkpoint rejects escaped manifest credentials before upload and retains 
   const f = await fixture(t), secret = 'fixture-"manifest\\credential\n9371';
   await configure(f.job, "[mcp_servers.fixture.env]\nPASSWORD=" + JSON.stringify(secret) + "\n", f.log); await history(f);
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
-  const input = checkpoint({ previous, progress: { detail: secret } });
+  const input = checkpoint({ previous, authorization: { ...auth, request: secret } });
   assert.equal(JSON.stringify(input).includes(secret), false);
   let uploaded = false;
   await assert.rejects(durableCheckpoint(f.job, input, f.log, async () => {}, async () => {
@@ -384,7 +227,8 @@ test("upload failures, missing sessions, drift and size limits never advance the
 test("checkpoint failure diagnostics preserve real Git observations and the preceding durable receipt", async (t) => {
   const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
   await writeFile(join(r.cwd, "new.txt"), "Published change\n");
-  const observed = await git.publish(["new.txt"], "Publish fixture", r.base, null);
+  await r.git("add", "new.txt"); await r.git("commit", "-m", "Skill fixture"); await r.git("push", "origin", r.branch);
+  const observed = await git.head();
   const previous = { sequence: 0, artifact_id: 7, checkpoint_sha: r.base };
   await assert.rejects(isolatedCheckpoint(f.job, r.cwd, checkpoint({ base_sha:r.base, checkpoint_sha:r.base, previous }), f.log, sha => git.verify(sha)), error => {
     assert.equal(error.reason, "checkpoint_operation_failed"); assert.equal(error.details.expected_sha, r.base);
@@ -395,51 +239,8 @@ test("checkpoint failure diagnostics preserve real Git observations and the prec
   assert.equal(failure.expected_sha, r.base); assert.equal(failure.observed_sha, observed);
   assert.equal(failure.last_verified_sha, null); assert.equal(failure.last_durable_checkpoint.artifact_id, 7);
 });
-test("required checks, marked review coverage and dispositions reject stale or incomplete completion", () => {
-  const head = "a".repeat(40), p = { ...policy, marked_review_count: 1 };
-  const receipt = { gate:"terminal", phase:"full", head_sha:head, all_checks_nonblocking:true, required_reviewers_satisfied:true,
-    required_checks:policy.checks, required_reviewers:[], required_check_problems:[], required_reviewer_problems:[] };
-  verifyTerminal(receipt, head, policy);
-  for (const change of [{head_sha:"b".repeat(40)},{required_checks:[]},{gate:"review_terminal"},{all_checks_nonblocking:false}]) assert.throws(() => verifyTerminal({...receipt,...change},head,policy));
-  const state = {pull_request:{head_sha:head}, codex_thread_actions:{incomplete:0}, ai_pr_reviewer_thread_actions:{incomplete:0}, reviews:[{id:"review-1",commit:{oid:head},body:`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->
-| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
-|:--|--:|--:|--:|--:|--:|
-| <code>src/main.ts</code> | 5 | 5 | 100% | 1 | 1 |
-| **Total** | **5** | **5** | **100%** | — | **1** |`}]};
-  const ledger=reviewSurfaces(state).map(surface=>({...surface,decision:"not_finding",reason:"Fixture contains no finding",fix_sha:null}));
-  verifyReviewState(state,head,p,ledger);
-  assert.throws(() => verifyReviewState({...state,reviews:[]},head,p,[]));
-  assert.throws(() => verifyReviewState({...state,ai_pr_reviewer_thread_actions:{incomplete:1}},head,p,ledger));
-  const finding={...state,reviews:[{...state.reviews[0],body:state.reviews[0].body+"\nP1: Missing authorization validation"}]};
-  assert.throws(()=>verifyReviewState(finding,head,p,[]),{reason:"review_surface_coverage_mismatch"});
-  assert.throws(()=>verifyReviewState(finding,head,p,ledger),{reason:"unhandled_review_surface"});
-  for (const body of ["Fixture review without coverage", state.reviews[0].body.replace("5 | 5 | 100%", "1 | 5 | 20%")]) {
-    const partial = { ...state, reviews:[{ ...state.reviews[0], body }] };
-    const dispositions = reviewSurfaces(partial).map(surface => ({ ...surface, decision:"not_finding", reason:"Fixture only", fix_sha:null }));
-    assert.throws(() => verifyReviewState(partial, head, p, dispositions), { reason:"incomplete_ai_review_coverage" });
-  }
-});
-test("the actual v3 aggregate coverage format proves all profiles and rejects partial or inconsistent receipts",()=>{
-  const head="a".repeat(40),validation={...policy,marked_review_count:6};
-  const body=`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->
-## AI review
-| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
-|:--|--:|--:|--:|--:|--:|
-| <code>src/entry.ts</code> | 5 | 5 | 100% | 6 | 6 |
-| <code>src/main.ts</code> | 113 | 113 | 100% | 6 | 6 |
-| **Total** | **118** | **118** | **100%** | — | **6** |
 
-Coverage does not measure review quality or completion.`;
-  const state={pull_request:{head_sha:head},codex_thread_actions:{incomplete:0},ai_pr_reviewer_thread_actions:{incomplete:0},reviews:[{id:"aggregate",commit:{oid:head},body}]};
-  const verify=value=>verifyReviewState(value,head,validation,reviewSurfaces(value).map(surface=>({...surface,decision:"not_finding",reason:"Fixture coverage only",fix_sha:null})));
-  verify(state);
-  for(const changed of [body.replace("100% | 6 | 6","80% | 6 | 6"),body.replace("100% | 6 | 6","100% | 5 | 6"),body.replace("**118** | **118**","**119** | **118**"),body.replace(head,"b".repeat(40))]) {
-    assert.throws(()=>verify({...state,reviews:[{...state.reviews[0],body:changed}]}),{reason:"incomplete_ai_review_coverage"});
-    const reviews = Array.from({ length:6 }, (_, index) => ({ ...state.reviews[0], id:`profile-${index}`, body:changed.replace("c".repeat(64), String(index + 1).repeat(64)) }));
-    assert.throws(() => verify({ ...state, reviews }), { reason:"incomplete_ai_review_coverage" });
-  }
-});
-test("failed validation retains bounded sanitized stdout while worker and API stdout stay private", async (t) => {
+test("explicit command diagnostics sanitize stdout while native and API output stay private", async (t) => {
   const f = await fixture(t), args = ["-e", "process.stdout.write('validation-failure-evidence\\n'+process.env.CODEX_API_KEY+'\\n'+JSON.stringify({private_provider:'omit-this-body'})+'\\n'+'x'.repeat(10000));process.exit(1)"];
   await assert.rejects(command(process.execPath, args, { cwd:f.temporary, env:f.job.env, stage:"local_check_0", log:f.log, diagnosticStdout:true }), error => {
     assert.match(error.nativeCause, /validation-failure-evidence/); assert.match(error.nativeCause, /truncated/);
@@ -469,7 +270,7 @@ test("a stalled real artifact transport is terminated within the checkpoint acti
   const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);await history(f);
   await mkdir(join(f.job.tools,"node_modules/@actions"));
   await symlink(join(root,"node_modules/@actions/artifact"),join(f.job.tools,"node_modules/@actions/artifact"),"dir");
-  const sha=await git.publish([],"",r.base,null);
+  await r.git("push", "origin", r.branch); const sha=await git.head();
   let requests=0;const server=createServer(async(request,response)=>{requests++;for await(const _ of request){};});
   await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
   t.after(()=>new Promise(resolve=>{server.close(resolve);server.closeAllConnections();}));
@@ -484,6 +285,36 @@ test("a stalled real artifact transport is terminated within the checkpoint acti
   assert.equal(evidence.observed_sha,null);assert.equal(evidence.last_verified_sha,sha);
   assert.ok(Date.now()<Number(f.job.env.CODEX_TASK_DEADLINE_MS));
 });
+for (const variant of ["escaped", "unicode", "nested"]) test(`opaque result artifacts reject ${variant} JSON credentials before export or transport`, async t => {
+  const f = await fixture(t), secret = 'fixture-"result\\credential\n9371'; f.log.protect(secret);
+  const encoded = JSON.stringify({ credential: secret });
+  const response = variant === 'nested' ? JSON.stringify({ response: JSON.stringify(encoded) }) : variant === 'unicode' ?
+    '{"credential":"' + Array.from(secret, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('') + '"}' : encoded;
+  assert.equal(response.includes(secret), false);
+  await assert.rejects(isolatedRecord(f.job, 'result', { task_id: 'fixture-task', lineage, response, native_outcome: 'succeeded' }, f.log), error => {
+    assert.equal(error.reason, 'credential_in_manifest'); f.log.failure(error); return true;
+  });
+  await assert.rejects(readFile(join(f.job.exports, recordName('result', 'fixture-task', lineage.run_id, lineage.run_attempt), 'record.json')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(f.job.root, 'result-request.json')), { code: 'ENOENT' });
+  assert.doesNotMatch(JSON.stringify(f.records), /result\\\\credential|9371|credential\":/);
+  assert.ok(!f.records.some(record => record.stage === 'continuation_record' || record.event === 'continuation.record'));
+});
+test('safe opaque result bytes remain unchanged when the real artifact transport starts', async t => {
+  const f = await fixture(t);
+  await mkdir(join(f.job.tools, 'node_modules/@actions'));
+  await symlink(join(root, 'node_modules/@actions/artifact'), join(f.job.tools, 'node_modules/@actions/artifact'), 'dir');
+  let requests = 0;
+  const server = createServer(async request => { requests++; for await (const _ of request) {} });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const token = 'e30.' + Buffer.from(JSON.stringify({ scp: 'Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222' })).toString('base64url') + '.fixture';
+  f.job.env.CODEX_TASK_DEADLINE_MS = String(Date.now() + 18000);
+  const response = 'Ordinary opaque response.\n{"unfinished JSON\n', value = { task_id: 'fixture-task', lineage, response, native_outcome: 'succeeded' };
+  await assert.rejects(isolatedRecord(f.job, 'result', value, f.log, { ...process.env, ACTIONS_RUNTIME_TOKEN: token,
+    ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, GITHUB_WORKSPACE: f.temporary, NO_PROXY: '127.0.0.1,localhost' }, join(root, 'dist/index.js')), { reason: 'command_timeout' });
+  assert.ok(requests > 0);
+  assert.deepEqual(JSON.parse(await readFile(join(f.job.exports, recordName('result', 'fixture-task', lineage.run_id, lineage.run_attempt), 'record.json'), 'utf8')), value);
+});
 test("normal diagnostic output masks credentials and raw provider bodies and marks truncation", () => {
   const { log, records } = logger(); log.protect("fixture-secret-8291");
   log.event("runtime.failed", "ERROR", { native_cause:'HTTP 403 {"message":"private API body"}\nAuthorization: Bearer fixture-secret-8291', detail:"x".repeat(800) });
@@ -491,32 +322,7 @@ test("normal diagnostic output masks credentials and raw provider bodies and mar
   assert.doesNotMatch(encoded, /fixture-secret-8291|private API body|Authorization: Bearer/);
   assert.equal(records[0].truncated, true); assert.equal(records[0].level, "ERROR");
 });
-test("real delivery rejection logs identify stale head and policy without raw receipt content", async () => {
-  const deliveryPath = JSON.stringify(new URL("../.build/delivery.js", import.meta.url).href);
-  const diagnosticPath = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
-  const expected = "a".repeat(40), observed = "b".repeat(40);
-  const receipt = { gate:"terminal", phase:"full", head_sha:observed, all_checks_nonblocking:true, required_reviewers_satisfied:true,
-    required_check_problems:[], required_reviewer_problems:[], required_checks:Array.from({ length:12 }, (_, index) => "Check " + index), required_reviewers:[],
-    provider_body:"private-provider-body-5419", secret:"fixture-secret-3149" };
-  const script = "import {verifyTerminal} from " + deliveryPath + ";import {Diagnostics} from " + diagnosticPath +
-    ";const log=new Diagnostics({task_id:'delivery-log-task',run_id:'13',run_attempt:'1',session_id:'log-session',turn:2});log.protect('fixture-secret-3149');" +
-    "try{verifyTerminal(" + JSON.stringify(receipt) + "," + JSON.stringify(expected) + "," + JSON.stringify(policy) +
-    ");}catch(error){log.failure(error,{artifact_id:17});}";
-  const output = (await exec(process.execPath, ["--input-type=module", "-e", script])).stdout;
-  const visible = output.split("\n").filter(line => !line.startsWith("::add-mask::")).join("\n");
-  assert.doesNotMatch(visible, /private-provider-body-5419|fixture-secret-3149/);
-  const line = visible.split("\n").find(line => line.includes('"event":"runtime.failed"'));
-  const evidence = JSON.parse(line.slice(line.indexOf("{")));
-  assert.equal(evidence.level, "ERROR"); assert.equal(evidence.stage, "delivery");
-  assert.equal(evidence.reason, "delivery_gate_incomplete"); assert.equal(evidence.evidence_source, "terminal_receipt");
-  assert.equal(evidence.expected_sha, expected); assert.equal(evidence.observed_sha, observed);
-  assert.deepEqual(evidence.missing_gates, ["head", "required_checks"]);
-  assert.deepEqual(evidence.expected_policy.checks.names, ["CI"]);
-  assert.equal(evidence.observed_policy.checks.count, 12); assert.equal(evidence.observed_policy.checks.names.length, 10);
-  assert.equal(evidence.observed_policy.checks.omitted, 2); assert.match(evidence.native_cause, /current-head review receipt/);
-  assert.equal(evidence.task_id, "delivery-log-task"); assert.equal(evidence.run_attempt, "1");
-  assert.equal(evidence.session_id, "log-session"); assert.equal(evidence.turn, 2); assert.equal(evidence.last_durable_checkpoint.artifact_id, 17);
-});
+
 test("the real Actions logger retains required failure evidence after DEBUG filtering",async()=>{
   const diagnosticPath=JSON.stringify(new URL("../.build/diagnostics.js",import.meta.url).href);
   const contractPath=JSON.stringify(new URL("../.build/contracts.js",import.meta.url).href);

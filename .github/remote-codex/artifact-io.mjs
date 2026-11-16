@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { checkpointBytes, invariant, positiveId } from './checkpoint-policy.mjs';
 
@@ -18,12 +18,12 @@ export async function readArtifact({ api, repository, id, root, kind = 'record' 
   const archive = join(root, `${id}.zip`), destination = join(root, `${id}-${kind}`);
   await writeFile(archive, bytes, { mode: 0o600, flag: 'wx' });
   try {
-    await promisify(execFile)('python3', [resolve(import.meta.dirname, '../../src/archive.py'), archive, destination, kind], { timeout: 120000, maxBuffer: 4096 });
+    await promisify(execFile)('python3', [join(import.meta.dirname, 'archive.py'), archive, destination, kind], { timeout: 120000, maxBuffer: 4096 });
   } catch (error) {
     let failure;
     try { failure = JSON.parse(error.stderr); } catch {}
     const reason = /^[a-z_]{1,80}$/.test(failure?.reason ?? '') ? failure.reason : 'unsafe_checkpoint_archive';
-    invariant(false, reason, reason === 'unsupported_checkpoint_schema' ? 2 : null,
+    invariant(false, reason, reason === 'unsupported_checkpoint_schema' ? 3 : null,
       reason === 'unsupported_checkpoint_schema' && Number.isSafeInteger(failure.observed) ? failure.observed : null);
   }
   const value = JSON.parse(await readFile(join(destination, kind === 'checkpoint' ? 'manifest.json' : 'record.json'), 'utf8'));

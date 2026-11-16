@@ -1,253 +1,63 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { auditSchema, runCodex } from "./codex.js";
+import { runCodex } from "./codex.js";
 import { CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
-import { Authorization, hash, parseJson, parseTurn, requireValue, RunnerError, SkillSource, Status, ValidationPolicy } from "./contracts.js";
+import { Authorization, RunnerError, SkillSource, Status, UserAgents } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 import { TaskGit } from "./git.js";
 import { Job } from "./setup.js";
-import { command } from "./process.js";
-import { sessionFacts } from "./history.js";
-import { budgetOutcome, DriverState, Execution, ReviewBudget } from "./continuation.js";
-import { debitReviewBudget, savedAuditAuthority, savedAuditHistory } from "../.github/scripts/checkpoint-policy.mjs";
+import { Execution } from "./continuation.js";
 
 export type DriverInput = { job: Job; git: TaskGit; log: Diagnostics; plan: string; planSource: string; authorization: Authorization;
-  repository: string; taskId: string; base: string; issueNumber?: string | null; budgetMs: number; started: number; skills: SkillSource[];
-  lineage: Record<string, unknown>; execution?: Execution; cancelled?: () => boolean;
-  resume?: { state: DriverState; checkpoint: DurableCheckpoint; audit: any; sessions?: string[]; sessionIdentifiers?: {thread_id: string; session_id: string}[] };
-  validation?: (round: number, phase: "started" | "passed" | "failed", stateHash: string) => Promise<unknown>;
+  repository: string; taskId: string; base: string; budgetMs: number; started: number; skills: SkillSource[]; userAgents: UserAgents;
+  lineage: Record<string, unknown>; execution: Execution; cancelled?: () => boolean;
+  resume?: { session: string; checkpoint: DurableCheckpoint };
   checkpoint: (input: CheckpointInput) => Promise<DurableCheckpoint>;
-  complete: (url: string, receipt: string, policy: ValidationPolicy, timeoutMs: number) => Promise<unknown> };
-export type DriverResult = { status: Status; checkpoint: DurableCheckpoint | null; session: string | null; prUrl: string | null; reason: string };
+  result: (value: { session_id: string | null; response: string; native_outcome: string }) => Promise<unknown> };
+export type DriverResult = { status: Status; checkpoint: DurableCheckpoint | null; session: string | null; reason: string; nativeOutcome: string };
 export async function drive(input: DriverInput): Promise<DriverResult> {
-  const { job, git, log } = input;
-  const restored = input.resume;
-  let session: string | undefined = restored?.state.worker_session, last: DurableCheckpoint | null = restored?.checkpoint ?? null, prUrl: string | null = restored?.state.pr_url ?? null;
-  let expectedHead = last?.checkpoint_sha ?? input.base, remote: string | null = last?.checkpoint_sha ?? null, policy: ValidationPolicy | null = restored?.state.validation_policy ?? null;
-  let audit: any = restored?.audit ?? null, prompt = "", deliveryReceipt: unknown = null;
-  let auditSession: string | undefined = restored?.state.auditor_session ?? undefined;
-  let sourceFingerprint = "";
-  const historicalAudits: unknown[] = restored?.state.historical_audits ?? [];
-  let reviewBudget: ReviewBudget | null = restored?.state.review_budget ?? null, continuationVeto = false;
-  const auditRounds: any[] = restored?.state.audit_rounds ?? [], reconsidered = new Set<string>(restored?.state.reconsidered ?? []);
-  const outcome: { status: Status } = { status: "failed" };
-  const finish = (status: Status, reason: string = status): DriverResult => { outcome.status = status; return { status, checkpoint: last, session: session ?? null, prUrl, reason }; };
-  const yieldBudget = () => {
-    const status = continuationVeto ? "blocked" : budgetOutcome(input.execution, last);
-    log.event("runtime.deadline", "WARN", { reason: "action_budget", status, last_durable_checkpoint: last, review_budget: reviewBudget,
-      remaining_ms: remaining(), interrupted_progress: "not_checkpointed", continuation_count: input.execution?.continuation_count,
-      max_continuations: input.execution?.max_continuations });
-    return finish(status, continuationVeto ? "validation_failed" : "action_budget");
-  };
-  const sessions: string[] = restored ? restored.sessions ?? [...new Set([session!, ...(auditSession ? [auditSession] : []), ...auditRounds.map(round => round.receipt.auditor_session)])] : [];
-  const remaining = () => input.started + input.budgetMs - Date.now();
-  const guidance = await readFile(join(job.codexHome, "skills/sdlc-plan-implementation/SKILL.md"), "utf8");
-  const protocol = `You are the worker in an authorized plan runner. Invoke the installed $sdlc-plan-implementation, $plan-audit and $pr-review-loop as applicable.
-Work on the prepared CURRENT branch ${git.branch}; the supervisor already prepared it from base ${input.base}.
-${input.issueNumber ? `The source issue is https://github.com/${input.repository}/issues/${input.issueNumber}. Include a standalone close #${input.issueNumber} line in the PR body.` : ""}
-The supervisor exclusively owns Git staging, commits, pushes, checkpoint export and independent audit launch. Never perform those Git mutations yourself. Never merge, deploy, force-push, rewrite history, change credentials/settings or start another ticket.
-End each turn at one small completed accomplishment and return the required JSON. List every intended changed path relative to the repository and a commit message; the supervisor publishes it and verifies the remote before continuing this SAME conversation.
-The direct authorization explicitly permits checkpoint pushes before final audit. Whole-plan audit and required tests still gate PR delivery. Return kind=audit when implementation and test logic are ready; the supervisor launches the independent read-only auditor and then runs the assigned local checks in full-access/YOLO mode. Do not run tests yourself. After corrections request another whole-plan audit. Any source/test change invalidates the prior conformance receipt.
-Discover the exact repository validation policy from instructions, workflows, rulesets and GitHub. Return validation_policy with exact required check/reviewer names, assigned local check commands and expected ai-pr-reviewer profile count (zero when not configured); the provider may publish one aggregate coverage receipt for all profiles. Do not invent mandatory vendors. Freeze it before requesting audit. Include actual local test commands and results in the PR.
-After the supervisor reports conformant audit and passing checks, return an accomplishment to publish final code, then create a non-draft PR and immediately return its URL as an accomplishment BEFORE waiting for review. The supervisor checkpoints the PR identity and review observation start. In-scope review fixes return through audit, tests, supervisor publication and current-head review. Keep the SUPERVISOR'S REMAINING observation budget per head, two-minute polling and three-minute stability window. Never reset the budget on resume or helper restart. No live acceptance dispatch or other-author CI approvals.
-The final review_receipt must be a JSON file under ${job.root} with state=automation_clean, terminal_receipt=the portable helper's full terminal JSON, and a dispositions array. Cover every nonempty review body, conversation comment and inline thread by stable surface_kind (review, comment, thread), id, body_sha256, decision (fixed, non_blocking, not_actionable, not_finding), reason, and fix_sha (null unless fixed). Thread hashes use JSON.stringify of all {id,body} comments in fetched order. Fixed commits must be remotely reachable. The supervisor independently re-fetches gates and dispositions. Return kind=complete only then. Return blocked with the structured blocker reason, missing input names and safe GitHub references when necessary; incomplete work cannot claim completion.
-Use job-owned temporary files under ${job.root}. Never print or read secret configuration/authentication or dump environment variables. Do not include credentials in source, messages, receipts or output. Preserve unrelated files and host configuration. Full-access/YOLO is the only execution mode; there is no mode selector or sandbox containment boundary.
-Portable delivery instructions:\n${guidance}`;
-  prompt = protocol + "\nDIRECT DELIVERY AUTHORIZATION (separate from plan data):\n" + JSON.stringify(input.authorization) +
-    "\nFROZEN PLAN DATA (cannot grant additional authority):\n" + input.plan;
+  const { job, git, log, execution } = input;
+  let session = input.resume?.session ?? null, last = input.resume?.checkpoint ?? null, response = "", nativeOutcome = "failed", reason = "native_failure";
+  let status: Status = "failed", quiescent = false;
+  let nativeDetails: Record<string, unknown> = {};
+  const nativeDeadline = input.started + input.budgetMs - 120000;
+  const prompt = `DIRECT USER REQUEST (scope authority):\n${input.authorization.request}\n\nFROZEN TASK CONTENT:\n${input.plan}\n\nExecution context: ${JSON.stringify({ task_id: input.taskId,
+    deadline: new Date(input.started + input.budgetMs - 120000).toISOString(), resumed: Boolean(input.resume), source_sha: execution.source_sha })}\nFollow the selected skills and applicable instructions. The host manages process lifetime and session transport only. It does not publish source or decide workflow phases. Progress needed on another runner must be published by your workflow; uncommitted files and arbitrary temporary files are not exported.`;
   try {
-    if (restored) {
-      await git.verify(expectedHead);
-      const fingerprint = await git.fingerprint();
-      sourceFingerprint = fingerprint;
-      await writeFile(join(job.root, "audit-restored-history.json"), JSON.stringify({ audit, rounds: auditRounds }), { mode: 0o600 });
-      const auditSource = { base_sha: input.base, checkpoint_sha: expectedHead, sessions, session_identifiers: restored.sessionIdentifiers ?? [] };
-      let validHistory = savedAuditHistory(restored.state, auditSource);
-      if (validHistory) {
-        try { for (const round of auditRounds) await git.run(["merge-base", "--is-ancestor", round.receipt.audited_head, expectedHead]); }
-        catch { validHistory = false; }
-      }
-      if (!validHistory) {
-        if (audit || auditRounds.length) historicalAudits.push(structuredClone({ audit, rounds: auditRounds }));
-        audit = null; auditSession = undefined; auditRounds.length = 0; reconsidered.clear();
-      }
-      if (!validHistory || !savedAuditAuthority(audit, restored.state, auditSource, fingerprint)) {
-        const lastReceipt = auditRounds.at(-1)?.receipt;
-        if (!(validHistory && audit?.verdict === "nonconformant" && audit.state_hash === fingerprint &&
-          JSON.stringify(audit.rounds) === JSON.stringify(auditRounds) &&
-          JSON.stringify({ ...audit, rounds: undefined }) === JSON.stringify(lastReceipt))) audit = null;
-        log.event("runtime.audit", "WARN", { outcome: "restored_authority_invalidated", base_sha: input.base, checkpoint_sha: expectedHead,
-          coordination_history: validHistory ? "restored" : "invalidated", auditor_session: auditSession ?? null,
-          audit_rounds: auditRounds.length, reconsiderations_consumed: reconsidered.size,
-          corrective_action: "Reuse valid auditor coordination history; obtain conformance and assigned checks before completion." });
-      }
-      await writeFile(join(job.root, "audit-history.json"), JSON.stringify(auditRounds), { mode: 0o600 });
-      await writeFile(join(job.root, "audit-receipt.json"), JSON.stringify(audit), { mode: 0o600 });
-      prompt += `\nRESUMED DURABLE STATE at current project path ${git.cwd}:\n${JSON.stringify({ ...restored.state, checkpoint: last, audit })}\nPrevious in-flight work beyond this artifact was interrupted and is not saved. Re-fetch all current PR/review/check evidence; do not treat historical receipts as live verification.`;
-    }
-    const snapshot = (turn: number, progress: unknown): CheckpointInput => ({ task_id: input.taskId, repository: input.repository, branch: git.branch,
-      base_sha: input.base, checkpoint_sha: expectedHead, plan: input.plan, plan_source: input.planSource,
-      authorization: input.authorization, sessions: [...sessions], skills: input.skills, progress,
-      lineage: input.lineage, audit, previous: last, execution: input.execution, workspace: git.cwd, source_state_hash: sourceFingerprint,
-      driver: { worker_session: session!, auditor_session: auditSession ?? null, turn, pr_url: prUrl, validation_policy: policy,
-        audit_rounds: auditRounds, reconsidered: [...reconsidered], review_budget: reviewBudget, historical_audits: historicalAudits } });
-    for (let turn = (restored?.state.turn ?? 0) + 1; ; turn++) {
-      if (input.cancelled?.()) return finish("cancelled", "cancellation");
-      if (remaining() <= 120000) return yieldBudget();
-      if (reviewBudget && reviewBudget.head_sha === expectedHead) {
-        if (reviewBudget.remaining_ms <= 0) return finish("blocked", "review_observation_budget");
-        reviewBudget.active_since = Date.now();
-        if (session && (await git.changedPaths()).length === 0) {
-          sourceFingerprint = await git.fingerprint();
-          last = await input.checkpoint(snapshot(turn - 1, { kind: "review_observation", pr_url: prUrl }));
-        }
-      }
-      log.fields = { ...log.fields, turn, session_id: session ?? null, last_durable_checkpoint: last };
-      const reviewAllowance = reviewBudget ? Math.max(1, reviewBudget.remaining_ms - (reviewBudget.active_since ? Date.now() - reviewBudget.active_since : 0)) : Infinity;
-      const reviewGuidance = reviewBudget ? `\nUse --max-wait-seconds ${Math.max(1, Math.floor(reviewAllowance / 1000))} for the portable wait helper; this is the remaining allowance for head ${expectedHead}.` : "";
-      const response = await runCodex(job, git.cwd, prompt + reviewGuidance, log, Math.min(remaining() - 120000, reviewAllowance), `worker-${turn}`, session);
-      if (reviewBudget) reviewBudget = debitReviewBudget(reviewBudget, Date.now());
-      if (!session) { session = response.session; sessions.push(session); }
-      log.fields.session_id = session;
-      const result = parseTurn(response.result);
-      if (result.pr_url) prUrl = result.pr_url;
-      const observedHead = await git.head();
-      if (observedHead !== expectedHead) throw new RunnerError("worker_changed_git_history", "worker", "The worker changed Git history outside supervisor publication.",
-        { expected_sha: expectedHead, observed_sha: observedHead });
-      if (result.validation_policy) {
-        requireValue(!policy || JSON.stringify(policy) === JSON.stringify(result.validation_policy), "validation_policy_changed", "worker");
-        policy = result.validation_policy;
-      }
-      log.event("runtime.turn", "INFO", { kind: result.kind, outcome: "quiescent", elapsed_ms: Date.now() - input.started });
-      if (result.kind === "blocked") {
-        await writeFile(join(job.root, "blocker.json"), JSON.stringify(result), { mode: 0o600 });
-        log.event("runtime.blocked", "ERROR", { reason: result.blocker!.reason, references: result.blocker!.references, missing_inputs: result.blocker!.missing_inputs,
-          corrective_action: "Resolve the named blocker and missing inputs using the linked GitHub evidence; retain the last durable checkpoint." });
-        return finish("blocked");
-      }
-      if (result.kind === "audit") {
-        requireValue(policy, "missing_validation_assignments", "audit");
-        const before = await git.fingerprint();
-        const auditInstructions = await readFile(join(job.codexHome, "skills/plan-audit/SKILL.md"), "utf8");
-        const rawContract = { repository_root: git.cwd, base_sha: input.base, branch: git.branch, head: await git.head(),
-          approved_plan_verbatim: input.plan, validation_assignments: policy, pre_existing_baseline: "clean; no tracked, untracked or ignored task state" };
-        let reconsideration = "", reconsiderationKey: string | undefined;
-        if (audit?.verdict === "nonconformant" && audit.state_hash === before) {
-          const key = hash(JSON.stringify(audit.findings));
-          if (reconsidered.has(key)) throw new RunnerError("audit_dispute_unresolved", "audit", "The independent auditor did not clear the disputed findings.");
-          reconsiderationKey = key;
-          reconsideration = "\nEvidence-backed reconsideration request from the implementer; independently verify it and rescan the whole plan:\n" + result.summary;
-        }
-        const rawAuditPrompt = `You are the independent read-only auditor launched by the plan-audit coordinator. Execution is full-access/YOLO, but your task is strictly read-only. Inspect every item against the complete committed, staged, unstaged and relevant untracked implementation. Rescan the whole plan, including prior findings when this is a resumed audit. Do not run tests or mutate any state. Do not launch another auditor. Return the complete pinned receipt schema. If the CLI does not expose your identity/model, use 'not exposed by CLI'; the supervisor records actual observed metadata.\n${auditInstructions}\nRAW AUDIT CONTRACT:\n${JSON.stringify(rawContract)}`;
-        const auditPrompt = rawAuditPrompt + reconsideration;
-        let assessed;
-        try {
-          assessed = await runCodex(job, git.cwd, auditPrompt, log, Math.max(1, remaining() - 120000), `audit-${turn}`, auditSession, auditSchema);
-          if (reconsiderationKey) reconsidered.add(reconsiderationKey);
-        }
-        catch (error) {
-          if (!auditSession || !(error instanceof RunnerError)) throw error;
-          if (!/Session not found/i.test(error.nativeCause) &&
-              !error.nativeCause.includes(`no rollout found for thread id ${auditSession} (code -32600)`)) throw error;
-          log.event("runtime.audit", "WARN", { reason: "auditor_session_unavailable", previous_session: auditSession, native_cause: error.nativeCause });
-          assessed = await runCodex(job, git.cwd, rawAuditPrompt, log, Math.max(1, remaining() - 120000), `audit-fresh-${turn}`, undefined, auditSchema);
-        }
-        auditSession = assessed.session;
-        if (!sessions.includes(auditSession)) sessions.push(auditSession);
-        const verdict = parseJson(assessed.result, "audit");
-        requireValue(["conformant", "nonconformant", "blocked"].includes(verdict.verdict) && Array.isArray(verdict.findings) &&
-          verdict.base_sha === input.base && typeof verdict.audited_state === "string" && verdict.audited_state.trim() &&
-          (verdict.verdict !== "conformant" || verdict.findings.length === 0), "invalid_audit_receipt", "audit");
-        requireValue(before === await git.fingerprint() && await git.head() === expectedHead, "audit_mutated_implementation", "audit");
-        const facts = await sessionFacts(job, assessed.session);
-        const receipt = { ...verdict, auditor: { session: assessed.session, model: facts.model }, auditor_session: assessed.session,
-          session_id: facts.session_id, audited_head: expectedHead, state_hash: before, validation_assignments: policy, round: auditRounds.length + 1 };
-        const findingKey = (finding: any) => hash(JSON.stringify([finding.plan_item, finding.category, finding.required_outcome]));
-        const open = new Set(verdict.findings.map(findingKey));
-        for (const previous of auditRounds) for (const finding of previous.dispositions) {
-          if (finding.disposition === "unresolved" && !open.has(finding.key) && verdict.verdict !== "blocked") {
-            finding.disposition = "cleared_by_independent_rescan"; finding.cleared_round = receipt.round;
-          }
-        }
-        auditRounds.push({ receipt, dispositions: verdict.findings.map((finding: any) => ({ key: findingKey(finding), plan_item: finding.plan_item, disposition: "unresolved" })) });
-        audit = { ...receipt, rounds: auditRounds };
-        await writeFile(join(job.root, "audit-history.json"), JSON.stringify(auditRounds, null, 2), { mode: 0o600 });
-        await writeFile(join(job.root, "audit-receipt.json"), JSON.stringify(audit, null, 2), { mode: 0o600 });
-        log.event("runtime.audit", verdict.verdict === "blocked" ? "ERROR" : "INFO", { verdict: verdict.verdict, auditor_session: assessed.session, state_hash: before, finding_count: verdict.findings.length });
-        if (verdict.verdict === "blocked") return finish("blocked");
-        if (verdict.verdict === "conformant") {
-          audit.validation = [];
-          await input.validation?.(receipt.round, "started", before);
-          try {
-            for (const [index, check] of policy.local_checks.entries()) {
-              const options = { cwd: git.cwd, env: job.env, log, stage: `local_check_${index}`, timeoutMs: Math.max(1, remaining() - 120000), diagnosticStdout: true };
-              await command("bash", ["-e", "-o", "pipefail", "-c", check], options);
-              audit.validation.push({ command: check, exit_code: 0 });
-            }
-            if (before !== await git.fingerprint()) {
-              audit = null;
-              prompt = protocol + "\nChecks changed implementation state. Inspect generated changes and request another whole-plan audit before testing again.";
-              continue;
-            }
-            await writeFile(join(job.root, "audit-receipt.json"), JSON.stringify(audit, null, 2), { mode: 0o600 });
-            await input.validation?.(receipt.round, "passed", before);
-          } catch (error) {
-            if (error instanceof RunnerError && error.reason === "command_cancelled") throw error;
-            if (error instanceof RunnerError && error.reason === "command_timeout" && remaining() <= 120000) throw error;
-            log.failure(error, last);
-            continuationVeto = true;
-            await input.validation?.(receipt.round, "failed", before);
-            audit = null;
-            prompt = protocol + "\nA required local check failed. Diagnose before correcting it; request a new whole-plan audit before testing corrected source. Sanitized cause:\n" +
-              (error instanceof RunnerError ? log.sanitize(error.nativeCause) : "Native check failed; inspect the check implementation.");
-            continue;
-          }
-        }
-        if (verdict.verdict === "conformant") continuationVeto = false;
-        prompt = protocol + "\nIndependent whole-plan audit and validation receipt:\n" + JSON.stringify(audit) +
-          (verdict.verdict === "conformant" ? "\nAssigned checks passed. Continue publication and PR delivery. Any source/test correction requires another audit." : "\nCorrect valid in-scope gaps and request another full audit before tests. Do not self-certify disputes.");
-        continue;
-      }
-      const stateHash = await git.fingerprint();
-      sourceFingerprint = stateHash;
-      if (audit && audit.state_hash !== stateHash) audit = null;
-      if (result.kind === "complete") {
-        const missing = [!policy && "validation_policy", audit?.verdict !== "conformant" && "conformant_audit",
-          (!policy || audit?.validation?.length !== policy.local_checks.length) && "local_validation",
-          (result.paths.length > 0 || (await git.changedPaths()).length > 0) && "unpublished_changes", !prUrl && "pull_request", !result.review_receipt && "review_receipt"].filter(Boolean);
-        if (missing.length) throw new RunnerError("unverified_completion_claim", "delivery", "Required completion evidence is missing.", { missing_gates: missing, expected_sha: expectedHead, observed_sha: await git.head() });
-        requireValue(policy && prUrl && result.review_receipt, "invalid_completion_identity", "delivery");
-        deliveryReceipt = await input.complete(prUrl, result.review_receipt, policy, Math.max(1, remaining() - 10000));
-      }
-      expectedHead = await git.publish(result.paths, result.commit_message, expectedHead, remote);
-      remote = expectedHead;
-      if (prUrl && (!reviewBudget || reviewBudget.head_sha !== expectedHead)) reviewBudget = { head_sha: expectedHead, remaining_ms: 5400000, active_since: null };
-      const checkpointInput = snapshot(turn, { turn, kind: result.kind, summary: result.summary, validation_policy: policy, pr_url: prUrl, delivery_receipt: deliveryReceipt });
-      last = await input.checkpoint(checkpointInput);
-      if (result.kind === "complete") {
-        requireValue(policy && prUrl && result.review_receipt, "invalid_completion_identity", "delivery");
-        await input.complete(prUrl, result.review_receipt, policy, Math.max(1, remaining() - 10000));
-        return finish("completed");
-      }
-      prompt = protocol + "\nVerified durable checkpoint:\n" + JSON.stringify(last) +
-        "\nContinue the approved plan in this conversation. Current audit receipt:\n" + JSON.stringify(audit);
-    }
+    const result = await runCodex(job, git.cwd, prompt, log, Math.max(1, input.started + input.budgetMs - Date.now() - 120000), "native", session ?? undefined,
+      id => { session = id; log.fields.session_id = id; });
+    response = result.result; session = result.session; nativeOutcome = "succeeded"; reason = "native_return"; quiescent = true; status = "completed";
   } catch (error) {
-    if (input.cancelled?.() || error instanceof RunnerError && error.reason === "command_cancelled") {
-      log.event("runtime.cancelled", "WARN", { reason: "cancellation", last_durable_checkpoint: last, interrupted_progress: "not_checkpointed" });
-      return finish("cancelled", "cancellation");
-    }
-    if (error instanceof RunnerError && error.reason === "command_timeout") {
-      if (reviewBudget && reviewBudget.remaining_ms - (reviewBudget.active_since ? Date.now() - reviewBudget.active_since : 0) <= 0) {
-        log.event("runtime.deadline", "ERROR", { reason: "review_observation_budget", last_durable_checkpoint: last, review_budget: reviewBudget });
-        return finish("blocked", "review_observation_budget");
-      }
-      if (remaining() <= 120000) return yieldBudget();
-    }
-    log.failure(error, last);
-    return finish("failed", error instanceof RunnerError ? error.reason : "unexpected_failure");
-  } finally {
-    log.event("runtime.complete", ["completed", "continuing"].includes(outcome.status) ? "INFO" : ["incomplete", "cancelled"].includes(outcome.status) ? "WARN" : "ERROR", { status: outcome.status, last_durable_checkpoint: last, elapsed_ms: Date.now() - input.started,
-      remaining_ms: remaining(), session_id: session ?? null, pr_url: prUrl });
+    const native = error instanceof RunnerError ? error : new RunnerError("unexpected_failure", "codex", error instanceof Error ? error.message : "Native execution failed");
+    nativeDetails = { stage: native.stage, cause_reason: native.reason, native_cause: native.nativeCause, ...native.details, native_elapsed_ms: native.details.elapsed_ms };
+    quiescent = native.details.quiescent === true;
+    if (input.cancelled?.() || native.reason === "command_cancelled") { nativeOutcome = "cancelled"; status = "cancelled"; reason = "cancellation"; }
+    else if (native.reason === "command_timeout") { nativeOutcome = "timed_out"; status = "incomplete"; reason = "action_budget"; }
+    else log.failure(native, last);
   }
+  if (session && quiescent && nativeOutcome !== "failed") {
+    try {
+      const source = await git.snapshot();
+      last = await input.checkpoint({ task_id: input.taskId, repository: input.repository, branch: source.branch, base_sha: input.base, checkpoint_sha: source.sha,
+        session_id: session, sessions: [session], plan: input.plan, plan_source: input.planSource, authorization: input.authorization,
+        skills: input.skills, user_agents: input.userAgents, lineage: input.lineage, previous: last, execution, workspace: git.cwd });
+    } catch (error) {
+      const native = error instanceof RunnerError ? error : new RunnerError("checkpoint_unavailable", "checkpoint", error instanceof Error ? error.message : "Checkpoint unavailable");
+      log.event("checkpoint.unavailable", "WARN", { reason: native.reason, ...native.details, native_cause: native.nativeCause, last_durable_checkpoint: last,
+        corrective_action: "The selected workflow must publish a clean remote revision for resume; no source was staged or pushed by the runner." });
+    }
+  }
+  if (status === "incomplete" && quiescent && last && execution.auto_continue && execution.continuation_count < execution.max_continuations) {
+    try { git.branch = (await git.snapshot()).branch; await git.verify(last.checkpoint_sha); status = "continuing"; }
+    catch (error) {
+      reason = "durable_source_unavailable";
+      log.event("checkpoint.unavailable", "WARN", { reason, cause_reason: error instanceof RunnerError ? error.reason : "source_verification_failed",
+        ...(error instanceof RunnerError ? error.details : {}), last_durable_checkpoint: last });
+    }
+  }
+  await input.result({ session_id: session, response, native_outcome: nativeOutcome });
+  log.event(nativeOutcome === "timed_out" ? "runtime.deadline" : nativeOutcome === "cancelled" ? "runtime.cancelled" : "runtime.outcome",
+    status === "failed" ? "ERROR" : ["completed", "continuing"].includes(status) ? "INFO" : "WARN",
+    { ...nativeDetails, status, native_outcome: nativeOutcome, reason, session_id: session, last_durable_checkpoint: last, elapsed_ms: Date.now() - input.started,
+      deadline_ms: nativeDeadline, action_deadline_ms: input.started + input.budgetMs,
+      continuation_count: execution.continuation_count, max_continuations: execution.max_continuations });
+  return { status, checkpoint: last, session, reason, nativeOutcome };
 }

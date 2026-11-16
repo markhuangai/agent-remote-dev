@@ -1,0 +1,26 @@
+{
+  "protocol_version": 3,
+  "files": {
+    "SKILL.md": "c0fa0ade103b3cdfb9af87dd1b5f920dd1dba5f8a4b0ced9a2cca4aff53d2868",
+    "agents/openai.yaml": "1615f33ebdaeb1eafa0d737e42187724ae60d920e0f9684970ab6bf6e412491c",
+    "assets/consumer/.github/remote-codex/archive.py": "c855a4998d375a791e24ce41ce8c6ff609eb6910b52bc8cff0dec849738d1a51",
+    "assets/consumer/.github/remote-codex/artifact-io.mjs": "be01d081f38f6cc93a48fa689a4273fe9481aee884de11649a50ac989150a680",
+    "assets/consumer/.github/remote-codex/checkpoint-policy.d.mts": "ce2ad490fc1cba284b93f29f9e875ff9bd640ef20fe82552dc5cf756e34e8461",
+    "assets/consumer/.github/remote-codex/checkpoint-policy.mjs": "8c5c9a4c30a6661c3dcae8e2629a00c156592d7a454ac7cc155182fa3d1ca91a",
+    "assets/consumer/.github/remote-codex/config.json": "b372fcc9501914a9ef987bbfcddf61c9a8f43a3746447b31027ef75dd1a646a0",
+    "assets/consumer/.github/remote-codex/continuation-policy.d.mts": "d293ddc1e8049045ac6af5346b483c5ae26637321e9398b0404d4b8fd9624709",
+    "assets/consumer/.github/remote-codex/continuation-policy.mjs": "adc1716eb82ca402d88b27745bad0d9c9e5996b510ca55425270b834db4ddc51",
+    "assets/consumer/.github/remote-codex/instructions.d.mts": "3f02c8756130957b09d3990c61c4dde7bf132c0f455d8bae13d796a82e2c72c2",
+    "assets/consumer/.github/remote-codex/instructions.mjs": "e1bfdb843c71e8ed3847ad502a45e2f9b98d8335385f90ba9a7bf05db2ec8954",
+    "assets/consumer/.github/remote-codex/protocol-policy.d.mts": "68a9ab73e545a957b74d610aead758593a9970f080171a7f8cccee087ba1af31",
+    "assets/consumer/.github/remote-codex/protocol-policy.mjs": "06567e2412f113740cbdac7b0a6d30b00986a3e892d733a42f976b88817cf290",
+    "assets/consumer/.github/remote-codex/protocol.json": "54884a0fbe2af57774007335e0560d6b03d40998ab77656db1914a2c708098d4",
+    "assets/consumer/.github/remote-codex/runtime-log.mjs": "66eda3d4e1de8b2e6f50908985fbbf923c99d8581f03839a60a8b83b4c7d8529",
+    "assets/consumer/.github/workflows/runner-continuation.yml": "01d1cf81e8616f4824e7f1559650b94d2c29547ab1e35bd0c679475da1b77f49",
+    "assets/consumer/.github/workflows/runner-task.yml": "a381453ed080658363f8f838d16430016f30a143bfdd83dbd92afb645bca1d86",
+    "references/usage.md": "8d51cd0b39063ff3dcddf4be4c239903607fe81c821953876a7e7621e4683e73",
+    "scripts/install-workflows.mjs": "329914dcc8555e7d6f071a6436506896cac5ade0b9bd3a5adb50b9db3623ba88",
+    "scripts/remote-codex.mjs": "3aa4fbc9299f83c02a3a832542f4d460cf9d8c7d3eb71f31b6c6397ec5fa7a78",
+    "scripts/submission.mjs": "b3d9724f1bea04bbb601207f4fb0da0201127226f4d6275758ab9e93844791a9"
+  }
+}

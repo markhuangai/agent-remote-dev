@@ -18,7 +18,7 @@ export async function verifyProtocol(api, repository, enabled = true) {
     }
   };
   let manifest;
-  try { manifest = JSON.parse((await content('.github/runner-protocol.json')).toString('utf8')); }
+  try { manifest = JSON.parse((await content('.github/remote-codex/protocol.json')).toString('utf8')); }
   catch (error) { invariant(false, error.reason ?? 'invalid_protocol_manifest'); }
   invariant(Object.entries(protocolContract).every(([key, expected]) => manifest[key] === expected), 'incompatible_runner_protocol', protocolContract.protocol_version, manifest.protocol_version);
   invariant(manifest.files && Object.keys(manifest.files).sort().join() === [...protocolFiles].sort().join(), 'incomplete_runner_protocol');
@@ -27,7 +27,7 @@ export async function verifyProtocol(api, repository, enabled = true) {
     const observed = digest(bytes), expected = /^[a-f0-9]{64}$/.test(manifest.files[path]) ? manifest.files[path] : null;
     if (expected !== observed) throw Object.assign(new Error('protocol_source_mismatch'), { reason: 'protocol_source_mismatch',
       details: { expected, observed, source_path: path, protocol_revision: revision } });
-    if (path.endsWith('.yml')) invariant(bytes.toString('utf8').includes("CODEX_RUNNER_PROTOCOL: '2'"), 'incompatible_workflow_protocol');
+    if (path.endsWith('.yml')) invariant(bytes.toString('utf8').includes("CODEX_RUNNER_PROTOCOL: '3'"), 'incompatible_workflow_protocol');
   }
   for (const name of [protocolContract.task_workflow, protocolContract.controller_workflow]) {
     const workflow = await api(`/repos/${repository}/actions/workflows/${name}`);

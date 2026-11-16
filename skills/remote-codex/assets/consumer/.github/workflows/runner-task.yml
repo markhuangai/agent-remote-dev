@@ -1,0 +1,165 @@
+name: Codex task runner
+run-name: ${{ fromJSON(inputs.request).operation == 'stop' && format('Codex stop {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).stop_key) || format('Codex task {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).dispatch_key || (fromJSON(inputs.request).resume_artifact_id && format('manual-resume-{0}-{1}-{2}', fromJSON(inputs.request).resume_artifact_id, fromJSON(inputs.request).source_sha, fromJSON(inputs.request).registration_key)) || format('request-{0}', fromJSON(inputs.request).registration_key)) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Authorized native task, explicit resume, or stop request as JSON
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: read
+
+env:
+  TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+  CODEX_RUNNER_PROTOCOL: '3'
+
+jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      operation: ${{ steps.request.outputs.operation }}
+      task_id: ${{ steps.request.outputs.task_id }}
+      runner: ${{ steps.request.outputs.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TASK_REQUEST: ${{ inputs.request }}
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { prepareTaskRequest } = await import(pathToFileURL(
+              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+            const request = await prepareTaskRequest({ github, context, core });
+            for (const name of ['operation', 'task_id', 'runner']) core.setOutput(name, request[name] || '');
+
+  execute:
+    needs: resolve
+    if: needs.resolve.outputs.operation == 'execute'
+    runs-on: ${{ fromJSON(needs.resolve.outputs.runner) }}
+    timeout-minutes: 360
+    concurrency:
+      group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout trusted task policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Revalidate actor, frozen request, and stop fence after acquiring the task lock
+        id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TASK_REQUEST: ${{ inputs.request }}
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { prepareTaskRequest } = await import(pathToFileURL(
+              process.env.GITHUB_WORKSPACE + '/trusted/.github/remote-codex/continuation-policy.mjs').href);
+            core.setOutput('parameters', JSON.stringify(await prepareTaskRequest({ github, context, core })));
+      - name: Checkout immutable action source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ fromJSON(steps.request.outputs.parameters).source_repository }}
+          ref: ${{ fromJSON(steps.request.outputs.parameters).source_sha }}
+          path: action-source
+          persist-credentials: false
+      - name: Checkout target repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          path: target
+          persist-credentials: false
+      - name: Verify immutable action checkout
+        env:
+          SOURCE_SHA: ${{ fromJSON(steps.request.outputs.parameters).source_sha }}
+        run: test "$(git -C action-source rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Execute native Codex with selected skills
+        id: native
+        uses: ./action-source
+        with:
+          working-directory: target
+          action-source-repository: ${{ fromJSON(steps.request.outputs.parameters).source_repository }}
+          action-source-sha: ${{ fromJSON(steps.request.outputs.parameters).source_sha }}
+          task-id: ${{ needs.resolve.outputs.task_id }}
+          task-request: ${{ inputs.request }}
+          plan: ${{ fromJSON(steps.request.outputs.parameters).plan }}
+          issue-url: ${{ fromJSON(steps.request.outputs.parameters).issue_url }}
+          resume-artifact-id: ${{ fromJSON(steps.request.outputs.parameters).resume_artifact_id }}
+          authorization: ${{ fromJSON(steps.request.outputs.parameters).authorization }}
+          skills: ${{ fromJSON(steps.request.outputs.parameters).skills }}
+          user-agents-url: ${{ fromJSON(steps.request.outputs.parameters).user_agents_url }}
+          user-agents-sha256: ${{ fromJSON(steps.request.outputs.parameters).user_agents_sha256 }}
+          git-author-name: ${{ fromJSON(steps.request.outputs.parameters).git_author_name }}
+          git-author-email: ${{ fromJSON(steps.request.outputs.parameters).git_author_email }}
+          continuation-context: ${{ fromJSON(steps.request.outputs.parameters).execution }}
+          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
+          codex-api-key: ${{ secrets.CODEX_API_KEY }}
+          github-token: ${{ secrets.REMOTE_DEV_PAT }}
+
+  stop:
+    needs: resolve
+    if: needs.resolve.outputs.operation == 'stop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - id: stop
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TASK_REQUEST: ${{ inputs.request }}
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { stopTask } = await import(pathToFileURL(
+              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+            for (const [name, value] of Object.entries(await stopTask({ github, context, core }))) core.setOutput(name, value);
+      - name: Persist the cancellation receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.stop.outputs.name }}
+          path: ${{ steps.stop.outputs.file }}
+          if-no-files-found: error
+          overwrite: false
+      - name: Cancel active and queued task runs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TASK_ID: ${{ steps.stop.outputs.task_id }}
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { cancelTaskRuns } = await import(pathToFileURL(
+              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+            await cancelTaskRuns({ github, context, core, taskId: process.env.TASK_ID });

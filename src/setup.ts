@@ -3,7 +3,8 @@ import { basename, dirname, join, sep } from "node:path";
 import { parse, stringify } from "smol-toml";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
-import { requireValue, RunnerError, SkillSource, versions } from "./contracts.js";
+import { requireValue, RunnerError, SkillSource, UserAgents, versions } from "./contracts.js";
+import { instructions } from "../.github/remote-codex/checkpoint-policy.mjs";
 
 export type Job = { root: string; home: string; codexHome: string; tools: string; staging: string; exports: string; env: NodeJS.ProcessEnv };
 export async function createJob(temp: string, apiKey: string, token: string, author: string, email: string, inherited: NodeJS.ProcessEnv = process.env): Promise<Job> {
@@ -65,6 +66,13 @@ export async function installTools(job: Job, actionRoot: string, log: Diagnostic
   const skillsPackage = JSON.parse(await readFile(join(job.tools, "node_modules/skills/package.json"), "utf8"));
   if (skillsPackage.version !== versions.skills_cli) throw new RunnerError("skills_version_mismatch", "setup", "Installed Skills CLI does not match the pinned version.",
     { dependency: "skills", expected_version: versions.skills_cli, observed_version: typeof skillsPackage.version === "string" ? skillsPackage.version : "invalid package metadata" });
+}
+export async function installUserAgents(job: Job, value: UserAgents, log: Diagnostics) {
+  try { instructions(value); }
+  catch (error: any) { throw new RunnerError(error.reason ?? "invalid_user_agents", "instructions", "Frozen user instructions were rejected.", error.details); }
+  if (value) await writeFile(join(job.codexHome, "AGENTS.md"), value.content, { mode: 0o600, flag: "wx" });
+  log.event("runtime.setup", "INFO", { stage: "user_instructions", configured: value !== null, source_url: value?.url ?? null,
+    sha256: value?.sha256 ?? null, bytes: value ? Buffer.byteLength(value.content) : 0, outcome: "success" });
 }
 export async function safeTree(root: string) {
   requireValue(!(await lstat(root)).isSymbolicLink(), "symlink_not_allowed", "filesystem");

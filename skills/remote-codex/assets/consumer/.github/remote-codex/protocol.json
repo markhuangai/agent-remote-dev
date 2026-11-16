@@ -1,0 +1,19 @@
+{
+  "protocol_version": 3,
+  "checkpoint_schema": 3,
+  "request_input": "request",
+  "task_workflow": "runner-task.yml",
+  "controller_workflow": "runner-continuation.yml",
+  "files": {
+    ".github/workflows/runner-task.yml": "a381453ed080658363f8f838d16430016f30a143bfdd83dbd92afb645bca1d86",
+    ".github/workflows/runner-continuation.yml": "01d1cf81e8616f4824e7f1559650b94d2c29547ab1e35bd0c679475da1b77f49",
+    ".github/remote-codex/checkpoint-policy.mjs": "8c5c9a4c30a6661c3dcae8e2629a00c156592d7a454ac7cc155182fa3d1ca91a",
+    ".github/remote-codex/continuation-policy.mjs": "adc1716eb82ca402d88b27745bad0d9c9e5996b510ca55425270b834db4ddc51",
+    ".github/remote-codex/artifact-io.mjs": "be01d081f38f6cc93a48fa689a4273fe9481aee884de11649a50ac989150a680",
+    ".github/remote-codex/protocol-policy.mjs": "06567e2412f113740cbdac7b0a6d30b00986a3e892d733a42f976b88817cf290",
+    ".github/remote-codex/runtime-log.mjs": "66eda3d4e1de8b2e6f50908985fbbf923c99d8581f03839a60a8b83b4c7d8529",
+    ".github/remote-codex/instructions.mjs": "e1bfdb843c71e8ed3847ad502a45e2f9b98d8335385f90ba9a7bf05db2ec8954",
+    ".github/remote-codex/archive.py": "c855a4998d375a791e24ce41ce8c6ff609eb6910b52bc8cff0dec849738d1a51",
+    ".github/remote-codex/config.json": "b372fcc9501914a9ef987bbfcddf61c9a8f43a3746447b31027ef75dd1a646a0"
+  }
+}

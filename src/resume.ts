@@ -1,17 +1,17 @@
 import { DatabaseSync } from "node:sqlite";
 import { cp, lstat, mkdir, readFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { checkpointBytes, databases, positiveId, recordName, validateFrozenRoot, validateManifest, validateProducer } from "../.github/scripts/checkpoint-policy.mjs";
-import { authorize, executionSource, parseJson, requireValue, RunnerError, skillSources, versions } from "./contracts.js";
+import { checkpointBytes, databases, positiveId, recordName, validateFrozenRoot, validateManifest, validateProducer } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { authorize, parseJson, requireValue, RunnerError, skillSources, versions } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
 import { Job, safeTree } from "./setup.js";
 import { TaskGit } from "./git.js";
 import { zstdDecompressSync } from "node:zlib";
 import { CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
-import { DriverState, Execution } from "./continuation.js";
+import { Execution } from "./continuation.js";
 
-export type Manifest = CheckpointInput & { schema_version: 2; execution: Execution; driver: DriverState; workspace: string; codex_home: string;
+export type Manifest = CheckpointInput & { schema_version: 3; execution: Execution; workspace: string; codex_home: string;
   sequence: number; files: { path: string; sha256: string; bytes: number }[]; plan_sha256: string };
 export async function unpackArchive(job: Job, archive: string, destination: string, kind: "checkpoint" | "record", log: Diagnostics) {
   try { await command("python3", [join(import.meta.dirname, "archive.py"), archive, destination, kind], { cwd: job.root, env: job.env, stage: "resume_archive", log }); }
@@ -23,15 +23,14 @@ export async function unpackArchive(job: Job, archive: string, destination: stri
       "invalid_checkpoint_file", "unexpected_checkpoint_file", "archive_inventory_mismatch", "checkpoint_file_hash_mismatch", "restore_destination_exists", "archive_read_failed"];
     const reason = allowed.includes(failure?.reason) ? failure.reason : "unsafe_checkpoint_archive";
     throw new RunnerError(reason, "resume", "Archive validation rejected the requested checkpoint.", reason === "unsupported_checkpoint_schema" ?
-      { expected: 2, observed: Number.isSafeInteger(failure.observed) ? failure.observed : null } : {});
+      { expected: 3, observed: Number.isSafeInteger(failure.observed) ? failure.observed : null } : {});
   }
 }
 export function validateCheckpoint(value: unknown, repository: string, taskId?: string): Manifest {
   try {
     const manifest = validateManifest(value, { repository, taskId, versions });
     authorize(JSON.stringify(manifest.authorization), repository, manifest.plan);
-    const sources = skillSources(JSON.stringify(manifest.skills.slice(1)));
-    requireValue(JSON.stringify(sources) === JSON.stringify(manifest.skills) && JSON.stringify(manifest.skills[0]) === JSON.stringify(executionSource), "checkpoint_skill_revision_mismatch", "resume");
+    skillSources(JSON.stringify(manifest.skills));
     return manifest as Manifest;
   } catch (error: any) {
     if (error instanceof RunnerError) throw error;
@@ -78,18 +77,18 @@ export async function loadCheckpoint(job: Job, api: (endpoint: string) => Promis
     try { validateFrozenRoot(manifest, rootRecord.value, rootRun); }
     catch (error: any) { throw new RunnerError(error.reason, "resume", "The checkpoint differs from its frozen root execution contract.", error.details); }
     log.event("resume.validate", "INFO", { artifact_id: id, producer_run_id: runId, producer_attempt: attempt, task_id: manifest.task_id,
-      checkpoint_sha: manifest.checkpoint_sha, session_id: manifest.driver.worker_session, outcome: "verified", elapsed_ms: Date.now() - started });
+      checkpoint_sha: manifest.checkpoint_sha, session_id: manifest.session_id, outcome: "verified", elapsed_ms: Date.now() - started });
     return { ...loaded, manifest, run, receipt: { artifact_id: id, checkpoint_sha: manifest.checkpoint_sha, sequence: manifest.sequence } as DurableCheckpoint };
   } catch (error: any) {
     log.event("resume.validate", "ERROR", { artifact_id: id, outcome: "rejected", reason: error.reason ?? "artifact_transport_failed", ...error.details,
-      elapsed_ms: Date.now() - started, corrective_action: "Use an unexpired schema-2 checkpoint from the trusted task workflow and resolve the rejected invariant before resuming." });
+      elapsed_ms: Date.now() - started, corrective_action: "Use an unexpired schema-3 checkpoint from the trusted task workflow and resolve the rejected invariant before resuming." });
     throw error;
   }
 }
 export async function restoreCheckpoint(job: Job, root: string, manifest: Manifest, git: TaskGit, log: Diagnostics) {
   try { await restoreVerifiedCheckpoint(job, root, manifest, git, log); }
   catch (error: any) {
-    log.event("resume.restore", "ERROR", { outcome: "rejected", task_id: manifest.task_id, session_id: manifest.driver.worker_session,
+    log.event("resume.restore", "ERROR", { outcome: "rejected", task_id: manifest.task_id, session_id: manifest.session_id,
       reason: error.reason ?? "restore_failed", ...error.details, corrective_action: "Resolve branch or state drift before restoring; the recorded checkpoint remains authoritative." });
     throw error;
   }
@@ -118,15 +117,20 @@ async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manif
     identifiers.push(meta.payload.id);
   }
   requireValue(manifest.sessions.every(id => identifiers.includes(id)), "missing_session_history", "resume");
-  const observed = await git.remoteHead();
+  git.branch = manifest.branch;
+  const observed = await git.remoteHead(manifest.checkpoint_sha);
   if (observed !== manifest.checkpoint_sha) throw new RunnerError("resume_branch_drift", "resume", "The task branch no longer matches its durable checkpoint.",
     { expected_sha: manifest.checkpoint_sha, observed_sha: observed, artifact_sequence: manifest.sequence });
   requireValue((await git.run(["status", "--porcelain", "--untracked-files=all"])).trim() === "", "unsafe_worktree", "resume");
-  await git.run(["fetch", "origin", `refs/heads/${manifest.branch}`]);
+  await git.run(["fetch", "origin", manifest.branch ? `refs/heads/${manifest.branch}` : manifest.checkpoint_sha]);
   requireValue((await git.run(["rev-parse", "FETCH_HEAD"])).trim() === manifest.checkpoint_sha, "resume_fetch_drift", "resume");
-  await git.run(["switch", "-c", manifest.branch, manifest.checkpoint_sha]);
+  if (manifest.branch === null) await git.run(["switch", "--detach", manifest.checkpoint_sha]);
+  else {
+    const local = (await git.run(["branch", "--list", "--format=%(objectname)", manifest.branch])).trim();
+    requireValue(!local || local === manifest.checkpoint_sha, "resume_local_branch_drift", "resume");
+    await git.run(local ? ["switch", manifest.branch] : ["switch", "-c", manifest.branch, manifest.checkpoint_sha]);
+  }
   await git.verify(manifest.checkpoint_sha);
-  await git.run(["merge-base", "--is-ancestor", manifest.base_sha, manifest.checkpoint_sha]);
   const source = join(root, "codex");
   for (const name of databases) {
     const database = join(source, name);
@@ -143,7 +147,8 @@ async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manif
           const relative = row.rollout_path.slice(manifest.codex_home.length + 1);
           requireValue(manifest.files.some(file => file.path === `codex/${relative}`), "missing_rollout_reference", "resume");
           requireValue(resolve(job.codexHome, relative).startsWith(job.codexHome + sep), "unsafe_rollout_reference", "resume");
-          update.run(join(job.codexHome, relative), row.cwd === manifest.workspace ? git.cwd : row.cwd, row.id);
+          const cwd = typeof row.cwd === "string" && (row.cwd === manifest.workspace || row.cwd.startsWith(manifest.workspace + sep)) ? git.cwd + row.cwd.slice(manifest.workspace.length) : row.cwd;
+          update.run(join(job.codexHome, relative), cwd, row.id);
         }
       }
     } finally { db.close(); }
@@ -155,8 +160,8 @@ async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manif
     await mkdir(join(target, ".."), { recursive: true, mode: 0o700 });
     await cp(file, target, { force: false, errorOnExist: true });
   }
-  log.event("resume.restore", "INFO", { outcome: "complete", task_id: manifest.task_id, session_id: manifest.driver.worker_session,
-    auditor_session_id: manifest.driver.auditor_session, old_workspace: manifest.workspace, workspace: git.cwd, old_codex_home: manifest.codex_home,
+  log.event("resume.restore", "INFO", { outcome: "complete", task_id: manifest.task_id, session_id: manifest.session_id,
+    old_workspace: manifest.workspace, workspace: git.cwd, old_codex_home: manifest.codex_home,
     codex_home: job.codexHome, file_count: files.length, sqlite_integrity: "verified", expected_sha: manifest.checkpoint_sha, observed_sha: await git.head(),
     credentials: "reprovisioned", elapsed_ms: Date.now() - started });
 }

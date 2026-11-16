@@ -4,111 +4,141 @@ on:
   workflow_dispatch:
     inputs:
       source-sha:
-        description: Exact authorized action implementation SHA
+        description: Exact merged source SHA explicitly authorized for live qualification
         required: true
         type: string
-      plan:
-        description: Inline approved plan, mutually exclusive with issue-url
+      action-ref:
+        description: Optional published ref to smoke, resolving to source-sha; use v1-prerelease before stable promotion
         type: string
-      issue-url:
-        description: Approved issue URL in this repository, mutually exclusive with plan
+      self-hosted-labels:
+        description: JSON labels for the provisioned self-hosted Linux runner
+        required: true
+        default: '["self-hosted","Linux"]'
         type: string
       authorization:
-        description: JSON binding the direct YOLO delivery request to repository and plan hash
+        description: Direct request authorizing smoke task branches, draft PRs, resumes, cancellation and scoped cleanup
         required: true
         type: string
       git-author-name:
-        description: Authorized job Git author and committer name
+        description: Explicit authorized job Git identity
         required: true
         type: string
       git-author-email:
-        description: Authorized job Git author and committer email
+        description: Explicit authorized job Git email
         required: true
         type: string
 
 permissions:
   contents: read
-  issues: read
   actions: read
 
+env:
+  TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+  SOURCE_SHA: ${{ inputs.source-sha }}
+  ACTION_REF: ${{ inputs.action-ref }}
+
 jobs:
-  acceptance:
-    if: github.ref == 'refs/heads/main' && github.actor == 'Z-M-Huang' && github.triggering_actor == 'Z-M-Huang'
+  authorize:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.prepare.outputs.targets }}
     steps:
-      - name: Verify authorized immutable source and plan
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          SOURCE_SHA: ${{ inputs.source-sha }}
-          INLINE_PLAN: ${{ inputs.plan }}
-          ISSUE_URL: ${{ inputs.issue-url }}
-          DELIVERY_AUTHORIZATION: ${{ inputs.authorization }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          script: |
-            const { createHash } = require('node:crypto');
-            const sha = process.env.SOURCE_SHA;
-            if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error('Exact source SHA required');
-            const { data: source } = await github.rest.repos.getCommit({ ...context.repo, ref: sha });
-            if (source.sha !== sha) throw new Error('Source identity mismatch');
-            const repository = context.repo.owner + '/' + context.repo.repo;
-            const inline = process.env.INLINE_PLAN || '';
-            const issueUrl = process.env.ISSUE_URL || '';
-            if (Boolean(inline.trim()) === Boolean(issueUrl.trim())) throw new Error('Exactly one plan source required');
-            let plan = inline;
-            if (issueUrl.trim()) {
-              const prefix = 'https://github.com/' + repository + '/issues/';
-              const number = issueUrl.slice(prefix.length);
-              if (!issueUrl.startsWith(prefix) || !/^[1-9][0-9]*$/.test(number)) throw new Error('Invalid issue URL');
-              const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: Number(number) });
-              if (issue.pull_request || issue.state !== 'open' || !issue.body) throw new Error('Issue is not an open plan');
-              plan = issue.body;
-            }
-            let authorization;
-            try { authorization = JSON.parse(process.env.DELIVERY_AUTHORIZATION); }
-            catch { throw new Error('Invalid authorization JSON'); }
-            const hash = createHash('sha256').update(plan).digest('hex');
-            if (!authorization || typeof authorization !== 'object' || Array.isArray(authorization) ||
-                Object.keys(authorization).sort().join() !== 'plan_sha256,repository,request' ||
-                authorization.repository !== repository || authorization.plan_sha256 !== hash ||
-                typeof authorization.request !== 'string' || !authorization.request.trim()) {
-              throw new Error('Authorization must bind this plan and repository without a mode selector');
-            }
-            core.info(JSON.stringify({ event: 'runtime.acceptance', source_sha: sha, plan_sha256: hash,
-              actor: context.actor, workflow_sha: process.env.GITHUB_WORKFLOW_SHA, outcome: 'authorized' }));
-      - name: Checkout verified action implementation
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ inputs.source-sha }}
-          path: action-source
-          persist-credentials: false
-      - name: Checkout target repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: main
-          path: target
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - name: Verify action checkout
+      - id: prepare
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          SOURCE_SHA: ${{ inputs.source-sha }}
-        run: |
-          set -euo pipefail
-          observed_source="$(git -C action-source rev-parse HEAD)"
-          printf 'Authorized action source: expected %s, observed %s\n' "$SOURCE_SHA" "$observed_source"
-          test "$observed_source" = "$SOURCE_SHA"
-      - name: Execute explicitly authorized acceptance task
-        uses: ./action-source
+          SELF_HOSTED_LABELS: ${{ inputs.self-hosted-labels }}
+          QUALIFICATION_AUTHORIZATION: ${{ inputs.authorization }}
+          GIT_AUTHOR_NAME: ${{ inputs.git-author-name }}
+          GIT_AUTHOR_EMAIL: ${{ inputs.git-author-email }}
         with:
-          working-directory: target
-          action-source-sha: ${{ inputs.source-sha }}
-          plan: ${{ inputs.plan }}
-          issue-url: ${{ inputs.issue-url }}
-          authorization: ${{ inputs.authorization }}
-          git-author-name: ${{ inputs.git-author-name }}
-          git-author-email: ${{ inputs.git-author-email }}
-          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
-          codex-api-key: ${{ secrets.CODEX_API_KEY }}
-          github-token: ${{ secrets.REMOTE_DEV_PAT }}
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { prepareQualification } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/qualification.mjs').href);
+            const prepared = await prepareQualification({ github, context, core });
+            core.setOutput('targets', JSON.stringify(prepared.targets));
+            core.setOutput('path', prepared.path);
+      - name: Persist task ownership before any live dispatch
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-qualification-${{ github.run_id }}-registry
+          path: ${{ steps.prepare.outputs.path }}
+          if-no-files-found: error
+          overwrite: false
+
+  qualify:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.authorize.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: linux-qualification-${{ github.run_id }}-registry
+          path: ${{ runner.temp }}/qualification-registry
+      - name: Exercise real native tasks on the selected runner family
+        env:
+          GH_TOKEN: ${{ secrets.REMOTE_DEV_PAT }}
+          QUALIFICATION_REGISTRY: ${{ runner.temp }}/qualification-registry/record.json
+          QUALIFICATION_TARGET: ${{ matrix.target.key }}
+          QUALIFICATION_OUTPUT: ${{ runner.temp }}/record.json
+        run: node .github/scripts/qualification.mjs run
+      - name: Preserve qualification evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-qualification-${{ github.run_id }}-${{ matrix.target.key }}
+          path: ${{ runner.temp }}/record.json
+          if-no-files-found: error
+          overwrite: false
+
+  cleanup:
+    needs: [authorize, qualify]
+    if: always() && needs.authorize.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: linux-qualification-${{ github.run_id }}-registry
+          path: ${{ runner.temp }}/qualification-registry
+      - name: Stop owned tasks and remove only proven smoke resources
+        env:
+          GH_TOKEN: ${{ secrets.REMOTE_DEV_PAT }}
+          QUALIFICATION_REGISTRY: ${{ runner.temp }}/qualification-registry/record.json
+          QUALIFICATION_OUTPUT: ${{ runner.temp }}/record.json
+        run: node .github/scripts/qualification.mjs cleanup
+      - name: Preserve cleanup proof
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-qualification-${{ github.run_id }}-cleanup
+          path: ${{ runner.temp }}/record.json
+          if-no-files-found: error
+          overwrite: false

@@ -1,81 +1,80 @@
-name: Codex plan runner
-description: Execute an authorized plan in full-access/YOLO mode on Linux and export verified checkpoints
+name: Codex skill runner
+description: Run native Codex with selected skills on Linux and transport verified session checkpoints
 inputs:
+  action-source-repository:
+    description: Repository containing the immutable action implementation
+    default: markhuangai/agent-remote-dev-codex
   action-source-sha:
-    description: Exact approved action implementation commit, verified by the trusted caller
+    description: Exact approved action implementation commit verified by the trusted caller
     required: true
   task-id:
-    description: Stable task ID; generated when omitted for a new task
-  resume-artifact-id:
-    description: Explicit schema-2 checkpoint artifact; mutually exclusive with plan and issue-url
-  auto-continue:
-    description: Enable trusted-controller continuation after budget stops
-    default: 'true'
-  max-continuations:
-    description: Maximum additional runs, frozen across the task chain
-    default: '3'
+    description: Stable task identity from the trusted dispatch request
+    required: true
+  task-request:
+    description: Original JSON request independently revalidated before native execution
+    required: true
   continuation-context:
-    description: Verified execution settings passed by the trusted task workflow
-  parent-job-ended-at:
-    description: Native completed_at of the parent execution job, verified before resume
-  parent-job-name:
-    description: Verified parent job name when timeout precedes execution
-  review-budget:
-    description: Verified remaining per-head review allowance passed by the trusted workflow
+    description: Frozen execution settings supplied by the trusted task workflow
+    required: true
+  resume-artifact-id:
+    description: Explicit schema-3 checkpoint; mutually exclusive with plan and issue-url
   working-directory:
-    description: Checked-out target directory relative to GITHUB_WORKSPACE
+    description: Target checkout relative to GITHUB_WORKSPACE
     default: .
   plan:
-    description: Inline approved plan; mutually exclusive with issue-url
+    description: Exact approved prompt; mutually exclusive with issue-url
   issue-url:
-    description: GitHub issue URL in the checked-out repository; mutually exclusive with plan
+    description: Open issue containing the approved prompt in the target repository
   authorization:
-    description: JSON with repository, plan_sha256, and the direct delivery request
-    required: true
-  codex-config:
-    description: Secret-backed Codex config.toml contents
-    required: true
-  codex-api-key:
-    description: Secret API credential for Codex
-    required: true
-  github-token:
-    description: Secret publication credential; never persisted in Git configuration
-    required: true
-  git-author-name:
-    description: Explicit author and committer name for this job
-    required: true
-  git-author-email:
-    description: Explicit author and committer email for this job
+    description: JSON binding the direct user request, repository, and prompt hash
     required: true
   skills:
-    description: JSON array of additional repository, revision (full SHA), and names skill sources
+    description: Complete selection of immutable repository/revision/names skill sources
     default: '[]'
-  budget-minutes:
-    description: Total runtime budget, including a 120-second shutdown and export reserve
-    default: '300'
+  user-agents-url:
+    description: Optional public HTTPS URL for isolated user-level AGENTS.md
+  user-agents-sha256:
+    description: Expected SHA-256 of the exact approved user instructions
+  codex-config:
+    description: Secret-backed Codex TOML configuration
+    required: true
+  codex-api-key:
+    description: Secret model credential
+    required: true
+  github-token:
+    description: Secret task credential; never persisted in Git configuration
+    required: true
+  git-author-name:
+    description: Explicit job Git author and committer name
+    required: true
+  git-author-email:
+    description: Explicit job Git author and committer email
+    required: true
 outputs:
   task-id:
-    description: Unique task identifier
+    description: Task identity
   branch:
-    description: Published task branch
+    description: Skill-chosen branch observed at the last durable checkpoint, empty for detached HEAD
   base-sha:
-    description: Verified task base
+    description: Initial source revision
   checkpoint-sha:
-    description: Last successfully uploaded checkpoint's pushed commit
+    description: Last verified remote source revision
   session-id:
-    description: Explicit worker conversation identifier
+    description: Native Codex conversation identity
   artifact-id:
-    description: Last durable checkpoint artifact ID
-  pull-request-url:
-    description: Delivered or in-progress pull request
+    description: Last durable checkpoint artifact
+  result-artifact-id:
+    description: Protected opaque native response artifact
+  native-outcome:
+    description: Native invocation outcome; no interpretation of skill success
   status:
-    description: completed, continuing, cancelled, incomplete, blocked, or failed
+    description: completed, continuing, cancelled, incomplete, or failed infrastructure outcome
   root-run-id:
-    description: Original task workflow run
+    description: Initial task workflow run
   parent-run-id:
-    description: Previous run in the continuation chain
+    description: Prior run in the continuation chain
   continuation-count:
-    description: Number of additional runs consumed
+    description: Additional runs consumed
 runs:
   using: node24
   main: dist/index.js

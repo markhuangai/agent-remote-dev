@@ -66,7 +66,8 @@ export async function command(executable: string, args: string[], options: Comma
         if (cause.length > 8192) cause = cause.slice(0, 8192) + `...[truncated ${cause.length - 8192} characters]`;
       }
       throw new RunnerError(cancelled ? "command_cancelled" : timeout ? "command_timeout" : overflow ? "command_output_limit" : !drained ? "command_output_not_closed" : "command_failed",
-        options.stage, cause, { exit_code: code, executable: executable.split("/").pop(), elapsed_ms: Date.now() - started, quiescent: receipt?.quiescent === true });
+        options.stage, cause, { exit_code: code, signal: child.signalCode, executable: executable.split("/").pop(), elapsed_ms: Date.now() - started,
+          timeout_ms: timeoutMs, deadline_ms: started + timeoutMs, quiescent: receipt?.quiescent === true });
     }
     options.log?.event("runtime.operation", "INFO", { stage: options.stage, outcome: "success", quiescent: true, elapsed_ms: Date.now() - started });
     return stdout;

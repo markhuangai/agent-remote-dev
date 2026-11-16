@@ -7,7 +7,7 @@ import { RunnerError, requireValue, versions } from "./contracts.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
-import { recordName } from "../.github/scripts/checkpoint-policy.mjs";
+import { recordName } from "../.github/remote-codex/checkpoint-policy.mjs";
 
 export async function checkpointWorker(requestPath: string) {
   const request = JSON.parse(await readFile(requestPath, "utf8"));
@@ -32,13 +32,19 @@ export async function checkpointWorker(requestPath: string) {
     await writeFile(request.resultPath, JSON.stringify(receipt), { mode: 0o600 });
   } catch (error) { log.failure(error, request.input?.previous ?? null); process.exitCode = 1; }
 }
-export async function isolatedRecord(job: Job, kind: "run" | "outcome" | `validation-${number}-${"started" | "passed" | "failed"}`, value: any, log: Diagnostics,
+export async function isolatedRecord(job: Job, kind: "run" | "outcome" | "result", value: any, log: Diagnostics,
   environment: NodeJS.ProcessEnv = process.env, entry = process.argv[1]) {
   const name = recordName(kind, value.task_id, String(value.lineage.run_id), String(value.lineage.run_attempt));
   const root = join(job.exports, name), file = join(root, "record.json"), resultPath = join(job.root, `${kind}-receipt.json`);
   const inspect = (data: unknown): void => {
-    if (typeof data === "string") for (const secret of log.protectedValues) requireValue(!data.includes(secret), "credential_in_manifest", "continuation");
-    else if (data && typeof data === "object") for (const [key, child] of Object.entries(data)) { inspect(key); inspect(child); }
+    if (typeof data === "string") {
+      for (const secret of log.protectedValues) requireValue(!data.includes(secret), "credential_in_manifest", "continuation");
+      if (/^[\s]*[\[{"]/.test(data)) {
+        let decoded: unknown;
+        try { decoded = JSON.parse(data); } catch { return; }
+        inspect(decoded);
+      }
+    } else if (data && typeof data === "object") for (const [key, child] of Object.entries(data)) { inspect(key); inspect(child); }
   };
   inspect(value);
   const encoded = JSON.stringify(value);
