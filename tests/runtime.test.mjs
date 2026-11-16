@@ -9,7 +9,7 @@ import { authorize, hash, skillSources } from "../.build/contracts.js";
 import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
 import { exportCheckpoint, durableCheckpoint } from "../.build/checkpoint.js";
 import { isolatedCheckpoint, isolatedRecord } from "../.build/checkpoint-worker.js";
-import { recordName } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { recordName } from "../src/platform/checkpoint-policy.mjs";
 import { TaskGit } from "../.build/git.js";
 import { selectPlanSource } from "../.build/main.js";
 import { command } from "../.build/process.js";
@@ -30,9 +30,9 @@ test("prompt selection preserves exact bytes and issue references without a mode
   assert.equal(selectPlanSource(issuePrompt).plan, issuePrompt);
   assert.equal(selectPlanSource("", "41").resumeArtifactId, 41);
   for (const args of [[plan, "41"], ["", ""], ["", "invalid"]]) assert.throws(() => selectPlanSource(...args));
-  assert.deepEqual(authorize(JSON.stringify(auth), "fixture/repo", plan), auth);
+  assert.deepEqual(authorize(auth, "fixture/repo", plan), auth);
   for (const changed of [{ ...auth, permission_mode: "sandboxed" }, { ...auth, permission_mode: "full-access" }, { ...auth, plan_sha256: hash(plan.trim()) }, { ...auth, request: "" }, { ...auth, repository: "other/repo" }]) {
-    assert.throws(() => authorize(JSON.stringify(changed), "fixture/repo", plan));
+    assert.throws(() => authorize(changed, "fixture/repo", plan));
   }
 });
 test("the actual bundled entry rejects retired mode inputs before configuration or execution",async()=>{

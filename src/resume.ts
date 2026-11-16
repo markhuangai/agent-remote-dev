@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { cp, lstat, mkdir, readFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { checkpointBytes, databases, positiveId, recordName, validateFrozenRoot, validateManifest, validateProducer } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { checkpointBytes, databases, positiveId, recordName, validateFrozenRoot, validateManifest, validateProducer } from "./platform/checkpoint-policy.mjs";
 import { authorize, parseJson, requireValue, RunnerError, skillSources, versions } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
@@ -29,8 +29,8 @@ export async function unpackArchive(job: Job, archive: string, destination: stri
 export function validateCheckpoint(value: unknown, repository: string, taskId?: string): Manifest {
   try {
     const manifest = validateManifest(value, { repository, taskId, versions });
-    authorize(JSON.stringify(manifest.authorization), repository, manifest.plan);
-    skillSources(JSON.stringify(manifest.skills));
+    authorize(manifest.authorization, repository, manifest.plan);
+    skillSources(manifest.skills);
     return manifest as Manifest;
   } catch (error: any) {
     if (error instanceof RunnerError) throw error;

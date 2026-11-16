@@ -1,8 +1,9 @@
 # Repository development
 
-This repository implements a Linux Codex plan runner. Work only on the linked
-issue; cross-run resume, continuation, release qualification and other platform
-support belong to their separate tickets. Use Node.js 24 for runtime, policy helpers and tests.
+This repository implements a remote Codex execution platform for Linux. Skills
+control task workflows and completion; the platform provides isolated setup,
+native execution, conversation persistence, cross-run resume, continuation and
+cancellation. Work only within the linked issue and approved scope. Use Node.js 24 for runtime, policy helpers and tests.
 Keep helpers dependency-free and test their actual decisions. API fixtures may
 isolate GitHub transport; do not replace the policy under test.
 

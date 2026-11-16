@@ -37,7 +37,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { runController } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/src/platform/continuation-policy.mjs').href);
             const result = await runController({ github, context, core });
             for (const [name, value] of Object.entries(result)) core.setOutput(name, value);
 
@@ -70,7 +70,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { runController } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/src/platform/continuation-policy.mjs').href);
             const result = await runController({ github, context, core });
             for (const [name, value] of Object.entries(result)) core.setOutput(name, value);
       - name: Persist dispatch claim before requesting a child
@@ -94,5 +94,5 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { runController } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/src/platform/continuation-policy.mjs').href);
             await runController({ github, context, core });

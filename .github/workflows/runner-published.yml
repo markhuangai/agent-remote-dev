@@ -45,7 +45,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { prepareTaskRequest } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/.github/remote-codex/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/src/platform/continuation-policy.mjs').href);
             const request = await prepareTaskRequest({ github, context, core });
             for (const name of ['operation', 'task_id', 'runner', 'published_ref']) core.setOutput(name, request[name] || '');
 
@@ -77,7 +77,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { prepareTaskRequest } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/trusted/.github/remote-codex/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/trusted/src/platform/continuation-policy.mjs').href);
             core.setOutput('parameters', JSON.stringify(await prepareTaskRequest({ github, context, core })));
       - name: Checkout target repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -123,7 +123,7 @@ jobs:
           script: |
             const { pathToFileURL } = require('node:url');
             const { prepareTaskRequest } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/trusted/.github/remote-codex/continuation-policy.mjs').href);
+              process.env.GITHUB_WORKSPACE + '/trusted/src/platform/continuation-policy.mjs').href);
             core.setOutput('parameters', JSON.stringify(await prepareTaskRequest({ github, context, core })));
       - name: Checkout target repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

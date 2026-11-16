@@ -1,15 +1,15 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { digest, registrationKey } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { authorizeActors, prepareTaskRequest } from '../.github/remote-codex/continuation-policy.mjs';
-import { freezeProjectConfig } from '../.github/remote-codex/project-config.mjs';
-import { resolveSource } from '../.github/remote-codex/sources.mjs';
-import { safeError } from '../.github/remote-codex/runtime-log.mjs';
+import { digest, registrationKey } from './platform/checkpoint-policy.mjs';
+import { authorizeActors, resolveTaskRequest } from './platform/continuation-policy.mjs';
+import { freezeProjectConfig } from './platform/project-config.mjs';
+import { resolveSource } from './platform/sources.mjs';
+import { safeError } from './platform/runtime-log.mjs';
 import { requireValue, RunnerError } from './contracts.js';
 
 export const actionResources = ['action.yml', 'package.json', 'package-lock.json', 'dist/index.js', 'dist/package.json', 'dist/supervise.py', 'dist/archive.py', 'dist/yaml.cjs', 'dist/yaml-licenses.txt',
-  'dist/control.mjs', 'dist/control-licenses.txt', 'dist/client.mjs'];
+  'dist/control.mjs', 'dist/control-licenses.txt', 'dist/client.mjs', 'dist/protocol.json'];
 export async function invocationSource(api: (path: string, options?: any) => Promise<any>, root: string, env: NodeJS.ProcessEnv,
   git: (args: string[]) => Promise<string>) {
   let repository = env.GITHUB_ACTION_REPOSITORY, ref = env.GITHUB_ACTION_REF;
@@ -67,9 +67,10 @@ export async function prepareInvocation({ api, plan, source, core, env = process
   }
   requireValue(request.source_repository === source.repository && request.source_sha === source.sha, 'action_source_mismatch');
   if (request.published_ref) requireValue(source.kind === 'published' && source.requested_ref === request.published_ref && source.release_tag && source.release_id, 'published_invocation_required');
-  const verified = await prepareTaskRequest({ github: { request: async (route: string, options?: any) => ({ data: await api(route.replace(/^[A-Z]+ /, ''), options) }) },
+  const verified = await resolveTaskRequest({ github: { request: async (route: string, options?: any) => ({ data: await api(route.replace(/^[A-Z]+ /, ''), options) }) },
     context: { repo: { owner, repo }, actor, eventName: env.GITHUB_EVENT_NAME }, core,
     env: { ...env, CODEX_RUNNER_PROTOCOL: '3', TRIGGERING_ACTOR: triggering, TASK_REQUEST: JSON.stringify(request) } });
   requireValue(verified.operation === 'execute', 'invalid_execution_request');
-  return verified;
+  return { taskId: verified.task_id, plan: verified.plan, resumeArtifactId: verified.resume_artifact_id,
+    authorization: verified.authorization, skills: verified.skills, execution: verified.execution };
 }

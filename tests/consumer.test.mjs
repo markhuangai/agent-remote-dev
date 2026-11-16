@@ -3,10 +3,10 @@ import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
-import { workflowCommand } from '../.github/remote-codex/control.mjs';
-import { registrationKey } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { prepareQueue, queuePrepared } from '../.github/remote-codex/submission.mjs';
-import { verifyProtocol } from '../.github/remote-codex/protocol-policy.mjs';
+import { workflowCommand } from '../src/platform/control.mjs';
+import { registrationKey } from '../src/platform/checkpoint-policy.mjs';
+import { prepareQueue, queuePrepared } from '../src/platform/submission.mjs';
+import { verifyProtocol } from '../src/platform/protocol-policy.mjs';
 import { prepareInvocation } from '../.build/invocation.js';
 import { exec, fixture, root } from './helpers.mjs';
 
@@ -36,7 +36,7 @@ function transport() {
 test('consumer workflow verification needs only the caller file and the provider template', async () => {
   const { state, api } = transport(), verified = await verifyProtocol(api, 'fixture/repo');
   assert.equal(verified.protocol_version, 3); assert.equal(verified.provider.sha, sourceSha);
-  assert.ok(!state.calls.some(path => /contents\/\.github\/remote-codex/.test(path)));
+  assert.ok(!state.calls.some(path => /contents\/(?:src\/platform|dist\/protocol.json)/.test(path)));
   const reordered = parse(caller); reordered.name = 'Project Codex'; reordered.on.workflow_run.workflows = [reordered.name];
   reordered.on = Object.fromEntries(Object.entries(reordered.on).reverse());
   reordered.jobs.remote.with = Object.fromEntries(Object.entries(reordered.jobs.remote.with).reverse());

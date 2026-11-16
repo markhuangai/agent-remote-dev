@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
-import { parseProjectConfig } from '../.github/remote-codex/project-config.mjs';
+import { parseProjectConfig } from '../src/platform/project-config.mjs';
 import { actionResources, invocationSource, prepareInvocation } from '../.build/invocation.js';
 import { hash } from '../.build/contracts.js';
 import { exec, fixture } from './helpers.mjs';
@@ -46,10 +46,12 @@ test('a standalone action prepares native execution with only a plan and reposit
     GITHUB_RUN_ID: '200', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'execute', GITHUB_WORKFLOW_SHA: 'a'.repeat(40),
     GITHUB_WORKFLOW_REF: 'fixture/repo/.github/workflows/custom.yml@refs/heads/main', RUNNER_TEMP: f.temporary };
   const call = () => prepareInvocation({ api, plan, source: { repository: 'fixture/action', sha: 'b'.repeat(40) }, core, env });
-  const verified = await call(), execution = JSON.parse(verified.execution);
-  assert.equal(verified.plan, plan); assert.equal(verified.task_id, '200'); assert.equal(execution.root_run_id, '200');
+  const verified = await call(), execution = verified.execution;
+  assert.equal(verified.plan, plan); assert.equal(verified.taskId, '200'); assert.equal(execution.root_run_id, '200');
   assert.equal(execution.project_config.content, content); assert.equal(execution.project_config.sha256, hash(content));
-  assert.equal(execution.auto_continue, false); assert.equal(verified.skills, '[]');
+  assert.equal(execution.auto_continue, false); assert.deepEqual(verified.skills, []);
+  assert.deepEqual(verified.authorization, { repository: 'fixture/repo', plan_sha256: hash(plan), request: plan });
+  assert.equal(verified.resumeArtifactId, '');
   assert.ok(!state.calls.some(path => /issues|graphql|protocol.json|actions\/workflows/.test(path)));
   assert.ok(records.some(record => record.event === 'submission.resolve' && record.outcome === 'verified'));
   assert.ok(!JSON.stringify(records).includes(plan.trim()));

@@ -3,17 +3,17 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { skillSources, hash } from '../.build/contracts.js';
-import { fetchInstructions } from '../.github/remote-codex/instructions.mjs';
-import { digest, registrationKey, runnerLabels } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { dispatchOnce, prepareQueue, queuePrepared, resolveSkills, resolveSource, waitForStop } from '../.github/remote-codex/submission.mjs';
+import { fetchInstructions } from '../src/platform/instructions.mjs';
+import { digest, registrationKey, runnerLabels } from '../src/platform/checkpoint-policy.mjs';
+import { dispatchOnce, prepareQueue, queuePrepared, resolveSkills, resolveSource, waitForStop } from '../src/platform/submission.mjs';
 import { exec, root } from './helpers.mjs';
 
 test('the complete selected skill list defaults empty and permits SDLC names without reserved defaults', () => {
-  assert.deepEqual(skillSources('[]'), []);
+  assert.deepEqual(skillSources([]), []);
   const chosen = [{ repository: 'fixture/skills', revision: 'a'.repeat(40), names: ['plan-audit', 'sdlc-plan-implementation'] }];
-  assert.deepEqual(skillSources(JSON.stringify(chosen)), chosen);
-  assert.throws(() => skillSources(JSON.stringify([{ ...chosen[0], revision: 'main' }])));
-  assert.throws(() => skillSources(JSON.stringify([...chosen, ...chosen])));
+  assert.deepEqual(skillSources(chosen), chosen);
+  assert.throws(() => skillSources([{ ...chosen[0], revision: 'main' }]));
+  assert.throws(() => skillSources([...chosen, ...chosen]));
   assert.deepEqual(runnerLabels(['self-hosted', 'Linux', 'ARM64']), ['self-hosted', 'Linux', 'ARM64']);
   for (const labels of [['windows-latest'], ['self-hosted'], ['self-hosted', 'Linux', 'Windows'], []]) assert.throws(() => runnerLabels(labels));
 });
@@ -110,7 +110,7 @@ test('a retained checkpoint can start a new explicit resume activation while ret
 test('queue freezes repository configuration and passes issue references verbatim without issue interpretation', async () => {
   const repository = 'fixture/repo', plan = 'Implement https://github.com/fixture/repo/issues/4 using $chosen-skill.\n';
   let content = 'allowed-actors: [Z-M-Huang]\nskills: []\n';
-  const files = new Map(), manifest = JSON.parse(await readFile(join(root, '.github/remote-codex/protocol.json'), 'utf8'));
+  const files = new Map(), manifest = JSON.parse(await readFile(join(root, 'dist/protocol.json'), 'utf8'));
   for (const path of Object.keys(manifest.files)) files.set(path, await readFile(join(root, path)));
   let dispatches = 0;
   const api = async (path, options) => {
@@ -150,8 +150,8 @@ test('stop waits for native workers and continuation controllers and fails withi
   assert.equal(now, 900000);
 });
 test('real Actions logging retains safe dispatch failure evidence without API bodies at normal verbosity', async () => {
-  const policy = new URL('../.github/remote-codex/continuation-policy.mjs', import.meta.url).href;
-  const registration = new URL('../.github/remote-codex/checkpoint-policy.mjs', import.meta.url).href;
+  const policy = new URL('../src/platform/continuation-policy.mjs', import.meta.url).href;
+  const registration = new URL('../src/platform/checkpoint-policy.mjs', import.meta.url).href;
   const script = `import * as core from '@actions/core';import {prepareTaskRequest} from ${JSON.stringify(policy)};import {registrationKey} from ${JSON.stringify(registration)};const request={request_id:'log-fixture'};const github={request:async()=>{throw Object.assign(new Error('private-api-body-8821'),{status:403})}};try{await prepareTaskRequest({github,context:{repo:{owner:'fixture',repo:'repo'},actor:'Z-M-Huang',eventName:'workflow_dispatch'},core,env:{GITHUB_REF:'refs/heads/main',CODEX_RUNNER_PROTOCOL:'3',TASK_REQUEST:JSON.stringify({...request,registration_key:registrationKey(request)}),TRIGGERING_ACTOR:'Z-M-Huang',RUNNER_TEMP:'/tmp',GITHUB_RUN_ID:'13',GITHUB_JOB:'fixture'}})}catch{}`;
   const output = (await exec(process.execPath, ['--input-type=module', '-e', script], { cwd: root })).stdout;
   assert.match(output, /::error::/); assert.doesNotMatch(output, /private-api-body-8821/);

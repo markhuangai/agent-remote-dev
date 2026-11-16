@@ -1,7 +1,7 @@
-import { digest, frozenExecution, invariant, positiveId, recordName, same, shaPattern } from '../remote-codex/checkpoint-policy.mjs';
-import { authorizeActors, loadVerifiedCheckpoint, pages } from '../remote-codex/continuation-policy.mjs';
-import { readArtifact } from '../remote-codex/artifact-io.mjs';
-import { logEvent, safeError } from '../remote-codex/runtime-log.mjs';
+import { digest, frozenExecution, invariant, positiveId, recordName, same, shaPattern } from '../../src/platform/checkpoint-policy.mjs';
+import { authorizeActors, loadVerifiedCheckpoint, pages } from '../../src/platform/continuation-policy.mjs';
+import { readArtifact } from '../../src/platform/artifact-io.mjs';
+import { logEvent, safeError } from '../../src/platform/runtime-log.mjs';
 
 export const qualificationCases = ['fresh', 'cold-resume', 'deadline', 'cancellation', 'failed-push'];
 export function releaseVersion(version) {

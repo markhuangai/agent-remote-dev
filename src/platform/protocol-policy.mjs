@@ -42,7 +42,7 @@ export async function verifyProtocol(api, repository, enabled = true) {
     return { revision, protocol_version: 3, provider };
   }
   let manifest;
-  try { manifest = JSON.parse((await content('.github/remote-codex/protocol.json')).toString('utf8')); }
+  try { manifest = JSON.parse((await content('dist/protocol.json')).toString('utf8')); }
   catch (error) { invariant(false, error.reason ?? 'invalid_protocol_manifest'); }
   invariant(Object.entries(protocolContract).every(([key, expected]) => manifest[key] === expected), 'incompatible_runner_protocol', protocolContract.protocol_version, manifest.protocol_version);
   invariant(manifest.files && Object.keys(manifest.files).sort().join() === [...protocolFiles].sort().join(), 'incomplete_runner_protocol');

@@ -7,7 +7,7 @@ import { RunnerError, requireValue, versions } from "./contracts.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
-import { recordName } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { recordName } from "./platform/checkpoint-policy.mjs";
 
 export async function checkpointWorker(requestPath: string) {
   const request = JSON.parse(await readFile(requestPath, "utf8"));

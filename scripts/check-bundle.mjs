@@ -5,13 +5,13 @@ import { join, relative, resolve } from "node:path";
 import { build, buildSkill, buildYaml, clean, files, protocolManifest } from "./build.mjs";
 
 const root = resolve(import.meta.dirname, "..");
-assert.deepEqual(JSON.parse(await readFile(join(root, ".github/remote-codex/protocol.json"), "utf8")), await protocolManifest(), "Stale trusted runner protocol manifest");
+assert.deepEqual(JSON.parse(await readFile(join(root, "dist/protocol.json"), "utf8")), await protocolManifest(), "Stale trusted runner protocol manifest");
 const temporary = await mkdtemp(join(tmpdir(), "codex-bundle-"));
 try {
   const yaml = join(temporary, 'yaml');
   await buildYaml(yaml);
   for (const [generated, shipped] of [['index.cjs', 'yaml.cjs'], ['yaml-licenses.txt', 'yaml-licenses.txt']])
-    assert.deepEqual(await readFile(join(yaml, generated)), await readFile(join(root, '.github/remote-codex', shipped)), `Stale YAML resource: ${shipped}`);
+    assert.deepEqual(await readFile(join(yaml, generated)), await readFile(join(root, 'src/platform', shipped)), `Stale YAML resource: ${shipped}`);
   await clean(yaml);
   await build(temporary);
   const generated = (await files(temporary)).map((file) => relative(temporary, file)).sort();

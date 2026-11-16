@@ -285,7 +285,7 @@ export async function runController({ github, context, core, env = process.env, 
     throw new Error(safeError(error).reason);
   }
 }
-export async function prepareTaskRequest({ github, context, core, env = process.env }) {
+export async function resolveTaskRequest({ github, context, core, env = process.env }) {
   const started = Date.now(), repository = repositoryName(context), api = async (path, options) => (await github.request(`${options?.method ?? 'GET'} ${path}`, options)).data;
   let request;
   try {
@@ -334,7 +334,7 @@ export async function prepareTaskRequest({ github, context, core, env = process.
       await requireActive(api, repository, manifest.task_id, execution.activation_run_id, execution.request_id);
       parameters = { operation: 'execute', task_id: manifest.task_id, source_repository: execution.source_repository, source_sha: execution.source_sha, resume_artifact_id: request.resume_artifact_id,
         published_ref: execution.published_ref ?? '',
-        authorization: JSON.stringify(manifest.authorization), plan: '', skills: JSON.stringify(manifest.skills), execution: JSON.stringify(execution), runner: JSON.stringify(execution.runner),
+        authorization: manifest.authorization, plan: '', skills: manifest.skills, execution, runner: execution.runner,
         git_author_name: execution.git_author_name, git_author_email: execution.git_author_email, user_agents_url: execution.user_agents_url ?? '', user_agents_sha256: execution.user_agents_sha256 ?? '' };
     } else {
       await authorizeActors(api, repository, context.actor, env.TRIGGERING_ACTOR);
@@ -388,14 +388,14 @@ export async function prepareTaskRequest({ github, context, core, env = process.
         activation_run_id: taskId, activation_run_attempt: env.GITHUB_RUN_ATTEMPT, parent_run_id: null, parent_run_attempt: null, git_author_name: request.git_author_name, git_author_email: request.git_author_email,
         user_agents_url: request.user_agents_url, user_agents_sha256: request.user_agents_sha256, project_config: request.project_config, request_id: request.request_id, published_ref: request.published_ref ?? null });
       await requireActive(api, repository, taskId, execution.activation_run_id, execution.request_id);
-      parameters = { operation: 'execute', task_id: taskId, source_repository: request.source_repository, source_sha: request.source_sha, resume_artifact_id: '', authorization: JSON.stringify(auth),
+      parameters = { operation: 'execute', task_id: taskId, source_repository: request.source_repository, source_sha: request.source_sha, resume_artifact_id: '', authorization: auth,
         published_ref: execution.published_ref ?? '',
-        plan: request.plan, skills: JSON.stringify(selected), execution: JSON.stringify(execution), runner: JSON.stringify(execution.runner),
+        plan: request.plan, skills: selected, execution, runner: execution.runner,
         git_author_name: execution.git_author_name, git_author_email: execution.git_author_email, user_agents_url: execution.user_agents_url ?? '', user_agents_sha256: execution.user_agents_sha256 ?? '' };
     }
     invariant(env.GITHUB_WORKFLOW_REF !== `${repository}/${publishedPath}@refs/heads/main` || parameters.published_ref, 'published_qualification_required');
     logEvent(core, 'submission.resolve', 'INFO', { outcome: 'verified', operation: parameters.operation, task_id: parameters.task_id, source_sha: parameters.source_sha,
-      source_repository: parameters.source_repository, artifact_id: parameters.resume_artifact_id || null, actor: context.actor, runner: parameters.runner ? JSON.parse(parameters.runner) : null, elapsed_ms: Date.now() - started }, env);
+      source_repository: parameters.source_repository, artifact_id: parameters.resume_artifact_id || null, actor: context.actor, runner: parameters.runner ?? null, elapsed_ms: Date.now() - started }, env);
     return parameters;
   } catch (error) {
     logEvent(core, 'submission.resolve', 'ERROR', { outcome: 'rejected',
@@ -406,9 +406,15 @@ export async function prepareTaskRequest({ github, context, core, env = process.
     throw new Error(safeError(error).reason);
   }
 }
+export async function prepareTaskRequest(args) {
+  const resolved = await resolveTaskRequest(args);
+  if (resolved.operation === 'stop') return resolved;
+  return { ...resolved, authorization: JSON.stringify(resolved.authorization), skills: JSON.stringify(resolved.skills),
+    execution: JSON.stringify(resolved.execution), runner: JSON.stringify(resolved.runner) };
+}
 export async function stopTask({ github, context, core, env = process.env }) {
   const repository = repositoryName(context), api = async (path, options) => (await github.request(`${options?.method ?? 'GET'} ${path}`, options)).data;
-  const request = await prepareTaskRequest({ github, context, core, env });
+  const request = await resolveTaskRequest({ github, context, core, env });
   invariant(request.operation === 'stop', 'invalid_stop_request');
   const root = join(env.RUNNER_TEMP, `stop-${env.GITHUB_RUN_ID}-${env.GITHUB_RUN_ATTEMPT}`), file = join(root, 'record.json');
   await mkdir(root, { mode: 0o700 });

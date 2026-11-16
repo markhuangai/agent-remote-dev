@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { parse } from 'yaml';
 import { exportCheckpoint } from '../.build/checkpoint.js';
-import { checkpointName, digest, recordName } from '../.github/remote-codex/checkpoint-policy.mjs';
+import { checkpointName, digest, recordName } from '../src/platform/checkpoint-policy.mjs';
 import { registryFor, taskRequest } from '../.github/scripts/qualification.mjs';
 import { qualificationCases, qualificationReceipt } from '../.github/scripts/release-policy.mjs';
 import { exec, execution, fixture, projectConfig, root } from './helpers.mjs';

@@ -5,7 +5,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { Authorization, executionMode, hash, requireValue, RunnerError, SkillSource, UserAgents, versions } from "./contracts.js";
 import { safeTree, Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
-import { checkpointName } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { checkpointName } from "./platform/checkpoint-policy.mjs";
 import type { Execution } from "./continuation.js";
 
 export const checkpointLimit = 256 * 1024 * 1024;

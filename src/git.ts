@@ -1,7 +1,7 @@
 import { command } from "./process.js";
 import { Diagnostics } from "./diagnostics.js";
 import { requireValue, RunnerError, shaPattern } from "./contracts.js";
-import { validBranch } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { validBranch } from "./platform/checkpoint-policy.mjs";
 
 export class TaskGit {
   constructor(public cwd: string, public env: NodeJS.ProcessEnv, public log: Diagnostics, public branch: string | null = null) {}

@@ -2,13 +2,13 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { digest, invariant, positiveId, runnerLabels, shaPattern, taskPattern } from '../remote-codex/checkpoint-policy.mjs';
-import { authorizeActors, pages } from '../remote-codex/continuation-policy.mjs';
-import { readArtifact } from '../remote-codex/artifact-io.mjs';
-import { dispatchOnce, githubAPI, inspectTask, log, resolveSource } from '../remote-codex/submission.mjs';
+import { digest, invariant, positiveId, runnerLabels, shaPattern, taskPattern } from '../../src/platform/checkpoint-policy.mjs';
+import { authorizeActors, pages } from '../../src/platform/continuation-policy.mjs';
+import { readArtifact } from '../../src/platform/artifact-io.mjs';
+import { dispatchOnce, githubAPI, inspectTask, log, resolveSource } from '../../src/platform/submission.mjs';
 import { qualificationCases } from './release-policy.mjs';
-import { safeError } from '../remote-codex/runtime-log.mjs';
-import { readProjectConfig } from '../remote-codex/project-config.mjs';
+import { safeError } from '../../src/platform/runtime-log.mjs';
+import { readProjectConfig } from '../../src/platform/project-config.mjs';
 
 const repository = 'markhuangai/agent-remote-dev-codex';
 export function registryFor({ runId, sourceSha, action, selfHosted, authorization, author, email, nonce = randomBytes(4).toString('hex') }) {

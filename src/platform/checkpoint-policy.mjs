@@ -18,7 +18,7 @@ export const databases = ['state_5.sqlite', 'thread_history_1.sqlite', 'goals_1.
 export const protocolContract = { protocol_version: 3, checkpoint_schema: 3, request_input: 'request', task_workflow: 'runner-task.yml', controller_workflow: 'runner-continuation.yml', published_workflow: 'runner-published.yml' };
 export const protocolFiles = ['.github/workflows/runner-task.yml', '.github/workflows/runner-continuation.yml', '.github/workflows/runner-published.yml',
   ...['checkpoint-policy.mjs', 'continuation-policy.mjs', 'artifact-io.mjs', 'protocol-policy.mjs', 'runtime-log.mjs', 'instructions.mjs', 'archive.py',
-    'project-config.mjs', 'sources.mjs', 'yaml.cjs', 'yaml-licenses.txt'].map(name => `.github/remote-codex/${name}`)];
+    'project-config.mjs', 'sources.mjs', 'yaml.cjs', 'yaml-licenses.txt'].map(name => `src/platform/${name}`)];
 export const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const identity = value => value === null || typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value) ? value :

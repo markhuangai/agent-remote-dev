@@ -9,11 +9,11 @@ import { drive } from "./driver.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { configure, createJob, fetchSkillSource, installSkillSource, installTools, installUserAgents, removeJob, Job } from "./setup.js";
-import { parseExecution, verifyResumeSettings } from "./continuation.js";
+import { verifyResumeSettings } from "./continuation.js";
 import { loadCheckpoint, restoreCheckpoint } from "./resume.js";
-import { positiveId, taskPattern } from "../.github/remote-codex/checkpoint-policy.mjs";
-import { authorizeActivation, requireActive } from "../.github/remote-codex/continuation-policy.mjs";
-import { fetchInstructions } from "../.github/remote-codex/instructions.mjs";
+import { positiveId, taskPattern } from "./platform/checkpoint-policy.mjs";
+import { authorizeActivation, requireActive } from "./platform/continuation-policy.mjs";
+import { fetchInstructions } from "./platform/instructions.mjs";
 import { invocationSource, prepareInvocation } from "./invocation.js";
 
 export function selectPlanSource(plan: string, resume = "") {
@@ -56,9 +56,9 @@ export async function main() {
     const actionRoot = resolve(import.meta.dirname, "..");
     const installedSource = await invocationSource(api, actionRoot, process.env, args => command("git", args, { cwd: actionRoot, env: currentJob.env, stage: "action_source", log }));
     const verified = await prepareInvocation({ api, source: installedSource, plan: get("plan"), core, env: { ...process.env, RUNNER_TEMP: job.staging } });
-    const execution = parseExecution(verified.execution, JSON.parse(verified.execution));
-    const source = selectPlanSource(verified.plan, String(verified.resume_artifact_id));
-    const taskId = verified.task_id;
+    const execution = verified.execution;
+    const source = selectPlanSource(verified.plan, String(verified.resumeArtifactId));
+    const taskId = verified.taskId;
     requireValue(taskPattern.test(taskId), "invalid_task_id");
     Object.assign(job.env, { GIT_AUTHOR_NAME: execution.git_author_name, GIT_COMMITTER_NAME: execution.git_author_name,
       GIT_AUTHOR_EMAIL: execution.git_author_email, GIT_COMMITTER_EMAIL: execution.git_author_email,
@@ -73,7 +73,7 @@ export async function main() {
     if (source.resumeArtifactId) {
       restored = await loadCheckpoint(job, path => api(path), repository, source.resumeArtifactId, log, taskId);
       verifyResumeSettings(restored.manifest.execution, execution);
-      selected = skillSources(JSON.stringify(restored.manifest.skills));
+      selected = skillSources(restored.manifest.skills);
     }
     const plan = restored?.manifest.plan ?? source.plan;
     requireValue(typeof plan === "string", "missing_plan");

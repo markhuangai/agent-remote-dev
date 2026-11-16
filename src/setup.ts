@@ -4,7 +4,7 @@ import { parse, stringify } from "smol-toml";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
 import { requireValue, RunnerError, SkillSource, UserAgents, versions } from "./contracts.js";
-import { instructions } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { instructions } from "./platform/checkpoint-policy.mjs";
 
 export type Job = { root: string; home: string; codexHome: string; tools: string; staging: string; exports: string; env: NodeJS.ProcessEnv };
 export async function createJob(temp: string, apiKey: string, token: string, author: string, email: string, inherited: NodeJS.ProcessEnv = process.env): Promise<Job> {

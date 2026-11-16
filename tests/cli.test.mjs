@@ -10,7 +10,7 @@ import { drive } from '../.build/driver.js';
 import { durableCheckpoint } from '../.build/checkpoint.js';
 import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
 import { hash } from '../.build/contracts.js';
-import { fetchInstructions } from '../.github/remote-codex/instructions.mjs';
+import { fetchInstructions } from '../src/platform/instructions.mjs';
 import { exec, execution, fixture, lineage, message, provider, repository, tool } from './helpers.mjs';
 
 const plan = 'Execute the selected workflow; its response is opaque to the host.';

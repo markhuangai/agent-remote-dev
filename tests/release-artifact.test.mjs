@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { parse } from 'yaml';
 import { actionResources } from '../.build/invocation.js';
-import { digest } from '../.github/remote-codex/checkpoint-policy.mjs';
+import { digest } from '../src/platform/checkpoint-policy.mjs';
 import { verifyReleaseArtifact } from '../.github/scripts/release-artifact.mjs';
 import { publishRelease, releaseVersion } from '../.github/scripts/release-policy.mjs';
 import { exec, fixture, root } from './helpers.mjs';

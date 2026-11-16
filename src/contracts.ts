@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { runnerVersions, sources, authorization } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { runnerVersions, sources, authorization } from "./platform/checkpoint-policy.mjs";
 
 export const versions = runnerVersions;
 export const shaPattern = /^[a-f0-9]{40}$/;
@@ -19,11 +19,11 @@ export function parseJson(value: string, stage: string): any {
   try { return JSON.parse(value); } catch { throw new RunnerError("invalid_json", stage); }
 }
 export function object(value: unknown): value is Record<string, any> { return value !== null && typeof value === "object" && !Array.isArray(value); }
-export function authorize(raw: string, repository: string, plan: string): Authorization {
-  try { return authorization(parseJson(raw, "authorization"), repository, plan); }
+export function authorize(value: unknown, repository: string, plan: string): Authorization {
+  try { return authorization(value, repository, plan); }
   catch (error: any) { throw new RunnerError(error.reason ?? "invalid_authorization", "authorization", "Direct request does not bind these plan bytes and repository.", error.details); }
 }
-export function skillSources(raw: string): SkillSource[] {
-  try { return sources(parseJson(raw, "skills")); }
+export function skillSources(value: unknown): SkillSource[] {
+  try { return sources(value); }
   catch (error: any) { throw new RunnerError(error.reason ?? "invalid_skill_sources", "skills", "Selected skill sources are invalid.", error.details); }
 }

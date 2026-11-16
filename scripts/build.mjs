@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { digest, protocolContract, protocolFiles } from "../.github/remote-codex/checkpoint-policy.mjs";
+import { digest, protocolContract, protocolFiles } from "../src/platform/checkpoint-policy.mjs";
 
 export const root = resolve(import.meta.dirname, "..");
 export async function protocolManifest(directory = root) {
@@ -32,16 +32,17 @@ export async function clean(path) {
 export async function build(destination) {
   await promisify(execFile)(process.execPath, [join(root, "node_modules/@vercel/ncc/dist/ncc/cli.js"), "build", "src/entry.ts", "-o", destination, "--minify", "--license", "licenses.txt"], { cwd: root });
   await cp(join(root,"src/supervise.py"),join(destination,"supervise.py"));
-  await cp(join(root,".github/remote-codex/archive.py"),join(destination,"archive.py"));
-  for (const name of ['yaml.cjs', 'yaml-licenses.txt']) await cp(join(root, '.github/remote-codex', name), join(destination, name));
+  await cp(join(root,"src/platform/archive.py"),join(destination,"archive.py"));
+  for (const name of ['yaml.cjs', 'yaml-licenses.txt']) await cp(join(root, 'src/platform', name), join(destination, name));
   for (const [entry, name] of [['control.mjs', 'control'], ['submission.mjs', 'client']]) {
     const temporary = await mkdtemp(join(tmpdir(), 'codex-helper-'));
     try {
-      await promisify(execFile)(process.execPath, [join(root, 'node_modules/@vercel/ncc/dist/ncc/cli.js'), 'build', join(root, '.github/remote-codex', entry), '-o', temporary, '--minify', ...(name === 'control' ? ['--license', 'control-licenses.txt'] : [])], { cwd: root });
+      await promisify(execFile)(process.execPath, [join(root, 'node_modules/@vercel/ncc/dist/ncc/cli.js'), 'build', join(root, 'src/platform', entry), '-o', temporary, '--minify', ...(name === 'control' ? ['--license', 'control-licenses.txt'] : [])], { cwd: root });
       await cp(join(temporary, 'index.mjs'), join(destination, `${name}.mjs`));
       if (name === 'control') await cp(join(temporary, 'control-licenses.txt'), join(destination, 'control-licenses.txt'));
     } finally { await clean(temporary); }
   }
+  await writeFile(join(destination, 'protocol.json'), JSON.stringify(await protocolManifest(), null, 2) + '\n');
 }
 export async function buildYaml(destination) {
   await promisify(execFile)(process.execPath, [join(root, 'node_modules/@vercel/ncc/dist/ncc/cli.js'), 'build', 'scripts/yaml-entry.cjs', '-o', destination, '--minify', '--license', 'yaml-licenses.txt'], { cwd: root });
@@ -65,10 +66,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   try {
     const yaml = join(temporary, 'yaml');
     await buildYaml(yaml);
-    await cp(join(yaml, 'index.cjs'), join(root, '.github/remote-codex/yaml.cjs'));
-    await cp(join(yaml, 'yaml-licenses.txt'), join(root, '.github/remote-codex/yaml-licenses.txt'));
+    await cp(join(yaml, 'index.cjs'), join(root, 'src/platform/yaml.cjs'));
+    await cp(join(yaml, 'yaml-licenses.txt'), join(root, 'src/platform/yaml-licenses.txt'));
     await clean(yaml);
-    await writeFile(join(root, ".github/remote-codex/protocol.json"), JSON.stringify(await protocolManifest(), null, 2) + "\n");
     await build(temporary);
     const destination = join(root, "dist");
     try { await files(destination); await clean(destination); } catch (error) { if (error.code !== "ENOENT") throw error; }

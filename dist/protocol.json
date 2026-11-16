@@ -1,0 +1,24 @@
+{
+  "protocol_version": 3,
+  "checkpoint_schema": 3,
+  "request_input": "request",
+  "task_workflow": "runner-task.yml",
+  "controller_workflow": "runner-continuation.yml",
+  "published_workflow": "runner-published.yml",
+  "files": {
+    ".github/workflows/runner-task.yml": "edc927d3171cc2df21c06ca4e367d87ac342f435da9f4b28a80b5381be10ea97",
+    ".github/workflows/runner-continuation.yml": "fbbe99470639ad02f29abb687f8c2986c2120746582f367ee3a4521cade66908",
+    ".github/workflows/runner-published.yml": "9fce2de4ec6bbee6efad95417733d012fd993aa5e509b39972d07df957daa9d4",
+    "src/platform/checkpoint-policy.mjs": "92947a941265957519739f5f5e61462f1cada27f6e039d54ea166027372d189e",
+    "src/platform/continuation-policy.mjs": "e095cbf478154693e7b51203cd89f490e2ea2aaeed5934f0e2bc832e697dbf4a",
+    "src/platform/artifact-io.mjs": "be01d081f38f6cc93a48fa689a4273fe9481aee884de11649a50ac989150a680",
+    "src/platform/protocol-policy.mjs": "b689e9f2b57bf2a20d7b0c72a9409f625fae06dbe63075cb4c94fd1ec96d7205",
+    "src/platform/runtime-log.mjs": "66eda3d4e1de8b2e6f50908985fbbf923c99d8581f03839a60a8b83b4c7d8529",
+    "src/platform/instructions.mjs": "e1bfdb843c71e8ed3847ad502a45e2f9b98d8335385f90ba9a7bf05db2ec8954",
+    "src/platform/archive.py": "c855a4998d375a791e24ce41ce8c6ff609eb6910b52bc8cff0dec849738d1a51",
+    "src/platform/project-config.mjs": "ee620505802e93eb547500b33f7a125a77e90b82e2805dc321448c9f8d76484e",
+    "src/platform/sources.mjs": "1bf60d3a8710ae95b8f74404113dab686a18f72e0d6c7fc48038c5c563f403fa",
+    "src/platform/yaml.cjs": "6ee5b3ce4d03e0d7ccc76c815334489e8a98703e0790f7e2f4e3ffdcde69d676",
+    "src/platform/yaml-licenses.txt": "d2c9e9d55943211169386c4ad4bf87b6ee97d835927e3bb230d584b0c7a377cc"
+  }
+}

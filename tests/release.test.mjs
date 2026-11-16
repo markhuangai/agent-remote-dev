@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { registryFor } from '../.github/scripts/qualification.mjs';
 import { latestJobs, publishRelease, qualificationCases, releaseVersion, validateQualification } from '../.github/scripts/release-policy.mjs';
-import { digest } from '../.github/remote-codex/checkpoint-policy.mjs';
+import { digest } from '../src/platform/checkpoint-policy.mjs';
 
 function qualification() {
   const repository = 'markhuangai/agent-remote-dev-codex', sourceSha = 'a'.repeat(40), runId = '100';

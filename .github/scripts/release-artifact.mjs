@@ -2,9 +2,9 @@ import { execFile } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { digest, invariant, positiveId, shaPattern } from '../remote-codex/checkpoint-policy.mjs';
-import { pages } from '../remote-codex/sources.mjs';
-import { logEvent, safeError } from '../remote-codex/runtime-log.mjs';
+import { digest, invariant, positiveId, shaPattern } from '../../src/platform/checkpoint-policy.mjs';
+import { pages } from '../../src/platform/sources.mjs';
+import { logEvent, safeError } from '../../src/platform/runtime-log.mjs';
 
 export async function verifyReleaseArtifact({ api, plan, artifactId, artifactDigest, runId, runAttempt, workflowSha, root, core, env = process.env }) {
   const started = Date.now();

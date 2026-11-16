@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { hash, versions } from '../.build/contracts.js';
 import { exportCheckpoint } from '../.build/checkpoint.js';
-import { unpackArchive, validateCheckpoint } from '../.build/resume.js';
+import { restoreCheckpoint, unpackArchive, validateCheckpoint } from '../.build/resume.js';
+import { TaskGit } from '../.build/git.js';
 import { verifyResumeSettings } from '../.build/continuation.js';
-import { checkpointName, recordName, registrationKey, validateManifest, validateProducer } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { authorizeActivation, childRunName, continuationDecision, prepareTaskRequest, runController, requireActive, cancelTaskRuns } from '../.github/remote-codex/continuation-policy.mjs';
-import { verifyProtocol } from '../.github/remote-codex/protocol-policy.mjs';
-import { parseProjectConfig } from '../.github/remote-codex/project-config.mjs';
-import { workflowCommand } from '../.github/remote-codex/control.mjs';
-import { exec, execution, fixture, lineage as fixtureLineage, root } from './helpers.mjs';
+import { prepareInvocation } from '../.build/invocation.js';
+import { checkpointName, recordName, registrationKey, validateManifest, validateProducer } from '../src/platform/checkpoint-policy.mjs';
+import { authorizeActivation, childRunName, continuationDecision, prepareTaskRequest, resolveTaskRequest, runController, requireActive, cancelTaskRuns } from '../src/platform/continuation-policy.mjs';
+import { verifyProtocol } from '../src/platform/protocol-policy.mjs';
+import { parseProjectConfig } from '../src/platform/project-config.mjs';
+import { workflowCommand } from '../src/platform/control.mjs';
+import { exec, execution, fixture, lineage as fixtureLineage, repository, root } from './helpers.mjs';
 
 const repo = 'fixture/repo', taskId = '13', branch = 'skill/selected-branch', sourceSha = 'a'.repeat(40);
 const lineage = fixtureLineage;
@@ -79,7 +81,7 @@ async function protocolFixture(t, supplied) {
   const controller = { ...parent, id: 99, event: 'workflow_run', path: '.github/workflows/runner-continuation.yml' };
   const model = { manifest, parent, request, artifacts, payloads, children: [], dispatches: [], registration: 'normal', controller,
     runs: new Map([[13, parent], [99, controller]]), endedAt: new Date(Date.now() - 1000).toISOString(), observedHead: manifest.checkpoint_sha };
-  model.protocol = JSON.parse(await readFile(join(root, '.github/remote-codex/protocol.json'), 'utf8'));
+  model.protocol = JSON.parse(await readFile(join(root, 'dist/protocol.json'), 'utf8'));
   model.sources = new Map();
   for (const path of Object.keys(model.protocol.files)) model.sources.set(path, await readFile(join(root, path)));
   model.sources.set('remote-codex.yml', await readFile(join(root, 'remote-codex.yml')));
@@ -95,7 +97,7 @@ async function protocolFixture(t, supplied) {
     if (endpoint === `/repos/${repo}/git/ref/heads/main`) return { object: { sha: sourceSha } };
     if (endpoint.startsWith(`/repos/${repo}/contents/`)) {
       const path = endpoint.split('/contents/')[1].split('?')[0];
-      const bytes = path === '.github/remote-codex/protocol.json' ? Buffer.from(json(model.protocol)) : model.sources.get(path);
+      const bytes = path === 'dist/protocol.json' ? Buffer.from(json(model.protocol)) : model.sources.get(path);
       return { size: bytes.length, encoding: 'base64', content: bytes.toString('base64') };
     }
     if (endpoint.match(/\/actions\/artifacts\/[0-9]+(?:\/zip)?$/)) {
@@ -162,8 +164,33 @@ test('trusted protocol verification rejects missing, changed and incompatible re
   f.model.protocol.protocol_version = 2;
   await assert.rejects(verifyProtocol(f.api, repo), { reason: 'incompatible_runner_protocol' });
   f.model.protocol.protocol_version = 3;
-  f.model.sources.set('.github/remote-codex/archive.py', Buffer.from('changed archive helper'));
+  f.model.sources.set('src/platform/archive.py', Buffer.from('changed archive helper'));
   await assert.rejects(verifyProtocol(f.api, repo), { reason: 'protocol_source_mismatch' });
+});
+
+test('real remote branch drift rejects native restore without changing the fresh checkout or session destination', async t => {
+  const f = await protocolFixture(t), r = await repository(f);
+  await r.git('branch', '-m', branch); await r.git('push', 'origin', branch);
+  const original = await r.git('rev-parse', 'HEAD');
+  await writeFile(join(r.cwd, 'drift.txt'), 'External branch advance');
+  await r.git('add', 'drift.txt'); await r.git('commit', '-m', 'Advance remote branch'); await r.git('push', 'origin', branch);
+  const advanced = await r.git('rev-parse', 'HEAD');
+  const fresh = await fixture(t), cwd = join(fresh.temporary, 'fresh');
+  await exec('git', ['clone', '--branch', 'main', r.remote, cwd], { env: fresh.job.env });
+  const git = new TaskGit(cwd, fresh.job.env, fresh.log), homeBefore = await readdir(fresh.job.codexHome);
+  const archive = join(fresh.temporary, 'checkpoint.zip'), snapshot = join(fresh.temporary, 'snapshot');
+  await writeFile(archive, f.model.payloads.get(41));
+  await unpackArchive(fresh.job, archive, snapshot, 'checkpoint', fresh.log);
+  const manifest = { ...f.model.manifest, base_sha: original, checkpoint_sha: original };
+  await assert.rejects(restoreCheckpoint(fresh.job, snapshot, manifest, git, fresh.log), { reason: 'resume_branch_drift' });
+  assert.equal(await git.head(), original); assert.equal((await git.run(['branch', '--show-current'])).trim(), 'main');
+  assert.equal(await git.changedPaths(), ''); assert.deepEqual(await readdir(fresh.job.codexHome), homeBefore);
+  await assert.rejects(readFile(join(cwd, 'drift.txt')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(fresh.job.codexHome, 'sessions/rollout.jsonl')), { code: 'ENOENT' });
+  const failure = fresh.records.find(record => record.event === 'resume.restore');
+  assert.equal(failure.reason, 'resume_branch_drift'); assert.equal(failure.level, 'ERROR');
+  assert.equal(failure.expected_sha, original); assert.equal(failure.observed_sha, advanced);
+  assert.equal(failure.session_id, manifest.session_id); process.stdout.write(json(failure) + '\n');
 });
 
 test('trusted fresh requests freeze selected setup and reject unlisted or read-only operators', async t => {
@@ -180,6 +207,9 @@ test('trusted fresh requests freeze selected setup and reject unlisted or read-o
   assert.deepEqual(fixed.runner, request.runner); assert.equal(fixed.source_repository, 'action/source'); assert.equal(fixed.budget_minutes, 300);
   assert.equal(result.skills, '[]'); assert.equal(fixed.activation_run_id, '200'); assert.equal(result.task_id, '200');
   assert.equal(fixed.project_config.sha256, hash(content));
+  const resolved = await resolveTaskRequest({ github: f.github, context, core: f.core, env });
+  assert.deepEqual(resolved.execution, fixed); assert.deepEqual(resolved.runner, request.runner);
+  assert.deepEqual(resolved.skills, []); assert.equal(resolved.authorization.request, plan);
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env: { ...env, TASK_REQUEST: json({ ...request, plan: 'Changed bytes', registration_key: registrationKey(request) }) } }), /request_registration_mismatch/);
   const changed = content + 'budget-minutes: 5\n';
   f.model.sources.set('remote-codex.yml', Buffer.from(changed));
@@ -198,6 +228,11 @@ test('a stop received before root run registration fences the initial request no
   const { allowed_actors, ...settings } = parseProjectConfig(content), plan = 'Run this prompt.';
   const request = { request_id: 'not-yet-registered', source_repository: 'action/source', source_sha: sourceSha, plan, plan_sha256: hash(plan),
     ...settings, user_agents_sha256: null, project_config: { revision: sourceSha, content, sha256: hash(content) } };
+  const stop = { operation: 'stop', task_id: request.request_id, stop_key: 'e'.repeat(32) };
+  const stopArgs = { github: f.github, context: { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' }, core: f.core,
+    env: { ...f.env, GITHUB_RUN_ID: '200', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(stop) } };
+  assert.deepEqual(await resolveTaskRequest(stopArgs), stop);
+  assert.deepEqual(await prepareTaskRequest(stopArgs), stop);
   f.model.children.push({ ...f.model.parent, id: 150, display_title: `Codex stop ${request.request_id} / ${'e'.repeat(32)}` });
   await assert.rejects(prepareTaskRequest({ github: f.github, context: { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' }, core: f.core,
     env: { ...f.env, GITHUB_RUN_ID: '200', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request) } }), /request_stopped/);
@@ -380,6 +415,29 @@ test('authority revoked during registration reconciliation is checked again imme
   assert.ok(f.records.some(record => record.level === 'ERROR' && record.activation_run_id === '13' && record.activation_run_attempt === '1'));
 });
 
+test('a stop during child reconciliation fences a prepared continuation claim before dispatch', async t => {
+  const f = await protocolFixture(t), prepared = await runController({ github: f.github, context: f.context, core: f.core,
+    env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
+  assert.equal(prepared.eligible, true); assert.equal(prepared.upload, true);
+  f.addArtifact(43, prepared.claim_name, await zipEntries(f, 'stop-race-claim', [{ name: 'record.json', text: await readFile(prepared.claim_path, 'utf8') }]), 99);
+  let stopped = false;
+  const github = { request: async (route, options) => {
+    const response = await f.github.request(route, options);
+    if (!stopped && route.includes('/actions/workflows/runner-task.yml/runs?')) {
+      const stop = { ...f.model.parent, id: 150, display_title: `Codex stop ${taskId} / ${'e'.repeat(32)}` };
+      f.model.children.push(stop); f.model.runs.set(stop.id, stop); stopped = true;
+    }
+    return response;
+  } };
+  await assert.rejects(runController({ github, context: f.context, core: f.core,
+    env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'true' } }), /task_stopped/);
+  assert.equal(stopped, true); assert.equal(f.model.dispatches.length, 0);
+  const failure = f.records.find(record => record.event === 'continuation.dispatch' && record.reason === 'task_stopped');
+  assert.equal(failure.level, 'ERROR'); assert.equal(failure.outcome, 'blocked');
+  assert.equal(failure.task_id, taskId); assert.equal(failure.parent_run_id, 13); assert.equal(failure.activation_run_id, '13');
+  assert.equal(failure.expected, 13); assert.equal(failure.observed, 150); process.stdout.write(json(failure) + '\n');
+});
+
 test('authorized manual takeover replaces revoked original authority and binds its exact attempt', async t => {
   const f = await protocolFixture(t);
   f.model.sources.set('remote-codex.yml', Buffer.from('allowed-actors: [New-Operator]\nskills: []\n'));
@@ -418,6 +476,15 @@ test('a native stop request fences existing claims and later queued execution; e
   const resumed = await prepareTaskRequest({ github: f.github, context, core: f.core, env });
   assert.equal(JSON.parse(resumed.execution).activation_run_id, '200'); assert.equal(JSON.parse(resumed.execution).continuation_count, 1);
   assert.deepEqual(JSON.parse(resumed.execution).project_config, f.model.manifest.execution.project_config);
+  const resolved = await resolveTaskRequest({ github: f.github, context, core: f.core, env: { ...env, GITHUB_JOB: 'structured-resume' } });
+  assert.deepEqual(resolved.execution, JSON.parse(resumed.execution));
+  assert.deepEqual(resolved.skills, f.model.manifest.skills);
+  assert.deepEqual(resolved.authorization, f.model.manifest.authorization);
+  const native = await prepareInvocation({ api: f.api, source: { repository: 'action/source', sha: sourceSha }, plan: '', core: f.core,
+    env: { ...env, GITHUB_ACTOR: 'Z-M-Huang', GITHUB_EVENT_NAME: 'workflow_dispatch', CODEX_TASK_REQUEST: registered(request), GITHUB_JOB: 'native-resume' } });
+  assert.equal(native.taskId, taskId); assert.equal(native.resumeArtifactId, 41); assert.equal(native.plan, '');
+  assert.deepEqual(native.execution, resolved.execution); assert.deepEqual(native.skills, resolved.skills);
+  assert.deepEqual(native.authorization, resolved.authorization);
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env: { ...env, TASK_REQUEST: registered({ ...request, runner: ['ubuntu-latest'] }) } }), /resume_settings_changed/);
 });
 
