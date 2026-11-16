@@ -8,7 +8,7 @@ import { exportCheckpoint } from '../.build/checkpoint.js';
 import { unpackArchive, validateCheckpoint } from '../.build/resume.js';
 import { verifyResumeSettings } from '../.build/continuation.js';
 import { checkpointName, recordName, registrationKey, validateManifest, validateProducer } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { childRunName, continuationDecision, prepareTaskRequest, runController, requireActive, cancelTaskRuns } from '../.github/remote-codex/continuation-policy.mjs';
+import { authorizeActivation, childRunName, continuationDecision, prepareTaskRequest, runController, requireActive, cancelTaskRuns } from '../.github/remote-codex/continuation-policy.mjs';
 import { verifyProtocol } from '../.github/remote-codex/protocol-policy.mjs';
 import { parseProjectConfig } from '../.github/remote-codex/project-config.mjs';
 import { exec, execution, fixture, lineage as fixtureLineage, root } from './helpers.mjs';
@@ -85,7 +85,7 @@ async function protocolFixture(t, supplied) {
   model.jobs = new Map(); model.cancelled = [];
   const api = async (endpoint, options = {}) => {
     const method = options.method ?? 'GET';
-    if (endpoint.includes('/collaborators/')) return { permission: model.permission ?? 'write' };
+    if (endpoint.includes('/collaborators/')) return { permission: model.permissions?.[endpoint.split('/collaborators/')[1].split('/')[0]] ?? model.permission ?? 'write' };
     if (endpoint === `/repos/${repo}/git/ref/heads/main`) return { object: { sha: sourceSha } };
     if (endpoint.startsWith(`/repos/${repo}/contents/`)) {
       const path = endpoint.split('/contents/')[1].split('?')[0];
@@ -102,6 +102,7 @@ async function protocolFixture(t, supplied) {
     if (endpoint === `/repos/${repo}/actions/workflows/7`) return { path: parent.path, state: 'active' };
     if (endpoint === `/repos/${repo}/actions/workflows/runner-task.yml`) return { path: '.github/workflows/runner-task.yml', state: 'active' };
     if (endpoint === `/repos/${repo}/actions/workflows/runner-continuation.yml`) return { path: '.github/workflows/runner-continuation.yml', state: 'active' };
+    if (endpoint === `/repos/${repo}/actions/workflows/runner-published.yml`) return { path: '.github/workflows/runner-published.yml', state: 'active' };
     if (/\/actions\/runs\/[0-9]+\/artifacts\?/.test(endpoint)) return { artifacts: [...artifacts.values()].filter(artifact => artifact.workflow_run.id === Number(endpoint.match(/runs\/([0-9]+)/)[1])) };
     if (endpoint.startsWith(`/repos/${repo}/actions/artifacts?`)) {
       const name = new URL('https://api.invalid' + endpoint).searchParams.get('name');
@@ -285,6 +286,65 @@ test('a claimed but unregistered dispatch blocks after five minutes without anot
   await assert.rejects(runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'false' },
     now: () => now, sleep: async ms => { now += ms; } }), /claimed_dispatch_unreconciled/);
   assert.equal(now, 300000); assert.equal(f.model.dispatches.length, 0);
+});
+
+for (const revocation of ['allowlist', 'permission', 'triggering_permission', 'attempt']) test(`automatic continuation rejects current activation ${revocation} changes`, async t => {
+  const f = await protocolFixture(t);
+  const prepared = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
+  const claim = JSON.parse(await readFile(prepared.claim_path, 'utf8'));
+  f.addArtifact(43, prepared.claim_name, await zipEntries(f, `revoked-${revocation}`, [{ name: 'record.json', text: json(claim) }]), 99);
+  if (revocation === 'allowlist') f.model.sources.set('remote-codex.yml', Buffer.from('allowed-actors: [New-Operator]\nskills: []\n'));
+  if (revocation === 'permission') f.model.permission = 'read';
+  if (revocation === 'triggering_permission') {
+    f.model.parent.triggering_actor = { login: 'New-Operator' };
+    f.model.sources.set('remote-codex.yml', Buffer.from('allowed-actors: [Z-M-Huang, New-Operator]\nskills: []\n'));
+    f.model.permissions = { 'New-Operator': 'read' };
+  }
+  if (revocation === 'attempt') f.model.parent.run_attempt = 2;
+  const reason = revocation === 'allowlist' ? 'untrusted_task_actor' : revocation === 'attempt' ? 'parent_run_active_or_rerun' : 'operator_write_permission_required';
+  await assert.rejects(runController({ github: f.github, context: f.context, core: f.core,
+    env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'true' } }), new RegExp(reason));
+  assert.equal(f.model.dispatches.length, 0);
+  assert.ok(f.records.some(record => record.level === 'ERROR' && record.reason === reason));
+});
+
+test('a queued automatic child rechecks revoked authority before execution', async t => {
+  const f = await protocolFixture(t), prepared = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
+  f.addArtifact(43, prepared.claim_name, await zipEntries(f, 'queued-claim', [{ name: 'record.json', text: await readFile(prepared.claim_path, 'utf8') }]), 99);
+  const child = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'true' } });
+  f.model.permission = 'read';
+  await assert.rejects(prepareTaskRequest({ github: f.github, context: { ...f.context, eventName: 'workflow_dispatch' }, core: f.core,
+    env: { ...f.env, GITHUB_RUN_ID: String(child.child_run_id), GITHUB_JOB: 'revoked-child', TASK_REQUEST: json(f.model.dispatches[0]) } }), /operator_write_permission_required/);
+  assert.ok(f.records.some(record => record.event === 'submission.resolve' && record.activation_run_id === '13' && record.activation_run_attempt === '1' && record.reason === 'operator_write_permission_required'));
+});
+
+test('authority revoked during registration reconciliation is checked again immediately before POST', async t => {
+  const f = await protocolFixture(t), prepared = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
+  f.addArtifact(43, prepared.claim_name, await zipEntries(f, 'late-revocation-claim', [{ name: 'record.json', text: await readFile(prepared.claim_path, 'utf8') }]), 99);
+  const github = { request: async (route, options) => {
+    const response = await f.github.request(route, options);
+    if (route.includes('/actions/workflows/runner-task.yml/runs?')) f.model.permission = 'read';
+    return response;
+  } };
+  await assert.rejects(runController({ github, context: f.context, core: f.core,
+    env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'true' } }), /operator_write_permission_required/);
+  assert.equal(f.model.dispatches.length, 0);
+  assert.ok(f.records.some(record => record.level === 'ERROR' && record.activation_run_id === '13' && record.activation_run_attempt === '1'));
+});
+
+test('authorized manual takeover replaces revoked original authority and binds its exact attempt', async t => {
+  const f = await protocolFixture(t);
+  f.model.sources.set('remote-codex.yml', Buffer.from('allowed-actors: [New-Operator]\nskills: []\n'));
+  f.model.permissions = { 'Z-M-Huang': 'read', 'New-Operator': 'write' };
+  const request = { task_id: taskId, source_repository: 'action/source', source_sha: sourceSha, resume_artifact_id: 41, activation_key: 'a'.repeat(32) };
+  const resumed = await prepareTaskRequest({ github: f.github, context: { ...f.context, actor: 'New-Operator', eventName: 'workflow_dispatch' }, core: f.core,
+    env: { ...f.env, GITHUB_RUN_ID: '200', GITHUB_RUN_ATTEMPT: '2', GITHUB_JOB: 'takeover', TRIGGERING_ACTOR: 'New-Operator', TASK_REQUEST: registered(request) } });
+  const settings = JSON.parse(resumed.execution);
+  assert.equal(settings.activation_run_id, '200'); assert.equal(settings.activation_run_attempt, '2');
+  f.model.runs.set(200, { ...f.model.parent, id: 200, run_attempt: 2, actor: { login: 'New-Operator' }, triggering_actor: { login: 'New-Operator' } });
+  assert.equal(await authorizeActivation(f.api, repo, settings), sourceSha);
+  f.model.runs.get(200).run_attempt = 3;
+  await assert.rejects(authorizeActivation(f.api, repo, settings), { reason: 'activation_attempt_changed' });
 });
 
 test('native failures, cancellation, drift and exhausted limits veto automatic continuation', async t => {

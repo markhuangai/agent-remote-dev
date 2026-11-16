@@ -7,11 +7,15 @@ import { digest } from '../.github/remote-codex/checkpoint-policy.mjs';
 function qualification() {
   const repository = 'markhuangai/agent-remote-dev-codex', sourceSha = 'a'.repeat(40), runId = '100';
   const registry = registryFor({ runId, sourceSha, selfHosted: ['self-hosted', 'Linux', 'X64'], authorization: 'Qualify the owned smoke tasks and clean their temporary resources.', author: 'Fixture', email: 'fixture@example.invalid',
-    action: { sha: sourceSha, release_tag: 'v1.0.0-rc.0', release_id: 9 }, nonce: '12345678' });
+    action: { repository, sha: sourceSha, requested_ref: 'v1-prerelease', release_tag: 'v1.0.0-rc.0', release_id: 9 }, nonce: '12345678' });
   const proofs = registry.targets.map(target => ({ schema_version: 3, repository, source_sha: sourceSha, run_id: runId, target: target.key, passed: true,
     cases: qualificationCases.map((scenario, index) => ({ scenario, source_sha: sourceSha, passed: true, root_run_id: index + 1, run_ids: [index + 1], session_before: 'same-session', session_after: 'same-session',
-      branch_before: 'qualification/owned', branch_after: 'qualification/owned', initial_artifact_id: 10, final_artifact_id: 11, automatic_restart: false, false_checkpoint: false })) }));
-  const cleanup = { schema_version: 3, repository, source_sha: sourceSha, run_id: runId, verified: true, tasks: registry.tasks.map(task => ({ task_id: task.task_id, verified: true })) };
+      branch_before: 'qualification/owned', branch_after: 'qualification/owned', initial_artifact_id: 10, final_artifact_id: 11, automatic_restart: false, false_checkpoint: false })),
+    published_smoke: { scenario: 'cold-resume', task_id: registry.published_tasks.find(task => task.target === target.key).task_id, passed: true, source_sha: sourceSha,
+      root_run_id: 20, run_ids: [20, 21], session_before: 'same-session', session_after: 'same-session', initial_artifact_id: 22, final_artifact_id: 23,
+      branch_before: registry.published_tasks.find(task => task.target === target.key).branch, branch_after: registry.published_tasks.find(task => task.target === target.key).branch,
+      invocation_before: { ...registry.action, kind: 'published' }, invocation_after: { ...registry.action, kind: 'published' } } }));
+  const cleanup = { schema_version: 3, repository, source_sha: sourceSha, run_id: runId, verified: true, tasks: [...registry.tasks, ...registry.published_tasks].map(task => ({ task_id: task.task_id, verified: true })) };
   return { registry, proofs, cleanup, repository, sourceSha, runId };
 }
 test('qualification requires both Linux runner families, all scenarios, matching resumes and proven cleanup', () => {
@@ -26,6 +30,10 @@ test('qualification requires both Linux runner families, all scenarios, matching
     value => { value.proofs[1].cases.find(entry => entry.scenario === 'failed-push').false_checkpoint = true; },
     value => { value.cleanup.tasks[0].verified = false; },
     value => { value.registry.action.release_tag = null; },
+    value => { delete value.proofs[0].published_smoke; },
+    value => { value.proofs[0].published_smoke.invocation_before.kind = 'checkout'; },
+    value => { value.proofs[1].published_smoke.invocation_after.requested_ref = 'v1'; },
+    value => { value.registry.published_tasks = []; },
   ]) {
     const bad = structuredClone(q); change(bad);
     assert.throws(() => validateQualification(bad.registry, bad.proofs, bad.cleanup, bad.repository, bad.sourceSha, bad.runId, true));

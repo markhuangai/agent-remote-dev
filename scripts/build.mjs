@@ -45,7 +45,7 @@ export async function buildSkill(destination) {
   const consumer = join(destination, "assets/consumer");
   await mkdir(join(consumer, ".github/workflows"), { recursive: true });
   await cp(join(root, ".github/remote-codex"), join(consumer, ".github/remote-codex"), { recursive: true });
-  for (const name of ["runner-task.yml", "runner-continuation.yml"]) await cp(join(root, ".github/workflows", name), join(consumer, ".github/workflows", name));
+  for (const name of ["runner-task.yml", "runner-continuation.yml", "runner-published.yml"]) await cp(join(root, ".github/workflows", name), join(consumer, ".github/workflows", name));
   await writeFile(join(consumer, 'remote-codex.yml'), 'allowed-actors: [REPLACE_WITH_YOUR_LOGIN]\nskills: []\nauto-continue: false\n');
   await writeFile(join(consumer, ".github/remote-codex/protocol.json"), JSON.stringify(await protocolManifest(consumer), null, 2) + "\n");
   const inventory = {};

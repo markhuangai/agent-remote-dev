@@ -8,7 +8,7 @@ For a new consumer, explicitly authorize bootstrap files in a clean target check
 node <skill-directory>/scripts/install-workflows.mjs --directory . --actors LOGIN
 ```
 
-The installer refuses existing resources and linked destinations. Review its complete `.github/remote-codex/` support directory and `runner-task.yml` / `runner-continuation.yml`, then deliver them through the repository's normal PR and human merge process. This command does not commit, push, configure secrets, or register runners. Subsequent customization of protocol-owned files requires regenerating their SHA-256 inventory in `protocol.json`.
+The installer refuses existing resources and linked destinations. Review its complete `.github/remote-codex/` support directory and `runner-task.yml`, `runner-continuation.yml`, and maintainer-only `runner-published.yml` qualification workflow, then deliver them through the repository's normal PR and human merge process. This command does not commit, push, configure secrets, or register runners. Subsequent customization of protocol-owned files requires regenerating their SHA-256 inventory in `protocol.json`.
 
 Provision runtime secrets `CODEX_CONFIG_TOML`, `CODEX_API_KEY`, and `REMOTE_DEV_PAT`. The task credential needs Contents/Pull requests/Actions read-write, Checks/Commit statuses read, Issues read for issue plans, and Workflows write only when the selected task edits workflows. Give it read access to any selected private skill repositories. The allowlist is a separate gate: dispatching users need write/maintain/admin permission, and both original and triggering actors must be allowed. Self-hosted Linux requires Git, npm, `gh`, Python 3.12+ and a working Node 24 toolchain; default labels are `["self-hosted","Linux"]`, with optional architecture/custom labels.
 
@@ -49,6 +49,10 @@ than creating another task. Status/resume/stop use `--run-id ROOT_RUN_ID`.
 Each explicit resume prints a new activation key before dispatch. Reuse it with
 `--activation-key KEY` when reconciling uncertainty. A later explicitly authorized
 resume after stopping uses a new key and the frozen continuation allowance.
+Automatic children recheck both humans behind that explicit activation against
+current trusted configuration and repository write permission. Changing its run
+attempt invalidates those children; an authorized manual resume establishes new
+authority without relying on a revoked original submitter.
 The optional workflow kit is required for these dispatch/control commands and
 for `auto-continue: true`; it is not required for standalone action execution.
 Runner labels in configuration are read in kit preflight. An action's already

@@ -29,7 +29,7 @@ export async function verifyProtocol(api, repository, enabled = true) {
       details: { expected, observed, source_path: path, protocol_revision: revision } });
     if (path.endsWith('.yml')) invariant(bytes.toString('utf8').includes("CODEX_RUNNER_PROTOCOL: '3'"), 'incompatible_workflow_protocol');
   }
-  for (const name of [protocolContract.task_workflow, protocolContract.controller_workflow]) {
+  for (const name of [protocolContract.task_workflow, protocolContract.controller_workflow, protocolContract.published_workflow]) {
     const workflow = await api(`/repos/${repository}/actions/workflows/${name}`);
     invariant(workflow.path === `.github/workflows/${name}` && workflow.state === 'active', 'continuation_protocol_unavailable');
   }

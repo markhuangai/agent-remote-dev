@@ -61,6 +61,8 @@ export async function prepareQueue(api, options) {
 }
 export async function dispatchOnce(api, repository, request, actor, { now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   invariant(!request.dispatch_key, 'automatic_dispatch_requires_claim');
+  invariant(!request.published_ref || ['v1-prerelease', 'v1'].includes(request.published_ref) && request.operation !== 'stop', 'invalid_published_reference');
+  const workflow = request.published_ref ? 'runner-published.yml' : 'runner-task.yml';
   if (request.resume_artifact_id) invariant(typeof request.activation_key === 'string' && /^[a-f0-9]{32}$/.test(request.activation_key), 'invalid_resume_activation');
   const key = registrationKey(request), payload = { ...request, registration_key: key };
   invariant(!request.registration_key || request.registration_key === key, 'request_registration_mismatch');
@@ -74,19 +76,19 @@ export async function dispatchOnce(api, repository, request, actor, { now = Date
       const collision = runs.find(run => run.display_title?.startsWith(`Codex request ${request.request_id} / `));
       invariant(!collision, 'task_registration_request_mismatch', key, /\/ request-([a-f0-9]{64})$/.exec(collision?.display_title ?? '')?.[1] ?? null);
     }
-    if (matches.length) invariant(matches[0].actor?.login === actor && matches[0].path === '.github/workflows/runner-task.yml' && matches[0].head_branch === 'main' && matches[0].repository?.full_name === repository, 'task_registration_identity_mismatch');
+    if (matches.length) invariant(matches[0].actor?.login === actor && matches[0].path === `.github/workflows/${workflow}` && matches[0].head_branch === 'main' && matches[0].repository?.full_name === repository, 'task_registration_identity_mismatch');
     return matches[0];
   };
   let run = await find(), apiError = null;
   if (!run) {
-    log('submission.dispatch', 'INFO', { repository, request_id: request.request_id ?? null, task_id: request.task_id ?? null, workflow: 'runner-task.yml', ref: 'main', actor, request_sha256: key, activation_key: request.activation_key ?? null, outcome: 'requesting' });
-    try { await api(`/repos/${repository}/actions/workflows/runner-task.yml/dispatches`, { method: 'POST', ref: 'main', inputs: { request: JSON.stringify(payload) } }); }
+    log('submission.dispatch', 'INFO', { repository, request_id: request.request_id ?? null, task_id: request.task_id ?? null, workflow, published_ref: request.published_ref ?? null, ref: 'main', actor, request_sha256: key, activation_key: request.activation_key ?? null, outcome: 'requesting' });
+    try { await api(`/repos/${repository}/actions/workflows/${workflow}/dispatches`, { method: 'POST', ref: 'main', inputs: { request: JSON.stringify(payload) } }); }
     catch (error) { apiError = safeError(error); }
   }
   const deadline = now() + 300000;
   while (!run && now() < deadline) { await sleep(Math.min(10000, deadline - now())); run = await find(); }
   invariant(run, 'ambiguous_dispatch_registration');
-  const receipt = { repository, task_id: request.task_id ?? String(run.id), root_run_id: request.task_id ?? String(run.id), request_id: request.request_id ?? null, actor, run_id: run.id, run_url: run.html_url, workflow: 'runner-task.yml', ref: 'main', workflow_sha: run.head_sha,
+  const receipt = { repository, task_id: request.task_id ?? String(run.id), root_run_id: request.task_id ?? String(run.id), request_id: request.request_id ?? null, actor, run_id: run.id, run_url: run.html_url, workflow, ref: 'main', workflow_sha: run.head_sha,
     source_repository: request.source_repository ?? null, source_sha: request.source_sha ?? null, plan_sha256: request.plan_sha256 ?? null, request_sha256: key, activation_key: request.activation_key ?? null };
   log('submission.dispatch', 'INFO', { ...receipt, api_error: apiError, outcome: 'registered' });
   return receipt;
@@ -121,7 +123,7 @@ export async function inspectTask(api, repository, taskId, root, showResult = fa
       invariant(value.schema_version === 3 && value.repository === repository && value.task_id === taskId && String(value.lineage?.run_id) === String(run.id) &&
         Number(value.lineage?.run_attempt) === Number(run.run_attempt) && value.lineage?.workflow_sha === run.head_sha && loaded.artifact.workflow_run?.id === run.id, 'run_record_identity_mismatch');
       if (kind === 'run') Object.assign(summary, { plan_sha256: value.plan_sha256, source_repository: value.execution.source_repository, source_sha: value.execution.source_sha, parent_run_id: value.execution.parent_run_id,
-        root_run_id: value.execution.root_run_id, continuation_count: value.execution.continuation_count, runner: value.execution.runner });
+        root_run_id: value.execution.root_run_id, continuation_count: value.execution.continuation_count, runner: value.execution.runner, invocation: value.invocation, execution: value.execution });
       else if (kind === 'outcome') Object.assign(summary, { infrastructure_status: value.status, native_outcome: value.native_outcome, reason: value.reason, checkpoint: value.checkpoint });
       else summary.native_response = value.response;
     }
@@ -186,7 +188,8 @@ export async function cli(argv, api = githubAPI) {
           const loaded = await loadVerifiedCheckpoint({ api, repository: options.repo, id: Number(options.artifact_id), taskId: options.run_id,
             io: (id, kind) => readArtifact({ api, repository: options.repo, id, root: temporary, kind }) });
           result = await dispatchOnce(api, options.repo, { task_id: options.run_id, source_repository: loaded.manifest.execution.source_repository,
-            source_sha: loaded.manifest.execution.source_sha, resume_artifact_id: Number(options.artifact_id), activation_key: options.activation_key ?? randomBytes(16).toString('hex') }, actor);
+            source_sha: loaded.manifest.execution.source_sha, ...(loaded.manifest.execution.published_ref ? { published_ref: loaded.manifest.execution.published_ref } : {}),
+            resume_artifact_id: Number(options.artifact_id), activation_key: options.activation_key ?? randomBytes(16).toString('hex') }, actor);
         }
       }
     }

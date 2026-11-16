@@ -74,8 +74,9 @@ test('published and local action invocations derive provenance and verify actual
   const sha = (await git(['rev-parse', 'HEAD'])).trim();
   const api = async path => path.includes('/commits/') ? { sha } : { tree, truncated: false };
   const published = await invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action', GITHUB_ACTION_REF: 'main' }, git);
-  assert.equal(published.sha, sha); assert.equal(published.repository, 'fixture/action');
-  assert.equal((await invocationSource(api, root, {}, git)).sha, sha);
+  assert.equal(published.sha, sha); assert.equal(published.repository, 'fixture/action'); assert.equal(published.kind, 'published');
+  assert.equal((await invocationSource(api, root, {}, git)).kind, 'checkout');
+  await assert.rejects(invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action' }, git), { reason: 'unknown_action_source' });
   await writeFile(join(root, 'dist/index.js'), 'Changed downloaded executable');
   await assert.rejects(invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action', GITHUB_ACTION_REF: 'main' }, git), error => {
     assert.equal(error.reason, 'action_source_resource_mismatch'); assert.equal(error.details.resource_path, 'dist/index.js');

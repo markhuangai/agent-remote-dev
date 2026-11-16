@@ -203,7 +203,8 @@ local Codex history or credentials. The client reads the target's committed
 `remote-codex.yml` rather than requiring settings on every invocation.
 
 The bundled installer creates `remote-codex.yml`, `.github/remote-codex/` resources,
-`runner-task.yml` and `runner-continuation.yml`. Review and merge this kit before
+`runner-task.yml`, `runner-continuation.yml` and the maintainer-only
+`runner-published.yml` qualification entrypoint. Review and merge this kit before
 using its queue/resume/stop commands. Installation refuses existing resources and
 linked destinations; it does not commit, push, configure secrets or register runners.
 Set `auto-continue: true` only after the complete compatible kit is installed.
@@ -239,7 +240,12 @@ permission. The initial allowlist here is `Z-M-Huang`; consumer installation
 requires explicit logins. The kit checks actors on trusted `main` before the secret-bearing execution
 step and again after acquiring the per-task lock; standalone action setup checks
 actors before native execution. Automatic bot children need
-a unique verified controller claim. This policy is separate from AI-review trust.
+a unique verified controller claim. Each automatic dispatch and execution also
+rechecks the humans behind the current explicit activation against current `main`
+and repository write permission. Activation is bound to its exact run attempt;
+rerunning that activation invalidates its automatic children. An authorized manual
+resume can establish a new activation after another operator loses access.
+This policy is separate from AI-review trust.
 
 Provision these runtime secrets:
 
@@ -359,14 +365,24 @@ Missing scenarios, mismatched sessions/source or unproven cleanup fail qualifica
 successful exact-source main CI/CodeQL children, complete qualification/cleanup,
 fresh source/bundle checks and a complete installed submission package. The initial
 versions are `v1.0.0-rc.0` and `v1.0.0`. Exact version tags are creation-only.
+Source installation, builds and tests run in a separate read-only job. The
+publisher executes only trusted policy and accepts a bounded, digest-bound
+artifact from that exact build run/attempt. It treats archives as data, rejects
+unsafe entries and independently compares all package bytes with Git blobs at
+the qualified source SHA before generating the release manifest.
 Prereleases advance `v1-prerelease`; stable releases advance `v1`; aliases use
 forward API updates with `force: false`. A partial or ambiguous publication stops
 for maintainer inspection rather than overwriting a version or retrying blindly.
 
 First qualify the merged SHA and explicitly publish `v1.0.0-rc.0`. Run qualification
-again with `action-ref: v1-prerelease` and that exact SHA to produce published-action
-plan/resume evidence. Stable promotion requires this published prerelease smoke
-receipt. Publish `v1.0.0`, verify `v1` and `v1-prerelease` resolve to their exact
+again with `action-ref: v1-prerelease` and that exact SHA. In addition to the five
+source cases, this runs a fresh/manual-resume pair per runner family through
+literal published `uses:` steps. The two channel jobs are separately gated, so
+prerelease qualification does not download the not-yet-published stable alias.
+Promotion independently verifies their actual run/attempts, invocation provenance,
+artifact producers, frozen settings and native checkpoint/session lineage.
+Stable promotion requires this published prerelease smoke receipt.
+Publish `v1.0.0`, verify `v1` and `v1-prerelease` resolve to their exact
 releases, and smoke the published stable action before remote cutover. Source and
 bundle checks, qualification run URLs, release IDs, exact tags/commits and alias
 targets are recorded without credentials. Do not move this repository's subsequent

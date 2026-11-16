@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       action-ref:
-        description: Optional published ref to smoke, resolving to source-sha; use v1-prerelease before stable promotion
+        description: Optional v1-prerelease or v1 channel for an actual published fresh/resume smoke pair per runner family
         type: string
       self-hosted-labels:
         description: JSON labels for the provisioned self-hosted Linux runner

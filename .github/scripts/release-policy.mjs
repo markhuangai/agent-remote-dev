@@ -1,5 +1,5 @@
-import { digest, invariant, positiveId, shaPattern } from '../remote-codex/checkpoint-policy.mjs';
-import { authorizeActors, pages } from '../remote-codex/continuation-policy.mjs';
+import { digest, frozenExecution, invariant, positiveId, recordName, same, shaPattern } from '../remote-codex/checkpoint-policy.mjs';
+import { authorizeActors, loadVerifiedCheckpoint, pages } from '../remote-codex/continuation-policy.mjs';
 import { readArtifact } from '../remote-codex/artifact-io.mjs';
 import { logEvent, safeError } from '../remote-codex/runtime-log.mjs';
 
@@ -48,18 +48,85 @@ export function validateQualification(registry, proofs, cleanup, repository, sou
       invariant(entry.session_before && entry.session_before === entry.session_after && entry.branch_before === entry.branch_after && positiveId(entry.initial_artifact_id) && positiveId(entry.final_artifact_id), 'qualification_resume_identity_mismatch');
     }
     invariant(proof.cases.find(entry => entry.scenario === 'cancellation').automatic_restart === false && proof.cases.find(entry => entry.scenario === 'failed-push').false_checkpoint === false, 'qualification_adverse_proof_missing');
+    const published = registry.published_tasks?.filter(task => task.target === target.key) ?? [];
+    if (registry.action?.release_tag) {
+      invariant(published.length === 1 && published[0].scenario === 'cold-resume' && published[0].published_ref === registry.action.requested_ref &&
+        same(published[0].labels, target.labels), 'published_smoke_task_missing');
+      const smoke = proof.published_smoke;
+      invariant(smoke?.passed === true && smoke.task_id === published[0].task_id && smoke.source_sha === sourceSha && smoke.scenario === 'cold-resume' &&
+        Array.isArray(smoke.run_ids) && smoke.run_ids.length === 2 && smoke.run_ids.every(positiveId) && smoke.run_ids[0] !== smoke.run_ids[1] &&
+        smoke.root_run_id === smoke.run_ids[0] && smoke.session_before && smoke.session_before === smoke.session_after && smoke.branch_before === published[0].branch &&
+        smoke.branch_after === published[0].branch && positiveId(smoke.initial_artifact_id) && positiveId(smoke.final_artifact_id), 'published_smoke_incomplete');
+      validatePublishedInvocation(smoke.invocation_before, registry.action);
+      validatePublishedInvocation(smoke.invocation_after, registry.action);
+    } else invariant(published.length === 0 && !proof.published_smoke, 'unexpected_published_smoke');
   }
+  const tasks = [...registry.tasks, ...(registry.published_tasks ?? [])];
   invariant(cleanup.schema_version === 3 && cleanup.repository === repository && cleanup.source_sha === sourceSha && String(cleanup.run_id) === String(runId) && cleanup.verified === true &&
-    Array.isArray(cleanup.tasks) && cleanup.tasks.length === registry.tasks.length && registry.tasks.every(task => cleanup.tasks.some(entry => entry.task_id === task.task_id && entry.verified === true)), 'qualification_cleanup_unproven');
-  invariant(registry.action?.sha === sourceSha && (registry.action.release_tag === null || /^v1\.\d+\.\d+(?:-rc\.\d+)?$/.test(registry.action.release_tag)) &&
+    Array.isArray(cleanup.tasks) && cleanup.tasks.length === tasks.length && tasks.every(task => cleanup.tasks.some(entry => entry.task_id === task.task_id && entry.verified === true)), 'qualification_cleanup_unproven');
+  invariant(registry.action?.repository === repository && registry.action.sha === sourceSha && (registry.action.release_tag === null || /^v1\.\d+\.\d+(?:-rc\.\d+)?$/.test(registry.action.release_tag)) &&
     (registry.action.release_id === null || positiveId(registry.action.release_id)), 'qualification_action_identity_mismatch');
-  if (stable) invariant(registry.action?.release_tag && /^v1\.\d+\.\d+-rc\.\d+$/.test(registry.action.release_tag) && positiveId(registry.action.release_id), 'published_prerelease_smoke_required');
+  if (stable) invariant(registry.action?.requested_ref === 'v1-prerelease' && /^v1\.\d+\.\d+-rc\.\d+$/.test(registry.action.release_tag) && positiveId(registry.action.release_id), 'published_prerelease_smoke_required');
   return { run_id: Number(runId), source_sha: sourceSha, targets: proofs.map(proof => proof.target), cleanup_verified: true,
     published_action: { sha: registry.action?.sha ?? null, release_tag: registry.action?.release_tag ?? null, release_id: registry.action?.release_id ?? null } };
 }
+function validatePublishedInvocation(invocation, action) {
+  invariant(invocation?.kind === 'published' && invocation.repository === action.repository && invocation.sha === action.sha &&
+    ['v1', 'v1-prerelease'].includes(invocation.requested_ref) && invocation.requested_ref === action.requested_ref &&
+    invocation.release_tag === action.release_tag && invocation.release_id === action.release_id, 'published_invocation_unproven');
+}
+export async function verifyPublishedSmoke(api, repository, qualificationRun, registry, proof, root) {
+  const smoke = proof.published_smoke, task = registry.published_tasks.find(task => task.target === proof.target);
+  const cache = new Map(), io = (id, kind) => {
+    const key = `${id}:${kind}`;
+    if (!cache.has(key)) cache.set(key, readArtifact({ api, repository, id, root, kind }));
+    return cache.get(key);
+  };
+  const records = [], checkpoints = [];
+  for (const [index, id] of smoke.run_ids.entries()) {
+    const run = await api(`/repos/${repository}/actions/runs/${id}`);
+    invariant(run.id === id && run.run_attempt === 1 && run.path === '.github/workflows/runner-published.yml' && run.event === 'workflow_dispatch' &&
+      run.head_branch === 'main' && run.head_sha === qualificationRun.head_sha && run.repository?.full_name === repository && run.head_repository?.full_name === repository &&
+      run.status === 'completed' && run.conclusion === (index === 0 ? 'failure' : 'success'), 'untrusted_published_smoke_run');
+    await authorizeActors(api, repository, run.actor?.login, run.triggering_actor?.login);
+    const artifacts = await pages(api, `/repos/${repository}/actions/runs/${id}/artifacts`, 'artifacts');
+    const values = {};
+    for (const kind of ['run', 'outcome']) {
+      const matches = artifacts.filter(artifact => artifact.name === recordName(kind, String(smoke.root_run_id), id, 1));
+      invariant(matches.length === 1, 'published_smoke_record_missing');
+      const loaded = await io(matches[0].id, 'record'), value = loaded.value;
+      invariant(loaded.artifact.workflow_run?.id === id && value.schema_version === 3 && value.repository === repository && value.task_id === String(smoke.root_run_id) &&
+        String(value.lineage?.run_id) === String(id) && String(value.lineage.run_attempt) === '1' && value.lineage.workflow_sha === run.head_sha &&
+        value.lineage.workflow_ref === `${repository}/${run.path}@refs/heads/main` && value.lineage.actor === run.actor?.login && value.lineage.triggering_actor === run.triggering_actor?.login, 'published_smoke_record_mismatch');
+      values[kind] = value;
+    }
+    validatePublishedInvocation(values.run.invocation, registry.action);
+    invariant(same(values.run.invocation, index === 0 ? smoke.invocation_before : smoke.invocation_after) && values.run.execution.request_id === task.task_id &&
+      values.run.execution.published_ref === task.published_ref && values.run.execution.auto_continue === false && same(values.run.execution.runner, task.labels) &&
+      same(values.run.execution.project_config, registry.project_config) && same(values.run.skills, [{ repository, revision: registry.source_sha, names: ['runner-acceptance'] }]) &&
+      values.run.execution.source_sha === registry.source_sha && values.run.execution.source_repository === repository && values.run.execution.continuation_count === index &&
+      values.run.execution.root_run_id === String(smoke.root_run_id) && values.run.execution.root_run_attempt === '1' &&
+      values.run.execution.activation_run_id === String(id) && values.run.execution.activation_run_attempt === '1' &&
+      (index === 0 ? values.run.resume_artifact_id === null && values.run.execution.parent_run_id === null :
+        values.run.resume_artifact_id === smoke.initial_artifact_id && values.run.execution.parent_run_id === String(smoke.root_run_id) && values.run.execution.parent_run_attempt === '1'), 'published_smoke_lineage_mismatch');
+    invariant(values.outcome.status === (index === 0 ? 'incomplete' : 'completed') && values.outcome.native_outcome === (index === 0 ? 'timed_out' : 'succeeded') &&
+      values.outcome.reason === (index === 0 ? 'action_budget' : 'native_return'), 'published_smoke_outcome_mismatch');
+    const artifactId = index === 0 ? smoke.initial_artifact_id : smoke.final_artifact_id;
+    invariant(values.outcome.checkpoint?.artifact_id === artifactId, 'published_smoke_checkpoint_mismatch');
+    const loaded = await loadVerifiedCheckpoint({ api, io, repository, id: artifactId, taskId: String(smoke.root_run_id) });
+    invariant(loaded.producer.id === id && same(loaded.manifest.execution, values.run.execution) && loaded.manifest.branch === task.branch &&
+      loaded.manifest.checkpoint_sha === values.outcome.checkpoint.checkpoint_sha && loaded.manifest.plan_sha256 === values.run.plan_sha256 &&
+      same(loaded.manifest.skills, values.run.skills), 'published_smoke_checkpoint_mismatch');
+    records.push(values.run); checkpoints.push(loaded.manifest);
+  }
+  invariant(checkpoints[0].session_id === smoke.session_before && checkpoints[1].session_id === smoke.session_after && checkpoints[0].session_id === checkpoints[1].session_id &&
+    same(frozenExecution(records[0].execution), frozenExecution(records[1].execution)) && records[0].plan_sha256 === records[1].plan_sha256 &&
+    checkpoints[0].sequence < checkpoints[1].sequence, 'published_smoke_resume_mismatch');
+  return { target: proof.target, run_ids: smoke.run_ids, source_sha: registry.source_sha, release_tag: registry.action.release_tag, release_id: registry.action.release_id };
+}
 export async function qualificationReceipt(api, repository, runId, sourceSha, root, stable) {
   const run = await api(`/repos/${repository}/actions/runs/${runId}`);
-  invariant(run.path === '.github/workflows/runner-acceptance.yml' && run.head_branch === 'main' && run.event === 'workflow_dispatch' && run.repository?.full_name === repository &&
+  invariant(run.id === Number(runId) && run.run_attempt === 1 && run.path === '.github/workflows/runner-acceptance.yml' && run.head_branch === 'main' && run.event === 'workflow_dispatch' && run.repository?.full_name === repository &&
     run.head_repository?.full_name === repository && run.status === 'completed' && run.conclusion === 'success', 'untrusted_qualification_run');
   const artifacts = await pages(api, `/repos/${repository}/actions/runs/${runId}/artifacts`, 'artifacts');
   async function record(name) {
@@ -73,7 +140,12 @@ export async function qualificationReceipt(api, repository, runId, sourceSha, ro
   invariant(Array.isArray(registry.targets) && registry.targets.length <= 10, 'qualification_matrix_incomplete');
   for (const target of registry.targets) proofs.push(await record(`linux-qualification-${runId}-${target.key}`));
   const cleanup = await record(`linux-qualification-${runId}-cleanup`);
-  return validateQualification(registry, proofs, cleanup, repository, sourceSha, runId, stable);
+  const receipt = validateQualification(registry, proofs, cleanup, repository, sourceSha, runId, stable);
+  if (registry.action.release_tag) {
+    receipt.published_smoke = [];
+    for (const proof of proofs) receipt.published_smoke.push(await verifyPublishedSmoke(api, repository, run, registry, proof, `${root}/published-${proof.target}`));
+  }
+  return receipt;
 }
 export async function prepareRelease({ api, repository, version, sourceSha, qualificationRunId, actor, triggeringActor, root }) {
   const parsed = releaseVersion(version);

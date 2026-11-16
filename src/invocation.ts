@@ -12,7 +12,8 @@ export const actionResources = ['action.yml', 'package.json', 'package-lock.json
 export async function invocationSource(api: (path: string, options?: any) => Promise<any>, root: string, env: NodeJS.ProcessEnv,
   git: (args: string[]) => Promise<string>) {
   let repository = env.GITHUB_ACTION_REPOSITORY, ref = env.GITHUB_ACTION_REF;
-  if (!repository || !ref) {
+  const kind = repository || ref ? 'published' : 'checkout';
+  if (kind === 'checkout') {
     requireValue((await git(['rev-parse', '--show-toplevel'])).trim() === root, 'unknown_action_source');
     const origin = (await git(['remote', 'get-url', 'origin'])).trim();
     repository = /^(?:https:\/\/github\.com\/|git@github\.com:)([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(origin)?.[1];
@@ -31,7 +32,7 @@ export async function invocationSource(api: (path: string, options?: any) => Pro
     if (entry?.type !== 'blob' || entry.sha !== observed) throw new RunnerError('action_source_resource_mismatch', 'action_source', 'Installed action differs from its resolved source.',
       { resource_path: path, source_sha: source.sha, expected: entry?.sha ?? null, observed });
   }
-  return source;
+  return { ...source, kind };
 }
 export async function prepareInvocation({ api, plan, source, core, env = process.env }: {
   api: (path: string, options?: any) => Promise<any>; plan: string; source: any; core: any; env?: NodeJS.ProcessEnv;
@@ -40,7 +41,7 @@ export async function prepareInvocation({ api, plan, source, core, env = process
   const actor = env.GITHUB_ACTOR ?? '', triggering = env.TRIGGERING_ACTOR || env.GITHUB_TRIGGERING_ACTOR || actor;
   requireValue(env.GITHUB_EVENT_NAME === 'workflow_dispatch' && env.GITHUB_REF === 'refs/heads/main', 'untrusted_task_context');
   let request: any;
-  if (env.GITHUB_EVENT_PATH && env.GITHUB_WORKFLOW_REF === `${repository}/.github/workflows/runner-task.yml@refs/heads/main`) {
+  if (env.GITHUB_EVENT_PATH && ['runner-task.yml', 'runner-published.yml'].some(name => env.GITHUB_WORKFLOW_REF === `${repository}/.github/workflows/${name}@refs/heads/main`)) {
     try {
       const event = JSON.parse(await readFile(env.GITHUB_EVENT_PATH, 'utf8'));
       if (event.inputs?.request) request = JSON.parse(event.inputs.request);
@@ -59,6 +60,7 @@ export async function prepareInvocation({ api, plan, source, core, env = process
     }
   }
   requireValue(request.source_repository === source.repository && request.source_sha === source.sha, 'action_source_mismatch');
+  if (request.published_ref) requireValue(source.kind === 'published' && source.requested_ref === request.published_ref && source.release_tag && source.release_id, 'published_invocation_required');
   const verified = await prepareTaskRequest({ github: { request: async (route: string, options?: any) => ({ data: await api(route.replace(/^[A-Z]+ /, ''), options) }) },
     context: { repo: { owner, repo }, actor, eventName: env.GITHUB_EVENT_NAME }, core,
     env: { ...env, CODEX_RUNNER_PROTOCOL: '3', TRIGGERING_ACTOR: triggering, TASK_REQUEST: JSON.stringify(request) } });

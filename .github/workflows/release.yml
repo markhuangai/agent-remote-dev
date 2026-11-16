@@ -47,10 +47,53 @@ jobs:
             const { releasePreflight } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
             await releasePreflight({ github, context, core });
 
-  publish:
+  build:
+    name: Build and verify source
     needs: authorize
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.assets.outputs.artifact-id }}
+      artifact_digest: ${{ steps.assets.outputs.artifact-digest }}
+    steps:
+      - name: Checkout exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Verify source and complete distribution
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm run test:skill-install
+      - name: Prepare reproducible release assets
+        run: |
+          mkdir "$RUNNER_TEMP/release-assets"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/action.tar" action.yml dist package.json package-lock.json
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/remote-codex.tar" -C skills remote-codex
+          gzip -n "$RUNNER_TEMP/release-assets/action.tar" "$RUNNER_TEMP/release-assets/remote-codex.tar"
+          cd "$RUNNER_TEMP/release-assets"
+          sha256sum action.tar.gz remote-codex.tar.gz > SHA256SUMS
+      - name: Transfer release assets as data
+        id: assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     concurrency:
       group: linux-release-publication
       cancel-in-progress: false
@@ -62,47 +105,27 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.workflow_sha }}
-          path: trusted
-          persist-credentials: false
-      - name: Checkout exact qualified source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ inputs.source-sha }}
-          path: source
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - name: Verify source and complete distribution
-        working-directory: source
-        run: |
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run check
-          npm run test:skill-install
-      - name: Prepare reproducible release assets
-        working-directory: source
-        run: |
-          mkdir "$RUNNER_TEMP/release-assets"
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/action.tar" action.yml dist package.json package-lock.json
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/remote-codex.tar" -C skills remote-codex
-          gzip -n "$RUNNER_TEMP/release-assets/action.tar" "$RUNNER_TEMP/release-assets/remote-codex.tar"
-          cd "$RUNNER_TEMP/release-assets"
-          sha256sum action.tar.gz remote-codex.tar.gz > SHA256SUMS
-      - name: Revalidate and publish immutable version with forward alias
+      - name: Verify artifact against qualified source and publish
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          RELEASE_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          RELEASE_ARTIFACT_DIGEST: sha256:${{ needs.build.outputs.artifact_digest }}
         with:
           retries: 0
           script: |
             const { pathToFileURL } = require('node:url');
-            const fs = require('node:fs/promises');
-            const path = require('node:path');
-            const { releasePreflight, publishRelease } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/trusted/.github/scripts/release-policy.mjs').href);
+            const root = process.env.GITHUB_WORKSPACE;
+            const { releasePreflight, publishRelease } = await import(pathToFileURL(root + '/.github/scripts/release-policy.mjs').href);
+            const { verifyReleaseArtifact } = await import(pathToFileURL(root + '/.github/scripts/release-artifact.mjs').href);
             const plan = await releasePreflight({ github, context, core });
-            const directory = path.join(process.env.RUNNER_TEMP, 'release-assets');
-            await fs.writeFile(path.join(directory, 'release-manifest.json'), JSON.stringify({ ...plan, bundle_verified: true, protocol_version: 3 }, null, 2));
-            const assets = await Promise.all((await fs.readdir(directory)).map(async name => ({ name, data: await fs.readFile(path.join(directory, name)) })));
             const api = async (route, options) => (await github.request(`${options?.method || 'GET'} ${route}`, options)).data;
+            const assets = await verifyReleaseArtifact({ api, plan, core, artifactId: process.env.RELEASE_ARTIFACT_ID,
+              artifactDigest: process.env.RELEASE_ARTIFACT_DIGEST, runId: context.runId, runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+              workflowSha: process.env.GITHUB_WORKFLOW_SHA, root: process.env.RUNNER_TEMP + '/release-artifact' });
             const upload = async (release_id, asset) => {
               const result = await github.rest.repos.uploadReleaseAsset({ ...context.repo, release_id, name: asset.name, data: asset.data,
                 headers: { 'content-type': 'application/octet-stream', 'content-length': asset.data.length } });

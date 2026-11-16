@@ -15,8 +15,8 @@ export function registrationKey(request) {
   return digest(JSON.stringify(frozen));
 }
 export const databases = ['state_5.sqlite', 'thread_history_1.sqlite', 'goals_1.sqlite', 'queue_1.sqlite', 'memories_1.sqlite', 'memories_v2_1.sqlite'];
-export const protocolContract = { protocol_version: 3, checkpoint_schema: 3, request_input: 'request', task_workflow: 'runner-task.yml', controller_workflow: 'runner-continuation.yml' };
-export const protocolFiles = ['.github/workflows/runner-task.yml', '.github/workflows/runner-continuation.yml',
+export const protocolContract = { protocol_version: 3, checkpoint_schema: 3, request_input: 'request', task_workflow: 'runner-task.yml', controller_workflow: 'runner-continuation.yml', published_workflow: 'runner-published.yml' };
+export const protocolFiles = ['.github/workflows/runner-task.yml', '.github/workflows/runner-continuation.yml', '.github/workflows/runner-published.yml',
   ...['checkpoint-policy.mjs', 'continuation-policy.mjs', 'artifact-io.mjs', 'protocol-policy.mjs', 'runtime-log.mjs', 'instructions.mjs', 'archive.py',
     'project-config.mjs', 'sources.mjs', 'yaml.cjs', 'yaml-licenses.txt'].map(name => `.github/remote-codex/${name}`)];
 export const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
@@ -75,7 +75,7 @@ export function executionSettings(value) {
   invariant(typeof value.auto_continue === 'boolean' && Number.isSafeInteger(value.max_continuations) && value.max_continuations >= 0 && value.max_continuations <= 100, 'invalid_continuation_limit');
   invariant(Number.isSafeInteger(value.continuation_count) && value.continuation_count >= 0 && value.continuation_count <= value.max_continuations, 'continuation_limit_exceeded', value.max_continuations, value.continuation_count);
   invariant(Number.isFinite(value.budget_minutes) && value.budget_minutes >= 3 && value.budget_minutes <= 300, 'invalid_budget');
-  invariant(positiveId(value.root_run_id) && positiveId(value.root_run_attempt) && positiveId(value.activation_run_id), 'invalid_root_lineage');
+  invariant(positiveId(value.root_run_id) && positiveId(value.root_run_attempt) && positiveId(value.activation_run_id) && positiveId(value.activation_run_attempt), 'invalid_root_lineage');
   invariant(value.continuation_count === 0 && value.parent_run_id === null && value.parent_run_attempt === null || positiveId(value.parent_run_id) && positiveId(value.parent_run_attempt), 'invalid_parent_lineage');
   invariant(typeof value.git_author_name === 'string' && value.git_author_name.trim() && typeof value.git_author_email === 'string' && value.git_author_email.trim() &&
     !/[\r\n\0]/.test(value.git_author_name + value.git_author_email), 'invalid_git_identity');
@@ -85,6 +85,7 @@ export function executionSettings(value) {
     typeof value.project_config.content === 'string' && Buffer.byteLength(value.project_config.content) <= 65536 &&
     digest(value.project_config.content) === value.project_config.sha256, 'project_config_hash_mismatch');
   invariant(typeof value.request_id === 'string' && taskPattern.test(value.request_id), 'invalid_request_identity');
+  invariant(value.published_ref === null || ['v1', 'v1-prerelease'].includes(value.published_ref) && value.auto_continue === false, 'invalid_published_reference');
   return value;
 }
 export function validBranch(value) {
@@ -137,7 +138,7 @@ export function validateProducer(artifact, run, manifest, repository) {
   return artifact;
 }
 export function frozenExecution(value) {
-  const { continuation_count, parent_run_id, parent_run_attempt, activation_run_id, ...fixed } = value;
+  const { continuation_count, parent_run_id, parent_run_attempt, activation_run_id, activation_run_attempt, ...fixed } = value;
   return fixed;
 }
 export function validateFrozenRoot(manifest, request, root) {
