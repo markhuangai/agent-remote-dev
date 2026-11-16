@@ -368,8 +368,8 @@ separately authorize `runner-acceptance.yml` on trusted `main`. Supply an exact
 merged source SHA and direct authorization for uniquely identified smoke branches,
 draft PRs, resume/cancellation and scoped cleanup. The harness runs `fresh`,
 `cold-resume`, `deadline`, `cancellation` and `failed-push` on hosted and self-hosted
-Linux. Its selected fixture skill owns all workflow phases; the harness checks
-real run/session/source evidence. Cleanup fences owned tasks, closes proven smoke
+Linux. An ordinary test prompt defines each scenario without installing a skill.
+The harness checks real run/session/source evidence. Cleanup fences owned tasks, closes proven smoke
 PRs without merging, removes only their proven branches and retains evidence.
 Missing scenarios, mismatched sessions/source or unproven cleanup fail qualification.
 

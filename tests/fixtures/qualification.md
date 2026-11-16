@@ -1,11 +1,6 @@
----
-name: runner-acceptance
-description: Execute one explicitly authorized Linux runner qualification scenario in markhuangai/agent-remote-dev-codex. Use only when the qualification task supplies its exact task ID, temporary branch, marker and scenario.
----
+# Linux runner qualification fixture
 
-# Runner acceptance fixture
-
-This skill owns the smoke workflow; the runtime does not implement its phases. Require the direct request to authorize the supplied temporary branch and draft PR in `markhuangai/agent-remote-dev-codex`. Never merge, force-push, change configuration/credentials, delete another resource, or touch another task. The qualification controller performs separately authorized scoped cleanup.
+Execute only the explicitly authorized scenario in the supplied qualification context. Require the direct request to authorize the supplied temporary branch and draft PR in `markhuangai/agent-remote-dev-codex`. Never merge, force-push, change configuration/credentials, delete another resource, or touch another task. The qualification controller performs separately authorized scoped cleanup.
 
 Read the JSON qualification context in the supplied prompt. Use only its `branch` and `marker` paths. Preserve the explicit job Git identity and authentication environment. Read the current checkout and remote before editing. For a new case, refuse an already existing remote branch, create the specified branch from the current clean checkout, write the marker JSON with `task_id`, `qualification_run_id`, `scenario`, and `phase: 1`, commit that file, push normally, and open a draft PR to `main` with body marker `qualification:<qualification_run_id>:<task_id>`. Keep that URL in the marker and publish the updated marker normally. Do not write secrets into files or output.
 

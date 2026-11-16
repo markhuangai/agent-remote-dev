@@ -82,12 +82,13 @@ async function follow(api, task, root, initialId) {
     invariant(next, 'qualification_child_missing'); id = next.run_id;
   }
 }
-function taskRequest(registry, task, artifactId) {
-  const context = { ...task, qualification_run_id: registry.run_id };
-  const plan = `Use $runner-acceptance for this explicitly authorized smoke case. Follow its workflow; the runner does not implement its phases. Qualification context:\n${JSON.stringify(context)}`;
+export async function taskRequest(registry, task, artifactId) {
+  const context = { ...task, qualification_run_id: registry.run_id, authorization: registry.authorization };
+  const instructions = await readFile(new URL('../../tests/fixtures/qualification.md', import.meta.url), 'utf8');
+  const plan = `${instructions}\n\nQualification context:\n${JSON.stringify(context)}`;
   return { request_id: task.task_id, source_repository: repository, source_sha: registry.source_sha, plan,
     ...(task.published_ref ? { published_ref: task.published_ref } : {}),
-    plan_sha256: digest(plan), project_config: registry.project_config, qualification_artifact_id: artifactId, user_agents_url: null, user_agents_sha256: null, skills: [{ repository, revision: registry.source_sha, names: ['runner-acceptance'] }],
+    plan_sha256: digest(plan), project_config: registry.project_config, qualification_artifact_id: artifactId, user_agents_url: null, user_agents_sha256: null, skills: [],
     runner: task.labels, budget_minutes: 5, max_continuations: 3, auto_continue: task.scenario === 'deadline', git_author_name: registry.author, git_author_email: registry.email };
 }
 async function checkpoint(api, id, root) {
@@ -112,7 +113,7 @@ export async function runTarget(api, registry, targetKey, root, output) {
       const artifacts = await pages(api, `/repos/${repository}/actions/runs/${registry.run_id}/artifacts`, 'artifacts');
       const matches = artifacts.filter(artifact => artifact.name === `linux-qualification-${registry.run_id}-registry`);
       invariant(matches.length === 1, 'qualification_registry_artifact_missing');
-      const request = taskRequest(registry, task, matches[0].id), receipt = await dispatchOnce(api, repository, request, actor);
+      const request = await taskRequest(registry, task, matches[0].id), receipt = await dispatchOnce(api, repository, request, actor);
       task.root_run_id = String(receipt.run_id);
       log('runtime.qualification', 'INFO', { task_id: task.task_id, scenario: task.scenario, runner: task.labels, source_sha: registry.source_sha, root_run_id: receipt.run_id, outcome: 'started' });
       let finished;

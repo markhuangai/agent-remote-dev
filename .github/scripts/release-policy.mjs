@@ -103,7 +103,7 @@ export async function verifyPublishedSmoke(api, repository, qualificationRun, re
     validatePublishedInvocation(values.run.invocation, registry.action);
     invariant(same(values.run.invocation, index === 0 ? smoke.invocation_before : smoke.invocation_after) && values.run.execution.request_id === task.task_id &&
       values.run.execution.published_ref === task.published_ref && values.run.execution.auto_continue === false && same(values.run.execution.runner, task.labels) &&
-      same(values.run.execution.project_config, registry.project_config) && same(values.run.skills, [{ repository, revision: registry.source_sha, names: ['runner-acceptance'] }]) &&
+      same(values.run.execution.project_config, registry.project_config) && same(values.run.skills, []) &&
       values.run.execution.source_sha === registry.source_sha && values.run.execution.source_repository === repository && values.run.execution.continuation_count === index &&
       values.run.execution.root_run_id === String(smoke.root_run_id) && values.run.execution.root_run_attempt === '1' &&
       values.run.execution.activation_run_id === String(id) && values.run.execution.activation_run_attempt === '1' &&

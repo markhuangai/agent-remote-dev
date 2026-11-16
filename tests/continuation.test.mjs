@@ -250,16 +250,18 @@ test('qualification overrides require the actual trusted registry artifact and e
   const registry = { repository: repo, run_id: '170', source_sha: sourceSha, author: 'Fixture Author', email: 'fixture@example.invalid', tasks: [task] };
   f.model.runs.set(170, { ...f.model.parent, id: 170, path: '.github/workflows/runner-acceptance.yml' });
   f.addArtifact(180, 'linux-qualification-170-registry', await zipEntries(f, 'qualification-registry', [{ name: 'record.json', text: json(registry) }]), 170);
-  const plan = 'Use the selected fixture skill.';
+  const plan = 'Execute the supplied qualification scenario.';
   const request = { request_id: task.task_id, source_repository: repo, source_sha: sourceSha, plan, plan_sha256: hash(plan), qualification_artifact_id: 180,
     project_config: { revision: sourceSha, content, sha256: hash(content) }, runner: task.labels, budget_minutes: 5, max_continuations: 3, auto_continue: false,
     git_author_name: registry.author, git_author_email: registry.email, user_agents_url: null, user_agents_sha256: null,
-    skills: [{ repository: repo, revision: sourceSha, names: ['runner-acceptance'] }] };
+    skills: [] };
   const context = { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' };
   const env = { ...f.env, GITHUB_RUN_ID: '200', GITHUB_JOB: 'qualification', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request) };
   assert.equal((await prepareTaskRequest({ github: f.github, context, core: f.core, env })).task_id, '200');
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
     env: { ...env, GITHUB_JOB: 'altered-qualification', TASK_REQUEST: registered({ ...request, runner: ['self-hosted', 'Linux'] }) } }), /qualification_settings_mismatch/);
+  await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
+    env: { ...env, GITHUB_JOB: 'injected-skill', TASK_REQUEST: registered({ ...request, skills: [{ repository: repo, revision: sourceSha, names: ['injected'] }] }) } }), /qualification_settings_mismatch/);
   f.model.runs.get(170).path = '.github/workflows/unrelated.yml';
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
     env: { ...env, GITHUB_JOB: 'untrusted-qualification' } }), /untrusted_parent_run/);

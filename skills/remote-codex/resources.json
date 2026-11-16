@@ -5,7 +5,7 @@
     "agents/openai.yaml": "1615f33ebdaeb1eafa0d737e42187724ae60d920e0f9684970ab6bf6e412491c",
     "assets/runner-task.yml": "87230a292aad949e09c86f99086be1fd31c7a51432894ed27da5c7d936e4a4a8",
     "dist/archive.py": "c855a4998d375a791e24ce41ce8c6ff609eb6910b52bc8cff0dec849738d1a51",
-    "dist/client.mjs": "193971ab6592b563784e34b00dfb91cbc65c81d352e0253df904a826b090e55e",
+    "dist/client.mjs": "c43c8d49a3a8edc32440dcd8055df0e2c6098e2fd1b44396cf39fe485e8a4e7c",
     "dist/yaml-licenses.txt": "d2c9e9d55943211169386c4ad4bf87b6ee97d835927e3bb230d584b0c7a377cc",
     "dist/yaml.cjs": "6ee5b3ce4d03e0d7ccc76c815334489e8a98703e0790f7e2f4e3ffdcde69d676",
     "references/usage.md": "ec913473db16358ed6a8b3892e7e5045fa1f84e5a5db905d9a2bffd7e633b604",

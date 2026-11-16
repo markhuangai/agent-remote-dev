@@ -7,7 +7,7 @@ import test from 'node:test';
 import { parse } from 'yaml';
 import { exportCheckpoint } from '../.build/checkpoint.js';
 import { checkpointName, digest, recordName } from '../.github/remote-codex/checkpoint-policy.mjs';
-import { registryFor } from '../.github/scripts/qualification.mjs';
+import { registryFor, taskRequest } from '../.github/scripts/qualification.mjs';
 import { qualificationCases, qualificationReceipt } from '../.github/scripts/release-policy.mjs';
 import { exec, execution, fixture, projectConfig, root } from './helpers.mjs';
 
@@ -39,7 +39,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
   const proofs = [];
   for (const [targetIndex, target] of registry.targets.entries()) {
     const job = await fixture(t), task = registry.published_tasks.find(task => task.target === target.key), initialId = 201 + targetIndex * 100, finalId = initialId + 1;
-    const session = randomUUID(), plan = `Use $runner-acceptance.\n${JSON.stringify(task)}`;
+    const session = randomUUID(), prepared = await taskRequest(registry, task, 1), plan = prepared.plan;
     await mkdir(join(job.job.codexHome, 'sessions')); await writeFile(join(job.job.codexHome, 'sessions', 'rollout.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: session } }) + '\n');
     const proof = { schema_version: 3, repository, source_sha: sourceSha, run_id: '100', target: target.key, passed: true,
       cases: qualificationCases.map((scenario, index) => ({ scenario, source_sha: sourceSha, passed: true, root_run_id: 50 + index, run_ids: [50 + index], session_before: session, session_after: session,
@@ -56,7 +56,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
       const settings = execution({ request_id: task.task_id, project_config: registry.project_config, source_repository: repository, source_sha: sourceSha, runner: target.labels, auto_continue: false,
         root_run_id: String(initialId), activation_run_id: String(id), continuation_count: index, parent_run_id: index === 0 ? null : String(initialId), parent_run_attempt: index === 0 ? null : '1', published_ref: 'v1-prerelease' });
       const request = { schema_version: 3, repository, task_id: String(initialId), plan_sha256: digest(plan), authorization: { repository, plan_sha256: digest(plan), request: plan },
-        execution: settings, lineage, plan_source: 'inline', skills: [{ repository, revision: sourceSha, names: ['runner-acceptance'] }], invocation: { ...registry.action, kind: 'published' }, resume_artifact_id: previous?.artifact_id ?? null };
+        execution: settings, lineage, plan_source: 'inline', skills: prepared.skills, invocation: { ...registry.action, kind: 'published' }, resume_artifact_id: previous?.artifact_id ?? null };
       await record(id + 1000, recordName('run', String(initialId), id, 1), request, id);
       const input = { repository, task_id: String(initialId), branch: task.branch, base_sha: workflowSha, checkpoint_sha: (index === 0 ? 'c' : 'd').repeat(40), plan, plan_source: 'inline', authorization: request.authorization,
         session_id: session, sessions: [session], skills: request.skills, user_agents: null, lineage, execution: settings, previous };
@@ -98,10 +98,13 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
 test('promotion verifies actual published fresh/resume runs, record producers and native checkpoints for both runner families', async t => {
   const f = await publishedFixture(t), receipt = await f.verify();
   assert.equal(receipt.published_smoke.length, 2); assert.deepEqual(receipt.published_smoke[0].run_ids, [201, 202]);
+  assert.deepEqual(f.records.get(1201).skills, []);
+  assert.equal(f.records.get(1201).plan_sha256, digest(f.manifests.get(501).manifest.plan));
+  assert.ok(f.manifests.get(501).manifest.plan.startsWith(await readFile(join(root, 'tests/fixtures/qualification.md'), 'utf8')));
   assert.ok(f.calls.some(call => call.path.endsWith('/actions/runs/202/attempts/1')));
 });
 
-for (const variant of ['registry_only', 'checkout', 'release', 'outcome', 'producer', 'attempt', 'workflow', 'parent', 'config', 'session'])
+for (const variant of ['registry_only', 'checkout', 'release', 'outcome', 'producer', 'attempt', 'workflow', 'parent', 'config', 'skills', 'session'])
   test(`published promotion rejects ${variant} evidence from actual runs and archives`, async t => {
     const f = await publishedFixture(t);
     if (variant === 'registry_only') { delete f.records.get(2).published_smoke; await f.replaceRecord(2); }
@@ -113,6 +116,7 @@ for (const variant of ['registry_only', 'checkout', 'release', 'outcome', 'produ
     if (variant === 'workflow') f.runs.get(201).path = '.github/workflows/runner-task.yml';
     if (variant === 'parent') { f.records.get(1202).execution.parent_run_id = '99'; await f.replaceRecord(1202); }
     if (variant === 'config') { f.records.get(1202).execution.project_config.sha256 = 'f'.repeat(64); await f.replaceRecord(1202); }
+    if (variant === 'skills') { f.records.get(1202).skills = [{ repository: f.repository, revision: f.sourceSha, names: ['injected'] }]; await f.replaceRecord(1202); }
     if (variant === 'session') { f.manifests.get(502).manifest.session_id = randomUUID(); await f.replaceManifest(502); }
     await assert.rejects(f.verify());
     assert.ok(!f.calls.some(call => call.method && call.method !== 'GET'));

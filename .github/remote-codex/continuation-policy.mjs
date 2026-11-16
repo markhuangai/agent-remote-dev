@@ -366,7 +366,7 @@ export async function prepareTaskRequest({ github, context, core, env = process.
             request.source_repository === repository && registry.value.action?.requested_ref === request.published_ref && registry.value.action?.sha === request.source_sha &&
             positiveId(registry.value.action?.release_id) && env.GITHUB_WORKFLOW_REF === `${repository}/${publishedPath}@refs/heads/main`) &&
           request.auto_continue === (task.scenario === 'deadline') && request.git_author_name === registry.value.author && request.git_author_email === registry.value.email &&
-          same(selected, [{ repository, revision: request.source_sha, names: ['runner-acceptance'] }]) && request.user_agents_url === null, 'qualification_settings_mismatch');
+          selected.length === 0 && request.user_agents_url === null, 'qualification_settings_mismatch');
       } else {
         invariant(!request.published_ref, 'published_qualification_required');
         for (const key of ['runner', 'budget_minutes', 'max_continuations', 'auto_continue', 'git_author_name', 'git_author_email', 'user_agents_url'])
