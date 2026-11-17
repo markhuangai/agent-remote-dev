@@ -98,12 +98,24 @@ for (const variant of ['content', 'extra', 'traversal', 'link', 'duplicate', 'mi
     await assert.rejects(readFile(join(f.options.root, 'verified', 'action.tar.gz')), { code: 'ENOENT' });
   });
 
-test('release publisher executes trusted policy only and receives source build output as data', async () => {
+test('release publisher uses trusted sources and verifies build output before publication', async () => {
   const workflow = parse(await readFile(join(root, '.github/workflows/release.yml'), 'utf8'));
   assert.equal(workflow.jobs.build.permissions.contents, 'read');
   assert.equal(workflow.jobs.publish.permissions.contents, 'write');
-  for (const step of workflow.jobs.publish.steps) {
-    assert.equal(step.run, undefined);
+  const steps = workflow.jobs.publish.steps;
+  const checkout = steps.findIndex(step => step.uses?.startsWith('actions/checkout@'));
+  const install = steps.findIndex(step => step.run !== undefined);
+  const policy = steps.findIndex(step => step.with?.script);
+  assert.ok(checkout >= 0 && checkout < install && install < policy);
+  assert.equal(steps.filter(step => step.run !== undefined).length, 1);
+  assert.equal(steps[checkout].with['persist-credentials'], false);
+  for (const step of steps) {
+    if (step.run !== undefined) {
+      assert.equal(step.run, 'npm ci --omit=dev --ignore-scripts --no-audit --no-fund');
+      assert.equal(step['working-directory'] ?? '.', '.');
+      assert.equal(step.env, undefined);
+      continue;
+    }
     if (step.uses.startsWith('actions/checkout@')) assert.equal(step.with.ref, '${{ github.workflow_sha }}');
     else assert.match(step.uses, /^actions\/(?:setup-node|github-script)@[a-f0-9]{40}$/);
   }

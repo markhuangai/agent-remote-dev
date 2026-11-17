@@ -63,9 +63,8 @@ project's dependencies or copy implementation files into their repositories.
 
 The action uses the existing checkout and job runner. An action cannot select
 an already allocated runner; set `runs-on` in the job. The optional
-[reusable workflow](.github/workflows/remote-codex.yml) reads configured runner
-labels before allocating execution. Its single caller also supports the local
-client, cross-run resume, stop and automatic continuation described below.
+[reusable workflow](.github/workflows/remote-codex.yml) accepts runner labels from
+its caller workflow and supports task-wide stop and automatic continuation.
 
 The action uses the package selected by `uses:`. Build and release checks verify
 that committed bundles match source; execution does not download a second
@@ -222,7 +221,7 @@ skill has no generated code or package inventory.
 
 ## Runners, credentials and trust
 
-Execution is Linux x64/arm64 with Node 24, Git, npm, GitHub CLI and Python 3.12+.
+Execution is Linux x64/arm64 with Node 24, Git 2.36+, npm, GitHub CLI and Python 3.12+.
 Set `jobs.<job>.runs-on` in the consumer workflow, for example `ubuntu-latest`,
 `ubuntu-24.04-arm`, or `[self-hosted, Linux, ARM64]`. The project configuration
 rejects `runner`; it never allocates machines or freezes runner labels in a

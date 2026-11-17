@@ -1,10 +1,45 @@
 import assert from 'node:assert/strict';
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { parse } from 'yaml';
 import { exec, fixture, root } from './helpers.mjs';
 const provider = 'markhuangai/agent-remote-dev-codex', sourceSha = 'b'.repeat(40), revision = 'a'.repeat(40);
+
+test('trusted source-helper jobs install locked packages and load from a clean checkout', async t => {
+  let command;
+  for (const name of ['runner-task', 'runner-continuation', 'runner-published', 'runner-acceptance', 'release']) {
+    const workflow = parse(await readFile(join(root, `.github/workflows/${name}.yml`), 'utf8'));
+    for (const job of Object.values(workflow.jobs)) {
+      const sourceIndex = job.steps.findIndex(step => /src\/platform\/|\.github\/scripts\/(?:qualification|release-policy)/.test(step.run ?? step.with?.script ?? ''));
+      if (sourceIndex < 0) continue;
+      const installIndex = job.steps.findIndex(step => step.run?.startsWith('npm ci '));
+      assert.ok(installIndex >= 0 && installIndex < sourceIndex, `${name} must install before importing source helpers`);
+      const install = job.steps[installIndex], source = job.steps[sourceIndex].run ?? job.steps[sourceIndex].with.script;
+      assert.equal(install['working-directory'] ?? '.', source.includes('/trusted/src/') ? 'trusted' : '.');
+      assert.ok(install.run.includes('--ignore-scripts')); assert.ok(install.run.includes('--omit=dev'));
+      command ??= install.run;
+    }
+  }
+  const f = await fixture(t), checkout = join(f.temporary, 'clean-source');
+  await mkdir(join(checkout, 'src'), { recursive: true });
+  await mkdir(join(checkout, '.github'), { recursive: true });
+  for (const name of ['package.json', 'package-lock.json']) await cp(join(root, name), join(checkout, name));
+  await cp(join(root, 'src/platform'), join(checkout, 'src/platform'), { recursive: true });
+  await cp(join(root, '.github/scripts'), join(checkout, '.github/scripts'), { recursive: true });
+  await assert.rejects(readFile(join(checkout, 'node_modules/yaml/package.json')), { code: 'ENOENT' });
+  const [executable, ...args] = command.trim().split(/\s+/);
+  await exec(executable, args, { cwd: checkout, env: f.job.env, timeout: 120000 });
+  const metadata = JSON.parse(await readFile(join(checkout, 'node_modules/yaml/package.json'), 'utf8'));
+  assert.equal(metadata.version, JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).dependencies.yaml);
+  const modules = ['src/platform/continuation-policy.mjs', '.github/scripts/release-policy.mjs', '.github/scripts/qualification.mjs'];
+  const imports = modules.map(path => `await import(${JSON.stringify(pathToFileURL(join(checkout, path)).href)});`).join('\n');
+  const script = imports + '\nconsole.log(import.meta.resolve("yaml"));';
+  const loaded = await exec(process.execPath, ['--input-type=module', '-e', script], { cwd: checkout, env: f.job.env });
+  assert.ok(loaded.stdout.trim().startsWith(pathToFileURL(join(checkout, 'node_modules/yaml/')).href));
+});
+
 for (const variant of ['valid', 'missing', 'duplicate', 'sha', 'head', 'repository', 'attempt', 'event'])
   test(`actual reusable workflow bootstrap ${variant} publishes only a verified provider revision`, async () => {
     const workflow = parse(await readFile(join(root, '.github/workflows/remote-codex.yml'), 'utf8'));
@@ -37,7 +72,7 @@ for (const variant of ['valid', 'missing', 'duplicate', 'sha', 'head', 'reposito
 test('the built workflow helper executes outside the source checkout and reports a rejected operator safely', async t => {
   const f = await fixture(t), bundled = join(f.temporary, 'bundle'), bin = join(f.temporary, 'bin'), event = join(f.temporary, 'event.json'), outputs = join(f.temporary, 'outputs');
   await mkdir(bundled); await mkdir(bin); await writeFile(event, '{}'); await writeFile(outputs, '');
-  for (const name of ['control.mjs', 'yaml.cjs', 'archive.py']) await cp(join(root, 'dist', name), join(bundled, name));
+  for (const name of ['control.mjs', 'archive.py']) await cp(join(root, 'dist', name), join(bundled, name));
   await writeFile(join(bin, 'gh'), `#!/usr/bin/env node
 const path=process.argv[3];let data;
 if(path.endsWith('/git/ref/heads/main'))data={object:{sha:'a'.repeat(40)}};

@@ -138,10 +138,11 @@ for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_m
   test(`actual release authorization script ${variant} emits a validated build source without qualification receipts`, async t => {
     const f = await publishedFixture(t), workflow = parse(await readFile(join(root, '.github/workflows/release.yml'), 'utf8'));
     const gate = workflow.jobs.authorize.steps.find(step => step.id === 'gate');
-    assert.equal(workflow.jobs.authorize.outputs.source_sha, '${{ steps.gate.outputs.source }}');
+    assert.equal(workflow.jobs.authorize.outputs, undefined);
+    assert.equal(workflow.env.SOURCE_SHA, '${{ github.workflow_sha }}');
+    assert.deepEqual(Object.keys(workflow.on.workflow_dispatch.inputs), ['version']);
     assert.equal(workflow.jobs.build.needs, 'authorize');
-    assert.equal(workflow.jobs.build.steps.find(step => step.name === 'Checkout exact source').with.ref, '${{ needs.authorize.outputs.source_sha }}');
-    assert.equal(workflow.jobs.build.env.SOURCE_SHA, '${{ needs.authorize.outputs.source_sha }}');
+    assert.equal(workflow.jobs.build.steps.find(step => step.name === 'Checkout exact source').with.ref, '${{ github.workflow_sha }}');
     f.registry.source_sha = 'e'.repeat(40); await f.replaceRecord(1);
     const sourceRuns = [
       { id: 801, path: '.github/workflows/ci.yml', names: ['CI', 'Runtime (linux-arm64)'] },
@@ -185,7 +186,7 @@ for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_m
       const github = { request: async (route, options) => ({ data: await api(route.replace(/^[A-Z]+ /, ''), options) }) };
       const invoke = () => new (Object.getPrototypeOf(async function () {}).constructor)('require', 'github', 'context', 'core', gate.with.script)(createRequire(import.meta.url), github, context, core);
       if (variant === 'qualified') {
-        await invoke(); assert.deepEqual([...outputs], [['source', f.sourceSha]]);
+        await invoke(); assert.deepEqual([...outputs], []);
         assert.ok(records.some(record => record.event === 'release.verify' && record.outcome === 'verified' && record.source_sha === f.sourceSha));
       } else {
         const reason = ({ actor: 'untrusted_task_actor', maintainer: 'release_maintainer_required', unmerged: 'release_source_not_merged', source_mismatch: 'invalid_release_source',

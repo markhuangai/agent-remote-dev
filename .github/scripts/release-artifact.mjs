@@ -36,7 +36,7 @@ export async function verifyReleaseArtifact({ api, plan, artifactId, artifactDig
       invariant(entry.type === 'blob' && ['100644', '100755'].includes(entry.mode) && shaPattern.test(entry.sha) && Number.isSafeInteger(entry.size) && entry.size >= 0, 'unsupported_release_source_entry');
       expected[action ? 'action.tar.gz' : 'remote-codex.tar.gz'][action ? entry.path : entry.path.slice('skills/'.length)] = { sha: entry.sha, size: entry.size, mode: entry.mode };
     }
-    for (const [asset, required] of [['action.tar.gz', ['action.yml', 'package.json', 'package-lock.json', 'dist/index.js', 'dist/package.json', 'dist/archive.py', 'dist/supervise.py', 'dist/yaml.cjs', 'dist/yaml-licenses.txt']],
+    for (const [asset, required] of [['action.tar.gz', ['action.yml', 'package.json', 'package-lock.json', 'dist/index.js', 'dist/package.json', 'dist/archive.py', 'dist/supervise.py']],
       ['remote-codex.tar.gz', ['remote-codex/SKILL.md']]])
       invariant(required.every(path => expected[asset][path]) && Object.keys(expected[asset]).length <= 10000, 'incomplete_release_source');
     await mkdir(root, { recursive: true, mode: 0o700 });

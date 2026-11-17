@@ -1,9 +1,7 @@
-import { createRequire } from 'node:module';
+import { parseDocument } from 'yaml';
 import { digest, instructionURL, invariant, shaPattern } from './checkpoint-policy.mjs';
 import { fetchInstructions } from './instructions.mjs';
 import { resolveSkills } from './sources.mjs';
-
-const parseDocument = createRequire(import.meta.url)('./yaml.cjs');
 
 export const configPath = 'remote-codex.yml';
 export function parseProjectConfig(text) {
