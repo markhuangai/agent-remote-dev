@@ -1,12 +1,14 @@
-name: Codex published v1
-run-name: ${{ inputs.resume-run-id && format('Codex resume {0}', inputs.resume-run-id) || (inputs.qualification-id && format('Codex qualification {0}', inputs.qualification-id)) || 'Codex task' }}
+name: Test published Codex workflow
+run-name: ${{ format('Test published Codex ({0})', inputs.channel) }}
 
 on:
   workflow_dispatch:
     inputs:
-      qualification-id:
-        description: Optional correlation label for explicitly authorized live qualification
-        type: string
+      channel:
+        description: Published workflow channel to test
+        type: choice
+        options: [stable, prerelease]
+        default: stable
       plan:
         description: Refined plan or new context for a resumed conversation
         type: string
@@ -27,8 +29,22 @@ permissions:
   actions: write
 
 jobs:
-  run:
+  stable:
+    if: inputs.channel == 'stable'
     uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1
+    with:
+      plan: ${{ inputs.plan }}
+      resume-run-id: ${{ inputs.resume-run-id }}
+      runs-on: ${{ inputs.runs-on }}
+      timeout-minutes: ${{ inputs.timeout-minutes }}
+    secrets:
+      codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
+      codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      github-token: ${{ secrets.REMOTE_DEV_PAT }}
+
+  prerelease:
+    if: inputs.channel == 'prerelease'
+    uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1-prerelease
     with:
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}

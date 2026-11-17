@@ -69,7 +69,7 @@ export async function prepareExecution({ api, repository, runId, attempt, actor,
     auto_count: autoCount, operator, lineage: { run_id: String(runId), run_attempt: String(attempt), workflow_id: run.workflow_id,
       workflow_path: run.path, workflow_sha: run.head_sha, branch: config.branch }, restored };
 }
-export async function recoverExecution({ api, repository, runId, attempt, root, core, inputs }) {
+export async function recoverExecution({ api, repository, runId, attempt, root, core }) {
   const stop = reason => { logEvent(core, 'continuation.dispatch', 'INFO', { reason, outcome: 'stopped' }); return { dispatched: false, reason }; };
   if (Number(attempt) !== 1) return stop('automatic_rerun_refused');
   const run = await api(`/repos/${repository}/actions/runs/${runId}`);
@@ -86,7 +86,7 @@ export async function recoverExecution({ api, repository, runId, attempt, root, 
   invariant(nativeTimedOut(latestJob) && latestJob.id === job.id, 'parent_execution_changed');
   // Dispatch once per parent attempt; an uncertain response is never retried automatically.
   await api(`/repos/${repository}/actions/workflows/${run.workflow_id}/dispatches`, { method: 'POST', ref: config.branch,
-    inputs: { 'resume-run-id': String(runId), plan: '', 'runs-on': inputs['runs-on'], 'timeout-minutes': String(inputs['timeout-minutes']) } });
+    inputs: { 'resume-run-id': String(runId), plan: '' } });
   logEvent(core, 'continuation.dispatch', 'INFO', { parent_run_id: runId, parent_attempt: attempt, workflow_id: run.workflow_id,
     artifact_id: loaded.artifact.id, continuation_count: manifest.auto_count + 1, outcome: 'requested' });
   return { dispatched: true };

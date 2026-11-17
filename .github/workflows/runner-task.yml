@@ -1,26 +1,15 @@
 name: Codex task runner
-run-name: ${{ inputs.resume-run-id && format('Codex resume {0}', inputs.resume-run-id) || (inputs.qualification-id && format('Codex qualification {0}', inputs.qualification-id)) || 'Codex task' }}
+run-name: ${{ inputs.resume-run-id && format('Codex resume {0}', inputs.resume-run-id) || 'Codex task' }}
 
 on:
   workflow_dispatch:
     inputs:
-      qualification-id:
-        description: Optional correlation label for explicitly authorized live qualification
-        type: string
       plan:
         description: Refined plan or new context for a resumed conversation
         type: string
       resume-run-id:
         description: Prior run containing the conversation
         type: string
-      runs-on:
-        description: JSON array of Linux runner labels
-        type: string
-        default: '["ubuntu-latest"]'
-      timeout-minutes:
-        description: GitHub job timeout in minutes
-        type: number
-        default: 360
 
 permissions:
   contents: read
@@ -32,7 +21,7 @@ jobs:
     with:
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
-      runs-on: ${{ inputs.runs-on }}
+      runs-on: '["ubuntu-latest"]'
       timeout-minutes: 360
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}

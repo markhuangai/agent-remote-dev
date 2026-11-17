@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { latestJobs, publishRelease, releaseVersion } from '../.github/scripts/release-policy.mjs';
-import { registryFor, qualificationCases } from '../.github/scripts/qualification.mjs';
 test('release channels accept immutable versions and major channels and inspect latest child attempts including partial reruns', () => {
   assert.equal(releaseVersion('v1.0.0-rc.0').alias, 'v1-prerelease'); assert.equal(releaseVersion('v1.0.0').alias, 'v1');
   assert.equal(releaseVersion('v2.3.4').alias, 'v2'); assert.equal(releaseVersion('v3.0.0-rc.1').alias, 'v3-prerelease');
@@ -35,29 +34,4 @@ test('concurrent alias changes preserve the independently published version and 
   const p = publication(); p.refs.set('v1', 'c'.repeat(40));
   await assert.rejects(publishRelease({ api: p.api, plan: p.plan }), { reason: 'release_alias_changed' });
   assert.equal(p.refs.get('v1'), 'c'.repeat(40)); assert.equal(p.refs.get('v1.0.0'), p.source);
-});
-test('qualification still covers both Linux families, all native scenarios and published workflow resume', () => {
-  const value = registryFor({ runId: '100', sourceSha: 'a'.repeat(40), selfHosted: ['self-hosted', 'Linux', 'ARM64'],
-    authorization: 'Run and clean these owned smoke tasks.', actionRef: 'v1-prerelease', nonce: '12345678' });
-  assert.equal(value.targets.length, 2); assert.equal(value.tasks.length, 12);
-  for (const target of value.targets) assert.deepEqual(value.tasks.filter(task => task.target === target.key).map(task => task.scenario), [...qualificationCases, 'published-resume']);
-  assert.equal(value.tasks.find(task => task.scenario === 'published-resume').workflow, 'runner-prerelease.yml');
-  assert.throws(() => registryFor({ runId: '100', sourceSha: 'a'.repeat(40), selfHosted: ['windows-latest'], authorization: 'authorized' }));
-});
-
-test('live qualification rejects false publication, missing phase advancement and invented push rejection', async () => {
-  const { verifyPublication, verifyRejectedPush } = await import('../.github/scripts/qualification.mjs');
-  const task = { id: 'qual-100-hosted-fresh-abcd', branch: 'qualification/qual-100-hosted-fresh-abcd', marker: '.runner-qualification/qual-100-hosted-fresh-abcd.json', scenario: 'fresh' };
-  const marker = { task_id: task.id, qualification_run_id: '100', scenario: 'fresh', phase: 1, pr_url: 'https://github.com/markhuangai/agent-remote-dev-codex/pull/12' };
-  const pull = { head: { ref: task.branch, repo: { full_name: 'markhuangai/agent-remote-dev-codex' } }, draft: true, state: 'open', merged_at: null, body: `qualification:100:${task.id}` };
-  const api = async path => path.includes('/contents/') ? { encoding: 'base64', content: Buffer.from(JSON.stringify(marker)).toString('base64') } : pull;
-  await verifyPublication(api, { run_id: '100' }, task, 1);
-  await assert.rejects(verifyPublication(api, { run_id: '100' }, task, 2), /qualification_marker_identity_mismatch/);
-  pull.draft = false; await assert.rejects(verifyPublication(api, { run_id: '100' }, task, 1), /qualification_pull_identity_mismatch/);
-  const response = { push_rejected: true, cause: 'non-fast-forward', local_sha: 'a'.repeat(40), remote_sha: 'b'.repeat(40) };
-  const manifest = { omitted_work: true, checkpoint_sha: 'c'.repeat(40) }, remote = { object: { sha: response.remote_sha } };
-  verifyRejectedPush(response, manifest, remote);
-  assert.throws(() => verifyRejectedPush({ ...response, push_rejected: false }, manifest, remote));
-  assert.throws(() => verifyRejectedPush(response, { ...manifest, checkpoint_sha: response.local_sha }, remote));
-  assert.throws(() => verifyRejectedPush(response, manifest, { object: { sha: 'd'.repeat(40) } }));
 });
