@@ -22,7 +22,7 @@ export async function uploadSnapshot(job: Job, name: string, files: string[], ro
   const request = join(root, "upload.json"), result = join(root, "receipt.json");
   await writeFile(request, JSON.stringify({ name, files, root, result }), { mode: 0o600 });
   await command(process.execPath, [join(import.meta.dirname, "entry.js"), "--upload", request], {
-    cwd: job.root, env: environment, stage: "artifact_upload", log, timeoutMs: Number(environment.CODEX_UPLOAD_TIMEOUT_MS ?? 45000), collect: false,
+    cwd: job.root, env: environment, stage: "artifact_upload", log, timeoutMs: Number(environment.REMOTE_DEV_UPLOAD_TIMEOUT_MS ?? 45000), collect: false,
   });
   return JSON.parse(await readFile(result, "utf8"));
 }
@@ -53,11 +53,11 @@ export async function saveSnapshot(saved: SavedRun, log: Diagnostics, api: any, 
 export async function watchSnapshots(path: string, options: { intervalMs?: number; api?: any; upload?: typeof uploadSnapshot } = {}) {
   const initial: SavedRun = JSON.parse(await readFile(path, "utf8"));
   const emit = (line: string | Error) => process.stdout.write(String(line) + "\n");
-  const log = new Diagnostics({ repository: initial.metadata.repository, run_id: initial.metadata.lineage.run_id, run_attempt: initial.metadata.lineage.run_attempt, workflow_sha: initial.metadata.lineage.workflow_sha }, { info: emit, warning: emit, error: emit, debug: emit });
+  const log = new Diagnostics({ repository: initial.metadata.repository, runner: initial.job.runner, run_id: initial.metadata.lineage.run_id, run_attempt: initial.metadata.lineage.run_attempt, workflow_sha: initial.metadata.lineage.workflow_sha }, { info: emit, warning: emit, error: emit, debug: emit });
   for (const secret of initial.secrets) log.protect(secret);
   const api = options.api ?? (async (endpoint: string, options: any = {}) => {
     const response = await fetch(`https://api.github.com${endpoint}`, { method: options.method ?? "GET", signal: AbortSignal.timeout(20000),
-      headers: { authorization: `Bearer ${process.env.CODEX_PLATFORM_TOKEN}`, accept: "application/vnd.github+json" } });
+      headers: { authorization: `Bearer ${process.env.REMOTE_DEV_PLATFORM_TOKEN}`, accept: "application/vnd.github+json" } });
     requireValue(response.ok, "snapshot_retention_api_failed", "checkpoint");
     return response.status === 204 ? null : response.json();
   });

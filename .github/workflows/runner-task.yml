@@ -1,9 +1,14 @@
-name: Codex task runner
-run-name: ${{ inputs.resume-run-id && format('Codex resume {0}', inputs.resume-run-id) || 'Codex task' }}
+name: Remote development task runner
+run-name: ${{ inputs.resume-run-id && format('Agent resume {0}', inputs.resume-run-id) || 'Agent task' }}
 
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: Agent runner
+        type: choice
+        options: [codex, claude]
+        default: codex
       plan:
         description: Refined plan or new context for a resumed conversation
         type: string
@@ -17,8 +22,9 @@ permissions:
 
 jobs:
   run:
-    uses: ./.github/workflows/remote-codex.yml
+    uses: ./.github/workflows/remote-dev.yml
     with:
+      runner: ${{ inputs.runner }}
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
       runs-on: '["ubuntu-latest"]'
@@ -26,4 +32,7 @@ jobs:
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
+      claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}

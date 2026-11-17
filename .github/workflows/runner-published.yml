@@ -1,9 +1,14 @@
-name: Test published Codex workflow
-run-name: ${{ format('Test published Codex ({0})', inputs.channel) }}
+name: Test published remote development workflow
+run-name: ${{ format('Test published remote development ({0})', inputs.channel) }}
 
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: Agent runner
+        type: choice
+        options: [codex, claude]
+        default: codex
       channel:
         description: Published workflow channel to test
         type: choice
@@ -31,8 +36,9 @@ permissions:
 jobs:
   stable:
     if: inputs.channel == 'stable'
-    uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1
+    uses: markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1
     with:
+      runner: ${{ inputs.runner }}
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
       runs-on: ${{ inputs.runs-on }}
@@ -40,12 +46,16 @@ jobs:
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
+      claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}
 
   prerelease:
     if: inputs.channel == 'prerelease'
-    uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1-prerelease
+    uses: markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1-prerelease
     with:
+      runner: ${{ inputs.runner }}
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
       runs-on: ${{ inputs.runs-on }}
@@ -53,4 +63,7 @@ jobs:
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
+      claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}

@@ -1,7 +1,7 @@
 import { parseDocument } from 'yaml';
 import { digest, instructionURL, invariant, shaPattern } from './checkpoint-policy.mjs';
 
-export const configPath = '.remote-codex.yml';
+export const configPath = '.remote-dev.yml';
 export function parseProjectConfig(text) {
   invariant(typeof text === 'string' && Buffer.byteLength(text) <= 65536, 'project_config_size_limit');
   let value;
@@ -11,7 +11,7 @@ export function parseProjectConfig(text) {
     value = document.toJS({ maxAliasCount: 0 });
   } catch { invariant(false, 'invalid_project_config'); }
   const object = input => input && typeof input === 'object' && !Array.isArray(input);
-  invariant(object(value) && Object.keys(value).every(key => ['allowed-actors', 'skills', 'user-level-agents.md-url', 'git-author',
+  invariant(object(value) && Object.keys(value).every(key => ['allowed-actors', 'skills', 'user-level-md-url', 'git-author',
     'auto-continue', 'max-continuations'].includes(key)), 'unknown_project_config_key');
   invariant(Array.isArray(value['allowed-actors']) && value['allowed-actors'].length > 0 && value['allowed-actors'].length <= 100 &&
     value['allowed-actors'].every(actor => typeof actor === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(actor)), 'invalid_operator_configuration');
@@ -23,11 +23,11 @@ export function parseProjectConfig(text) {
     Object.keys(source).every(key => ['repository', 'ref', 'names'].includes(key)) && typeof source.repository === 'string' &&
     (source.ref === undefined || typeof source.ref === 'string' && source.ref.trim()) &&
     (source.names === undefined || Array.isArray(source.names) && source.names.length > 0 && source.names.every(name => typeof name === 'string'))), 'invalid_skill_sources');
-  const url = value['user-level-agents.md-url'] ?? null;
-  if (url !== null) { invariant(typeof url === 'string', 'invalid_user_level_agents_md_url'); instructionURL(url); }
+  const url = value['user-level-md-url'] ?? null;
+  if (url !== null) { invariant(typeof url === 'string', 'invalid_user_level_md_url'); instructionURL(url); }
   const limit = value['max-continuations'] ?? 3, automatic = value['auto-continue'] ?? false;
   invariant(Number.isSafeInteger(limit) && limit >= 0 && limit <= 100 && typeof automatic === 'boolean', 'invalid_execution_settings');
-  return { allowed_actors: value['allowed-actors'], skills, user_agents_url: url, git_author_name: author.name, git_author_email: author.email,
+  return { allowed_actors: value['allowed-actors'], skills, user_instructions_url: url, git_author_name: author.name, git_author_email: author.email,
     max_continuations: limit, auto_continue: automatic };
 }
 export async function readProjectConfig(api, repository, revision, expected) {

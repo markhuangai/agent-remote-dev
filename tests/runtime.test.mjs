@@ -15,18 +15,18 @@ import { exec, executionSource, checkpoint, sessionId, fixture, logger, portable
 
 const plan = "Implement the fixture plan.\n";
 async function history(f, content = "completed turn") {
-  await mkdir(join(f.job.codexHome, "sessions"));
+  await mkdir(join(f.job.runnerHome, "sessions"));
   const data = JSON.stringify({ type: "session_meta", payload: { id: sessionId, session_id: sessionId } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
-  await writeFile(join(f.job.codexHome, "sessions/rollout.jsonl"), data);
+  await writeFile(join(f.job.runnerHome, "sessions/rollout.jsonl"), data);
 }
 test("configuration is isolated, rejects invalid TOML, and prevents permission and storage overrides", async (t) => {
   const f = await fixture(t);
   await configure(f.job, 'model="gpt-5.1"\nsandbox_mode="read-only"\nsqlite_home="/outside"\n[model_providers.fixture]\nenv_key="CODEX_API_KEY"\nhttp_headers={authorization="fixture-config-secret-4631"}', f.log);
   for (const [name, content] of Object.entries(f.hostFiles)) assert.equal(await readFile(join(f.host,name),"utf8"), content);
   assert.notEqual(f.job.env.HOME,f.host);assert.notEqual(f.job.env.CODEX_HOME,join(f.host,".codex"));
-  const data = await readFile(join(f.job.codexHome, "config.toml"), "utf8");
+  const data = await readFile(join(f.job.runnerHome, "config.toml"), "utf8");
   assert.doesNotMatch(data, /\/outside|sandbox_mode/);
-  assert.ok(data.includes(f.job.codexHome));
+  assert.ok(data.includes(f.job.runnerHome));
   assert.ok(f.log.protectedValues.includes("fixture-config-secret-4631"));
   assert.ok(!f.log.protectedValues.includes("CODEX_API_KEY"));
   await assert.rejects(configure(f.job, "[invalid", f.log), { reason: "invalid_codex_config" });
@@ -38,7 +38,7 @@ test("actual Skills CLI installs complete pinned portable packages outside proje
   for (const name of executionSource.names) {
     const sourceFiles = await safeTree(join(source, "skills", name));
     for (const path of sourceFiles) {
-      const target = path.replace(join(source,"skills"), join(f.job.codexHome,"skills"));
+      const target = path.replace(join(source,"skills"), join(f.job.runnerHome,"skills"));
       assert.deepEqual(await readFile(target), await readFile(path));
     }
   }
@@ -49,7 +49,7 @@ test("runtime reuses the provider's package-managed Codex without a second insta
   const f = await fixture(t);
   await installTools(f.job, root, f.log);
   assert.equal(f.job.tools, root);
-  assert.equal(f.records.find(record => record.stage === 'codex_version').outcome, 'success');
+  assert.equal(f.records.find(record => record.stage === 'runner_version').outcome, 'success');
 });
 for(const scenario of ["valid","revision","traversal","symlink"]) test(`actual skill source fetch enforces ${scenario} archive/revision decisions`,async(t)=>{
   const f=await fixture(t),archive=join(f.temporary,"source.tar.gz");
@@ -76,12 +76,12 @@ test("safe tree and cleanup refuse export symlinks and never follow cleanup link
 
 test("checkpoint exports exact session state and consistent SQLite backups, excluding secrets and caches", async (t) => {
   const f = await fixture(t); await history(f);
-  const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(join(f.job.runnerHome, "state_5.sqlite"));
   db.exec("PRAGMA journal_mode=WAL; CREATE TABLE progress (value TEXT); INSERT INTO progress VALUES ('durable'); CREATE TABLE threads (id TEXT, rollout_path TEXT);");
-  db.prepare("INSERT INTO threads VALUES (?, ?)").run(sessionId, join(f.job.codexHome, "sessions/rollout.jsonl"));
-  await writeFile(join(f.job.codexHome, "auth.json"), f.job.env.CODEX_API_KEY);
-  await writeFile(join(f.job.codexHome, "config.toml"), f.job.env.CODEX_API_KEY);
-  await mkdir(join(f.job.codexHome, "cache")); await writeFile(join(f.job.codexHome, "cache/code.txt"), "excluded source");
+  db.prepare("INSERT INTO threads VALUES (?, ?)").run(sessionId, join(f.job.runnerHome, "sessions/rollout.jsonl"));
+  await writeFile(join(f.job.runnerHome, "auth.json"), f.job.env.CODEX_API_KEY);
+  await writeFile(join(f.job.runnerHome, "config.toml"), f.job.env.CODEX_API_KEY);
+  await mkdir(join(f.job.runnerHome, "cache")); await writeFile(join(f.job.runnerHome, "cache/code.txt"), "excluded source");
   const output = await exportCheckpoint(f.job, checkpoint(), f.log);
   assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
   assert.equal(db.prepare("SELECT value FROM progress").get().value, "durable");
@@ -89,7 +89,7 @@ test("checkpoint exports exact session state and consistent SQLite backups, excl
   const saved = new DatabaseSync(join(output.root, "codex/state_5.sqlite"), { readOnly: true });
   assert.equal(saved.prepare("SELECT value FROM progress").get().value, "durable"); saved.close();
   const manifest = JSON.parse(await readFile(join(output.root, "manifest.json"), "utf8"));
-  assert.equal(manifest.codex_version, JSON.parse(await readFile(join(root, 'package.json'))).dependencies['@openai/codex']);
+  assert.equal(manifest.runner_version, JSON.parse(await readFile(join(root, 'package.json'))).dependencies['@openai/codex']);
   assert.equal(manifest.session_id, sessionId); assert.ok(!('authorization' in manifest));
   assert.ok(manifest.files.every((entry) => !/auth|config|cache|\.git/.test(entry.path)));
   assert.ok(output.files.every((file) => !/-(wal|shm)$/.test(file)));
@@ -97,7 +97,7 @@ test("checkpoint exports exact session state and consistent SQLite backups, excl
 for (const compressed of [false, true]) test(`credential exclusion scans ${compressed ? "compressed" : "plain"} real conversation content`, async (t) => {
   const f = await fixture(t); await history(f, f.job.env.CODEX_API_KEY);
   if (compressed) {
-    const path = join(f.job.codexHome, "sessions/rollout.jsonl");
+    const path = join(f.job.runnerHome, "sessions/rollout.jsonl");
     await writeFile(path + ".zst", zstdCompressSync(await readFile(path)));
     const { unlink } = await import("node:fs/promises"); await unlink(path);
   }
@@ -107,7 +107,7 @@ for (const storage of ["TEXT", "BLOB"]) test("checkpoint rejects a credential re
   const f = await fixture(t); await history(f);
   const secret = "fixture-sqlite-credential-" + "x".repeat(1500) + "-9371";
   f.log.protect(secret);
-  const path = join(f.job.codexHome, "state_5.sqlite"), db = new DatabaseSync(path);
+  const path = join(f.job.runnerHome, "state_5.sqlite"), db = new DatabaseSync(path);
   db.exec("PRAGMA page_size=512; CREATE TABLE protected_value (value " + storage + ");");
   db.prepare("INSERT INTO protected_value VALUES (?)").run(storage === "TEXT" ? secret : Buffer.from(secret));
   assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
@@ -127,7 +127,7 @@ for (const compressed of [false, true]) test("checkpoint decodes escaped credent
   const f = await fixture(t), secret = 'fixture-"escaped\\credential\n9371';
   await configure(f.job, "[mcp_servers.fixture.env]\nPASSWORD=" + JSON.stringify(secret) + "\n", f.log);
   await history(f, secret);
-  const path = join(f.job.codexHome, "sessions/rollout.jsonl"), data = await readFile(path);
+  const path = join(f.job.runnerHome, "sessions/rollout.jsonl"), data = await readFile(path);
   assert.equal(data.includes(Buffer.from(secret)), false);
   if (compressed) { await writeFile(path + ".zst", zstdCompressSync(data)); await unlink(path); }
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
@@ -164,7 +164,7 @@ for (const [scheme, header, provider, encoding] of [["Bearer", "authorization", 
     assert.ok(f.log.protectedValues.includes(value));
     await history(f, storage === "JSONL" ? content : "Completed fixture turn");
     if (storage === "SQLite") {
-      const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
+      const db = new DatabaseSync(join(f.job.runnerHome, "state_5.sqlite"));
       try { db.exec("CREATE TABLE tool_error (value TEXT)"); db.prepare("INSERT INTO tool_error VALUES (?)").run(content); }
       finally { db.close(); }
     }
@@ -184,7 +184,7 @@ test("non-secret environment flags permit export while configured MCP credential
   assert.ok(!f.log.protectedValues.includes("1"));assert.ok(f.log.protectedValues.includes(secret));
   await history(f,"Ordinary completed turn 1");
   await exportCheckpoint(f.job,checkpoint(),f.log);
-  const path=join(f.job.codexHome,"sessions/rollout.jsonl");
+  const path=join(f.job.runnerHome,"sessions/rollout.jsonl");
   await writeFile(path,await readFile(path,"utf8")+JSON.stringify({type:"response_item",payload:{text:secret}})+"\n");
   await assert.rejects(exportCheckpoint(f.job,checkpoint({previous:{sequence:1,artifact_id:4,checkpoint_sha:"a".repeat(40)}}),f.log),{reason:"credential_in_checkpoint"});
 });
@@ -248,7 +248,7 @@ test("a stalled actual artifact SDK upload is bounded and keeps staged session d
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
   const token = 'e30.' + Buffer.from(JSON.stringify({ scp: 'Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222' })).toString('base64url') + '.fixture';
   await assert.rejects(uploadSnapshot(f.job, exported.name, exported.files, exported.root, f.log,
-    { ...process.env, ACTIONS_RUNTIME_TOKEN: token, ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, NO_PROXY: '127.0.0.1,localhost', GITHUB_WORKSPACE: f.temporary, CODEX_UPLOAD_TIMEOUT_MS: '1500' }), { reason: 'command_timeout' });
+    { ...process.env, ACTIONS_RUNTIME_TOKEN: token, ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, NO_PROXY: '127.0.0.1,localhost', GITHUB_WORKSPACE: f.temporary, REMOTE_DEV_UPLOAD_TIMEOUT_MS: '1500' }), { reason: 'command_timeout' });
   assert.ok(requests > 0); assert.ok(await readFile(join(exported.root, 'manifest.json')));
 });
 for (const variant of ['escaped', 'unicode', 'nested']) test(`result credential checks decode ${variant} JSON before transport`, async t => {
@@ -352,11 +352,11 @@ test('an upload finalized remotely with a lost receipt does not poison later sna
 for (const variant of ['duplicate', 'missing-reference']) test(`staged ${variant} history cannot replace a completed snapshot`, async t => {
   const f = await fixture(t); await history(f); let uploads = 0;
   const previous = await durableCheckpoint(f.job, checkpoint(), f.log, async () => ({ id: ++uploads }));
-  if (variant === 'duplicate') await cp(join(f.job.codexHome, 'sessions/rollout.jsonl'), join(f.job.codexHome, 'sessions/duplicate.jsonl'));
+  if (variant === 'duplicate') await cp(join(f.job.runnerHome, 'sessions/rollout.jsonl'), join(f.job.runnerHome, 'sessions/duplicate.jsonl'));
   else {
-    const db = new DatabaseSync(join(f.job.codexHome, 'state_5.sqlite'));
+    const db = new DatabaseSync(join(f.job.runnerHome, 'state_5.sqlite'));
     db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT)');
-    db.prepare('INSERT INTO threads VALUES (?, ?)').run(sessionId, join(f.job.codexHome, 'sessions/missing.jsonl')); db.close();
+    db.prepare('INSERT INTO threads VALUES (?, ?)').run(sessionId, join(f.job.runnerHome, 'sessions/missing.jsonl')); db.close();
   }
   await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => ({ id: ++uploads })),
     { reason: variant === 'duplicate' ? 'duplicate_session_history' : 'missing_rollout_reference' });

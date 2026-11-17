@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
-export const checkpointSchema = 4;
+const dependencies = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).dependencies;
+const runnerVersions = { codex: dependencies['@openai/codex'], claude: dependencies['@anthropic-ai/claude-agent-sdk'] };
+
+export const checkpointSchema = 5;
 export const checkpointBytes = 256 * 1024 * 1024;
 export const instructionBytes = 64 * 1024;
 export const databases = ['state_5.sqlite', 'thread_history_1.sqlite', 'goals_1.sqlite', 'queue_1.sqlite', 'memories_1.sqlite', 'memories_v2_1.sqlite'];
@@ -36,16 +40,16 @@ export function runnerLabels(value = ['ubuntu-latest']) {
 }
 export function instructionURL(value) {
   let url;
-  try { url = new URL(value); } catch { invariant(false, 'invalid_user_agents_url'); }
-  invariant(url.protocol === 'https:' && !url.username && !url.password && !url.hash && url.hostname && value.length <= 2048, 'invalid_user_agents_url');
+  try { url = new URL(value); } catch { invariant(false, 'invalid_user_instructions_url'); }
+  invariant(url.protocol === 'https:' && !url.username && !url.password && !url.hash && url.hostname && value.length <= 2048, 'invalid_user_instructions_url');
   return value;
 }
 export function instructions(value) {
   if (value === null) return null;
-  invariant(object(value) && Object.keys(value).sort().join() === 'content,sha256,url', 'invalid_user_agents');
+  invariant(object(value) && Object.keys(value).sort().join() === 'content,sha256,url', 'invalid_user_instructions');
   instructionURL(value.url);
   invariant(hashPattern.test(value.sha256) && typeof value.content === 'string' && value.content.trim() && Buffer.byteLength(value.content) <= instructionBytes &&
-    !value.content.includes('\0') && digest(value.content) === value.sha256, 'user_agents_hash_mismatch', value.sha256, typeof value.content === 'string' ? digest(value.content) : null);
+    !value.content.includes('\0') && digest(value.content) === value.sha256, 'user_instructions_hash_mismatch', value.sha256, typeof value.content === 'string' ? digest(value.content) : null);
   return value;
 }
 export function validBranch(value) {
@@ -53,22 +57,31 @@ export function validBranch(value) {
     !/[\x00-\x20\x7f~^:?*\[\\]/.test(value) && !value.includes('..') && !value.includes('@{') &&
     value.split('/').every(part => part && !part.startsWith('.') && !part.endsWith('.') && !part.endsWith('.lock')) && !value.startsWith('-');
 }
-export function checkpointName(value) { return `codex-session-r${value.lineage.run_id}-a${value.lineage.run_attempt}-${value.sequence}`; }
-export function validateManifest(value, { repository, codexVersion } = {}) {
+export function checkpointName(value) { return `remote-dev-session-r${value.lineage.run_id}-a${value.lineage.run_attempt}-${value.sequence}`; }
+export function allowedStatePath(runner, path) {
+  if (typeof path !== 'string' || path.length > 512 || path.includes('\\') || path.includes(':') ||
+      path.split('/').some(part => !part || part === '.' || part === '..')) return false;
+  if (runner === 'codex') return /^codex\/(?:sessions|archived_sessions)\/.+\.jsonl(?:\.zst)?$/.test(path) || databases.some(name => path === `codex/${name}`);
+  if (runner !== 'claude') return false;
+  return /^claude\/projects\/[A-Za-z0-9_-]+\/[a-f0-9-]{36}\.jsonl$/.test(path) ||
+    /^claude\/projects\/[A-Za-z0-9_-]+\/[a-f0-9-]{36}\/(?:subagents\/agent-[A-Za-z0-9_-]+\.(?:jsonl|meta\.json)|(?:tool-results|mcp-tasks)\/.+)$/.test(path) ||
+    /^claude\/projects\/[A-Za-z0-9_-]+\/memory\/.+\.md$/.test(path) ||
+    /^claude\/(?:tasks\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\.json|agent-memory\/[A-Za-z0-9_-]+\/.+\.md)$/.test(path);
+}
+export function validateManifest(value, { repository, runner, runnerVersion } = {}) {
   invariant(value?.schema_version === checkpointSchema, 'unsupported_checkpoint_schema');
   invariant(value.repository === repository && repositoryPattern.test(repository), 'checkpoint_repository_mismatch');
   invariant(validBranch(value.branch) && shaPattern.test(value.checkpoint_sha) && typeof value.omitted_work === 'boolean', 'invalid_checkpoint_git_identity');
   invariant(typeof value.session_id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.session_id), 'invalid_session_identity');
-  invariant(typeof value.codex_version === 'string' && (!codexVersion || value.codex_version === codexVersion), 'checkpoint_version_mismatch');
+  invariant(['codex', 'claude'].includes(value.runner) && (!runner || value.runner === runner), 'checkpoint_runner_mismatch');
+  invariant(typeof value.runner_version === 'string' && value.runner_version === (runnerVersion ?? runnerVersions[value.runner]), 'checkpoint_version_mismatch');
   invariant(positiveId(value.root_run_id) && positiveId(value.activation_run_id) && Number.isSafeInteger(value.auto_count) && value.auto_count >= 0 && value.auto_count <= 100 &&
     typeof value.operator === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(value.operator), 'invalid_session_lineage');
   invariant(['running', 'completed', 'failed', 'cancelled'].includes(value.outcome), 'invalid_native_outcome');
   invariant(Number.isSafeInteger(value.sequence) && value.sequence > 0 && Array.isArray(value.files) && value.files.length <= 10000, 'invalid_checkpoint_inventory');
   const paths = new Set(); let bytes = Buffer.byteLength(JSON.stringify(value));
   for (const file of value.files) {
-    invariant(typeof file.path === 'string' && file.path.length <= 512 && !paths.has(file.path) && !file.path.includes('\\') &&
-      !file.path.split('/').some(part => !part || part === '.' || part === '..') &&
-      (/^codex\/(?:sessions|archived_sessions)\/.+\.jsonl(?:\.zst)?$/.test(file.path) || databases.some(name => file.path === `codex/${name}`)), 'unsafe_checkpoint_path');
+    invariant(!paths.has(file.path) && allowedStatePath(value.runner, file.path), 'unsafe_checkpoint_path');
     invariant(hashPattern.test(file.sha256) && Number.isSafeInteger(file.bytes) && file.bytes >= 0, 'invalid_checkpoint_file');
     paths.add(file.path); bytes += file.bytes;
   }
@@ -76,7 +89,7 @@ export function validateManifest(value, { repository, codexVersion } = {}) {
   const lineage = value.lineage;
   invariant(lineage && positiveId(lineage.run_id) && positiveId(lineage.run_attempt) && positiveId(lineage.workflow_id) && shaPattern.test(lineage.workflow_sha) &&
     /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(lineage.workflow_path) && typeof lineage.branch === 'string', 'untrusted_checkpoint_producer');
-  invariant(typeof value.workspace === 'string' && value.workspace.startsWith('/') && typeof value.codex_home === 'string' && value.codex_home.startsWith('/'), 'invalid_checkpoint_locations');
+  invariant(typeof value.workspace === 'string' && value.workspace.startsWith('/') && typeof value.runner_home === 'string' && value.runner_home.startsWith('/'), 'invalid_checkpoint_locations');
   return value;
 }
 export function validateProducer(artifact, run, manifest, repository) {

@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { Diagnostics } from "../.build/diagnostics.js";
 import { createJob, removeJob } from "../.build/setup.js";
-import { hash, versions } from "../.build/contracts.js";
+import { hash, versions, projectStorageKey } from "../.build/contracts.js";
 
 export const root = resolve(import.meta.dirname, "..");
 export const exec = promisify(execFile);
@@ -16,24 +16,28 @@ export function logger() {
   const sink = Object.fromEntries(["info", "warning", "error", "debug"].map((key) => [key, (line) => records.push(JSON.parse(line))]));
   return { log: new Diagnostics({ task_id: "fixture-task", run_id: "13", run_attempt: "1" }, sink), records };
 }
-export async function fixture(t) {
+export async function fixture(t, runner = "codex") {
   const temporary = await mkdtemp(join(tmpdir(), "codex-runtime-test-"));
   t.after(() => removeJob(temporary));
   const host = join(temporary, "inherited-host");
   await mkdir(join(host, ".codex"), { recursive: true });
+  await mkdir(join(host, ".claude"), { recursive: true });
   await mkdir(join(host, ".agents/skills/unwanted"), { recursive: true });
   const hostFiles = {
     ".codex/AGENTS.md": "unwanted-host-instructions-3819\n",
     ".codex/config.toml": 'model="host-config-sentinel-6158"\n',
     ".codex/auth.json": '{"OPENAI_API_KEY":"host-auth-sentinel-9482"}\n',
+    ".claude/CLAUDE.md": "unwanted-host-instructions-3819\n",
+    ".claude/settings.json": '{"model":"host-config-sentinel-6158"}\n',
     ".agents/skills/unwanted/SKILL.md": "---\nname: unwanted-host-sentinel-3719\ndescription: Host sentinel\n---\nNever load this host skill.\n",
   };
   for (const [name, content] of Object.entries(hostFiles)) await writeFile(join(host, name), content);
   const { log, records } = logger();
   const job = await createJob(temporary, "fixture-api-credential-9374", "fixture-github-credential-6241", "Fixture Author", "fixture@example.invalid",
-    { ...process.env, HOME: host, CODEX_HOME: join(host, ".codex") });
+    { ...process.env, HOME: host, CODEX_HOME: join(host, ".codex"), CLAUDE_CONFIG_DIR: join(host, ".claude") }, runner);
+  if (runner === "claude") job.env.CLAUDE_CODE_PROJECT_DIR_NAME = projectStorageKey('fixture/repo', '13');
   job.env.NO_PROXY = "127.0.0.1,localhost";
-  log.protect(job.env.CODEX_API_KEY); log.protect(job.env.GH_TOKEN);
+  log.protect(job.env.CODEX_API_KEY ?? job.env.ANTHROPIC_API_KEY); log.protect(job.env.GH_TOKEN);
   await mkdir(join(job.tools, "node_modules/.bin"), { recursive: true });
   for (const binary of ["codex", "skills"]) {
     await writeFile(join(job.tools, "node_modules/.bin", binary), `#!/bin/sh\nexec '${join(root, "node_modules/.bin", binary)}' "$@"\n`, { mode: 0o700 });

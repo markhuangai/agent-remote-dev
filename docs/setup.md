@@ -1,12 +1,18 @@
 # Setup
 
-This repository already has a [Codex task runner](../.github/workflows/runner-task.yml)
+This repository already has a [remote development task runner](../.github/workflows/runner-task.yml)
 that calls its own reusable workflow. Use it to develop this project without
 publishing a release first. For another repository, follow
 [Reuse the workflow](#reuse-the-workflow-from-another-repository) after configuring
 the credentials below.
 
-## 1. Prepare CODEX_CONFIG_TOML
+## 1. Prepare the selected runner's configuration
+
+Select `runner: codex` (the default) or `runner: claude` in the caller workflow.
+The reusable workflow uses the Codex CLI or Claude Agent SDK respectively.
+Both share setup, skills, supervision, snapshots, Git and recovery.
+
+### Codex: CODEX_CONFIG_TOML
 
 The secret contains the raw contents of a Codex `config.toml`, without Markdown
 fences. It selects the model, provider and optional MCP servers. Keep the model
@@ -54,15 +60,38 @@ Start without MCP servers; Git and GitHub CLI are already available. Add MCP
 configuration later if a task needs it. The runner manages execution permissions,
 storage paths and credential files, so those do not need TOML settings.
 
+### Claude: CLAUDE_SETTINGS_JSON
+
+Use native Claude settings JSON, without Markdown fences. For example:
+
+```json
+{"model":"claude-sonnet-4-6","effortLevel":"high"}
+```
+
+Use a model available to your account. Store its API key in `ANTHROPIC_API_KEY`.
+For an Anthropic Messages-compatible gateway, add
+`"env": {"ANTHROPIC_BASE_URL":"https://your-gateway.example"}` to the settings.
+See the [native settings reference](https://code.claude.com/docs/en/settings).
+
+Optionally provide `CLAUDE_MCP_CONFIG_JSON` with native MCP definitions:
+
+```json
+{"mcpServers":{"example":{"type":"http","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer YOUR_MCP_TOKEN"}}}}
+```
+
+Repository `.mcp.json` discovery also remains available. Keep private credentials
+in Actions secrets. The platform controls storage, Git credentials, persistence,
+and full-access permissions; configuration cannot override those settings.
+
 ## 2. Create REMOTE_DEV_PAT
 
 A fine-grained personal access token is recommended for Git pushes, pull
-requests and GitHub Actions operations. It is the token Codex uses through Git
+requests and GitHub Actions operations. It is the token either agent uses through Git
 and `gh`; it is separate from the workflow's automatic `GITHUB_TOKEN`.
 
 Open [GitHub's fine-grained token form](https://github.com/settings/personal-access-tokens/new).
-Name it `remote-codex`, choose an expiration, set the resource owner to
-`markhuangai`, then select only `agent-remote-dev-codex`. For another consumer,
+Name it `remote-dev`, choose an expiration, set the resource owner to
+`markhuangai`, then select only `agent-remote-dev`. For another consumer,
 select that repository's owner and repository.
 
 Grant repository permissions according to the work:
@@ -91,38 +120,42 @@ App token. Check that requirement before choosing a token for a full review loop
 See GitHub's [token limitations and setup](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 and [permission reference](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens).
 
-## 3. Add the three Actions secrets
+## 3. Add Actions secrets
 
-Open [this repository's Actions secrets](https://github.com/markhuangai/agent-remote-dev-codex/settings/secrets/actions),
+Open [this repository's Actions secrets](https://github.com/markhuangai/agent-remote-dev/settings/secrets/actions),
 then create repository secrets with these exact names:
 
 | Secret | Value |
 | --- | --- |
 | `CODEX_CONFIG_TOML` | The complete TOML from step 1 |
 | `CODEX_API_KEY` | An API key for the model provider selected in the TOML |
+| `CLAUDE_SETTINGS_JSON` | Native settings JSON when selecting Claude |
+| `ANTHROPIC_API_KEY` | Claude provider API key when selecting Claude |
+| `CLAUDE_MCP_CONFIG_JSON` | Optional Claude MCP server JSON |
 | `REMOTE_DEV_PAT` | The GitHub token from step 2 |
 
 Organization secrets also work when this repository is included in their access
-policy. These are the three secrets required by the task runner.
+policy. Configure `REMOTE_DEV_PAT` and the selected runner's configuration and
+API key. The other provider's secrets may be absent and are not passed to the agent.
 
 With GitHub CLI, save your TOML outside the checkout and run:
 
 ```bash
-gh secret set CODEX_CONFIG_TOML --repo markhuangai/agent-remote-dev-codex < /path/to/remote-codex-config.toml
-gh secret set CODEX_API_KEY --repo markhuangai/agent-remote-dev-codex
-gh secret set REMOTE_DEV_PAT --repo markhuangai/agent-remote-dev-codex
+gh secret set CODEX_CONFIG_TOML --repo markhuangai/agent-remote-dev < /path/to/remote-dev-config.toml
+gh secret set CODEX_API_KEY --repo markhuangai/agent-remote-dev
+gh secret set REMOTE_DEV_PAT --repo markhuangai/agent-remote-dev
 ```
 
 The last two commands prompt for their values. Enter credentials through the
 secret form or prompt, rather than putting them in a plan or committing them.
 
 Snapshot transport and automatic recovery use the workflow's `GITHUB_TOKEN`
-with `actions: write`. The PAT's Actions permission controls Codex's own GitHub
+with `actions: write`. The PAT's Actions permission controls the agent's own GitHub
 CLI operations.
 
 ## 4. Check repository configuration
 
-The root [`.remote-codex.yml`](../.remote-codex.yml) in this repository currently
+The root [`.remote-dev.yml`](../.remote-dev.yml) in this repository currently
 allows `Z-M-Huang`, installs the skills from `markhuangai/agent-remote-dev-skills`,
 and disables automatic continuation.
 It downloads the shared Golden instructions as user-level `AGENTS.md` on each run.
@@ -135,15 +168,17 @@ requirements in the plan or selected skills; the platform does not perform those
 delivery steps itself. This repository's `AGENTS.md` also applies to task execution.
 
 This repository and the consumer example use the Golden instructions through
-the optional `user-level-agents.md-url` key in the root `.remote-codex.yml`:
+the optional `user-level-md-url` key in the root `.remote-dev.yml`:
 
 ```yaml
-user-level-agents.md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md
+user-level-md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md
 ```
 
-The runner downloads the Markdown to its isolated `$CODEX_HOME/AGENTS.md`;
-the source filename can be `CLAUDE.md`. The repository's own `AGENTS.md` is still
-discovered automatically. Set a different public HTTPS URL to use other shared
+The runner downloads the Markdown to isolated `$CODEX_HOME/AGENTS.md` for Codex
+or `$CLAUDE_CONFIG_DIR/CLAUDE.md` for Claude. The source filename is unrestricted.
+Repository instructions and skills use each agent's native discovery. This
+repository's `CLAUDE.md` imports `AGENTS.md` to share its instructions.
+Set a different public HTTPS URL to use other shared
 instructions, or omit the key to use only the repository instructions.
 
 ## 5. Start a task
@@ -153,27 +188,27 @@ acceptance criteria and delivery requirements. For example, request a task
 branch, required validation, commits and a push, then a pull request and the
 review loop. Avoid asking the runner to merge.
 
-In [Actions → Codex task runner](https://github.com/markhuangai/agent-remote-dev-codex/actions/workflows/runner-task.yml),
-select **Run workflow**, choose `main`, and paste the plan. The form contains only
-`plan` (or new context) and `resume-run-id`; leave the latter empty for a fresh
+In [Actions → Remote development task runner](https://github.com/markhuangai/agent-remote-dev/actions/workflows/runner-task.yml),
+select **Run workflow**, choose `main`, select `runner`, and paste the plan.
+The form contains `runner`, `plan` (or new context), and `resume-run-id`; leave the latter empty for a fresh
 task. Alternatively:
 
 ```bash
-gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev-codex --ref main -F plan=@plan.md
-gh run list --repo markhuangai/agent-remote-dev-codex --workflow runner-task.yml --limit 5
-gh run view RUN_ID --repo markhuangai/agent-remote-dev-codex --log
+gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev --ref main -f runner=claude -F plan=@plan.md
+gh run list --repo markhuangai/agent-remote-dev --workflow runner-task.yml --limit 5
+gh run view RUN_ID --repo markhuangai/agent-remote-dev --log
 ```
 
 The caller's YAML fixes `runs-on: '["ubuntu-latest"]'` and `timeout-minutes: 360`
 under `jobs.run.with`. Repository owners change scheduling there, not in the
-task form or `.remote-codex.yml`. Read the `codex-result-*` artifact to confirm
-what Codex completed.
+task form or `.remote-dev.yml`. Read the `remote-dev-result-*` artifact to confirm
+what the selected agent completed.
 
 To answer a clarification or continue saved work, run the same caller with the
 previous run ID and a file containing the additional context:
 
 ```bash
-gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev-codex --ref main -f resume-run-id=RUN_ID -F plan=@context.md
+gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev --ref main -f runner=claude -f resume-run-id=RUN_ID -F plan=@context.md
 ```
 
 ## Reuse the workflow from another repository
@@ -182,12 +217,12 @@ Releases have not been published. Until a maintainer publishes a version, use an
 explicitly authorized exact commit in place of `v1`. The caller below shows the
 interface for a published release.
 
-Commit `.remote-codex.yml` in the consumer repository root:
+Commit `.remote-dev.yml` in the consumer repository root:
 
 ```yaml
 allowed-actors: [YOUR_GITHUB_LOGIN]
 skills: []
-user-level-agents.md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md
+user-level-md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md
 auto-continue: false
 max-continuations: 3
 ```
@@ -195,10 +230,15 @@ max-continuations: 3
 Create one caller workflow, for example `.github/workflows/codex.yml`:
 
 ```yaml
-name: Remote Codex
+name: Remote development
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: Agent runner
+        type: choice
+        options: [codex, claude]
+        default: codex
       plan:
         description: Refined plan, or new context for a resumed conversation
         type: string
@@ -210,8 +250,9 @@ permissions:
   actions: write
 jobs:
   run:
-    uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1
+    uses: markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1
     with:
+      runner: ${{ inputs.runner }}
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
       runs-on: '["ubuntu-latest"]'
@@ -219,6 +260,9 @@ jobs:
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
+      claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}
 ```
 
@@ -226,29 +270,31 @@ Invoke the caller workflow from the repository's default branch. Consumers choos
 its filename and configure `runs-on` and `timeout-minutes` once under the reusable
 call's `with:` block. The reusable workflow keeps those optional scheduling inputs
 (defaulting to `ubuntu-latest` and 360 minutes) solely for its execution job.
-Only `plan` and `resume-run-id` are task inputs. Automatic recovery dispatches
-only those two fields, so the consumer's current YAML supplies scheduling again.
-Use one executing remote Codex call per caller workflow run; mutually exclusive
+The task inputs are `runner`, `plan`, and `resume-run-id`. `runner` selects the
+agent while `runs-on` selects the machine. Automatic recovery forwards the
+recorded runner with plan/resume; current caller YAML supplies scheduling again.
+Consumer dispatch workflows must accept and forward `runner` for recovery.
+Use one executing remote development call per caller workflow run; mutually exclusive
 declared calls are supported. GitHub enforces job timeout and runner limits.
 
-Configure the three Actions secrets using the steps above, with your consumer
+Configure the selected runner's Actions secrets using the steps above, with your consumer
 repository as the target.
 
 Both initiating and triggering actors must be allowlisted in the latest reviewed
-`.remote-codex.yml` on the default branch and have repository write/maintain/admin
+`.remote-dev.yml` on the default branch and have repository write/maintain/admin
 access. Authorization is checked again after acquiring the session lock. Automatic
 children recheck their initiating operator's current access. This policy is
 independent of the repository's AI-review trust policy.
 
 Optional YAML keys are `git-author: {name: ..., email: ...}` and
-`user-level-agents.md-url: https://...`. Instruction downloads require public HTTPS,
+`user-level-md-url: https://...`. Instruction downloads require public HTTPS,
 strict encoding and redirects, a 20-second timeout, and a 64 KiB limit. Skills
 accept repository URLs or `{repository, ref, names}` objects. Omitted `ref` uses
 the current default branch; omitted `names` installs every discovered skill.
 Settings, selected skill revisions, instructions and secret configuration are
 resolved anew on each run. Repository skills and `AGENTS.md` use native discovery.
 
-The runner's native instructions ask Codex to include this trailer exactly once
+The runner's native instructions ask either agent to include this trailer exactly once
 in each Git commit, including resumed conversations and runs without downloaded
 user instructions:
 
@@ -272,22 +318,32 @@ GitHub CLI and Python 3.12+ are required on self-hosted Linux x64/arm64 runners.
 Codex runs noninteractively with explicit full-access/YOLO and trusted-hook
 bypasses. Job-owned homes, credentials and configuration preserve host setup;
 YOLO execution requires an appropriate runner and authorized task/skill sources.
-Codex receives the refined plan, may follow its selected skills, and can report
+Claude uses the SDK permission bypass and native tool/prompt presets. Each agent receives the refined plan, may follow its selected skills, and can report
 an indispensable clarification as its ordinary response. A successful run means
 native execution returned normally; inspect the response for task completion.
 
 ## Resume and cancellation
 
+### Migration from remote-codex
+
+Finish existing sessions before upgrading. Rename `.remote-codex.yml` to
+`.remote-dev.yml`, rename `user-level-agents.md-url` to `user-level-md-url`, update
+the reusable workflow reference to `remote-dev.yml`, and install the renamed
+`remote-dev` dispatch skill. Old names have no aliases. Add and forward the
+`runner` dispatch input. Schema-4 checkpoints are unsupported by this release.
+Select the original runner on manual resume; a runner or pinned-version mismatch
+stops restoration. Automatic continuation preserves the recorded runner.
+
 ```bash
 gh workflow run codex.yml --repo OWNER/REPO --ref main -F plan=@plan.md
 gh run view RUN_ID --repo OWNER/REPO --log
-gh run download RUN_ID --repo OWNER/REPO --pattern 'codex-result-*' --dir RESULT_DIRECTORY
+gh run download RUN_ID --repo OWNER/REPO --pattern 'remote-dev-result-*' --dir RESULT_DIRECTORY
 gh workflow run codex.yml --repo OWNER/REPO --ref main -f resume-run-id=RUN_ID -F plan=@clarification.md
 gh run cancel RUN_ID --repo OWNER/REPO
 ```
 
 Substitute your default branch and caller filename. The optional
-[remote-codex skill](../skills/remote-codex/SKILL.md) contains only Markdown and teaches
+[remote-dev skill](../skills/remote-dev/SKILL.md) contains only Markdown and teaches
 an agent to use GitHub CLI or GitHub MCP. An uncertain dispatch response requires
 inspection of existing runs before another submission.
 
@@ -299,8 +355,11 @@ The saved published source commit is restored without merging newer main or
 rewriting an existing local branch. When its local branch has moved, restoration
 uses detached HEAD so the agent can decide how to continue safely.
 
-Schema-4 artifacts preserve native conversation JSONL and supported SQLite state,
-including goals, queues and memories. Managed writers pause briefly for a file
+Schema-5 artifacts record the runner and pinned version. Codex preserves native
+conversation JSONL and supported SQLite state, including goals, queues and memories.
+Claude preserves transcripts, subagent transcripts, tool results, MCP task state,
+task lists and native memory. Its stable project key follows the root task across
+homes and workspaces. Managed writers pause briefly for a file
 copy; validation and upload run after writers resume. Snapshots begin when session
 state becomes available, repeat every 60 seconds, and save once more after normal
 exit, including native errors and clarification responses. Only the last two
@@ -309,10 +368,10 @@ after a replacement upload succeeds. Existing log/evidence artifacts are retaine
 
 Uncommitted files and unpushed commits are excluded. A dirty checkout or rejected
 push still permits conversation export: the artifact records the nearest
-published ancestor and an omitted-work warning. Resume tells Codex that omitted
+published ancestor and an omitted-work warning. Resume tells the agent that omitted
 work may need recreating. The platform never stages, commits or pushes on its
 own. Repository/user native hooks can publish coherent progress under their own
-policy and run with the same privileges as Codex.
+policy and run with the same privileges as the agent.
 
 Snapshots exclude authentication files, secret configuration, logs, caches and
 working files. Archive validation rejects traversal, links, duplicate/encrypted
@@ -321,7 +380,7 @@ integrity, credential exclusion, native version and session references are
 verified. Expired artifacts, unrelated producers, unsupported native versions and
 legacy checkpoint formats stop restoration with diagnostics.
 
-Enable `auto-continue: true` to recover after GitHub times out the Codex execution
+Enable `auto-continue: true` to recover after GitHub times out the Agent execution
 job. A separate recovery job checks the actual execution step, current policy,
 saved session and continuation limit before dispatching the same consumer
 workflow. Setup or upload timeouts, normal returns, clarification, errors and
@@ -336,6 +395,26 @@ Recovery uses the last completed upload, not the terminated runner's disk. A
 upload failures, validation failures or slow storage can leave an older snapshot.
 A downstream job cannot retrieve files from a terminated runner. Final-save is a
 separate step, so a failure while saving cannot masquerade as a native timeout.
+
+## Deliver an audited implementation through a PR
+
+Install `sdlc-plan-implementation`, `plan-audit` and `pr-review-loop` from
+[`agent-remote-dev-skills` at the pinned revision](https://github.com/markhuangai/agent-remote-dev-skills/tree/224a5be4ddf40c6cf0a50b97885cb353e8522e2e).
+This repository's project configuration already installs these packages. The same
+packages work with either selected runner. Begin the task prompt with:
+
+```text
+Use $sdlc-plan-implementation to implement the following approved plan through
+an audited, tested, non-draft PR and complete the configured PR review loop.
+Do not merge. Approved plan:
+<complete plan text>
+```
+
+The skill performs read-only preflight, branches, implements, obtains an
+independent conformance audit, runs required checks, commits and pushes normally,
+opens the PR, and completes current-head review/CI before handoff. Delivery
+authority comes from the user's request. The platform itself does not enforce
+this task-specific workflow on unrelated tasks.
 
 ## Diagnose runtime infrastructure
 
