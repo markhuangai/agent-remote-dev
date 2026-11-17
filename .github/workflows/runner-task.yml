@@ -33,7 +33,7 @@ jobs:
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
       runs-on: ${{ inputs.runs-on }}
-      timeout-minutes: ${{ inputs.timeout-minutes }}
+      timeout-minutes: 360
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
