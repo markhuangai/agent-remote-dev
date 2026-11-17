@@ -86,12 +86,14 @@ test('published maintainer test selects exactly one literal stable or prerelease
   assert.equal(caller.on.workflow_dispatch.inputs.channel.type, 'choice');
   assert.equal(caller.on.workflow_dispatch.inputs.channel.default, 'stable');
   assert.deepEqual(caller.on.workflow_dispatch.inputs.channel.options, ['stable', 'prerelease']);
+  assert.equal(caller.on.workflow_dispatch.inputs['timeout-minutes'].type, 'number');
+  assert.equal(caller.on.workflow_dispatch.inputs['timeout-minutes'].default, 360);
   for (const channel of ['stable', 'prerelease']) {
     const selected = Object.values(caller.jobs).filter(job => new Function('inputs', `return ${job.if}`)({ channel }));
     assert.equal(selected.length, 1);
     assert.equal(selected[0].uses, `${provider}/.github/workflows/remote-codex.yml@v1${channel === 'prerelease' ? '-prerelease' : ''}`);
     assert.deepEqual(selected[0].with, { plan: '${{ inputs.plan }}', 'resume-run-id': '${{ inputs.resume-run-id }}',
-      'runs-on': '${{ inputs.runs-on }}', 'timeout-minutes': '${{ inputs.timeout-minutes }}' });
+      'runs-on': '${{ inputs.runs-on }}', 'timeout-minutes': '${{ fromJSON(inputs.timeout-minutes) }}' });
     assert.deepEqual(selected[0].secrets, { 'codex-config': '${{ secrets.CODEX_CONFIG_TOML }}',
       'codex-api-key': '${{ secrets.CODEX_API_KEY }}', 'github-token': '${{ secrets.REMOTE_DEV_PAT }}' });
   }
