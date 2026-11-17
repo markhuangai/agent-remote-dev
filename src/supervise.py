@@ -9,23 +9,29 @@ import time
 
 PR_SET_CHILD_SUBREAPER = 36
 
-def children():
-    path = Path(f"/proc/self/task/{os.getpid()}/children")
-    return [int(value) for value in path.read_text().split()]
+def children(pid):
+    try:
+        tasks = list(Path(f"/proc/{pid}/task").iterdir())
+    except FileNotFoundError:
+        return []
+    found = []
+    for task in tasks:
+        try:
+            found.extend(int(value) for value in (task / "children").read_text().split())
+        except FileNotFoundError:
+            pass
+    return found
 
 
 def descendants():
     found = []
-    pending = children()
+    pending = children(os.getpid())
     while pending:
         pid = pending.pop()
         if pid in found:
             continue
         found.append(pid)
-        try:
-            pending.extend(int(value) for value in Path(f"/proc/{pid}/task/{pid}/children").read_text().split())
-        except FileNotFoundError:
-            pass
+        pending.extend(children(pid))
     return found
 
 
@@ -77,23 +83,27 @@ def main():
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     control = Path(receipt).parent
-    paused = False
+    paused = None
     worker = subprocess.Popen(command, start_new_session=True)
     while worker.poll() is None:
+        try:
+            request = (control / "pause").read_text()
+        except FileNotFoundError:
+            request = None
         if stopping_at is not None:
             signal_children(signal.SIGCONT)
             signal_children(signal.SIGKILL if time.monotonic() - stopping_at >= 1 else signal.SIGTERM)
-        elif (control / "pause").exists():
-            if not paused:
+        elif request:
+            if paused != request:
                 freeze_children()
                 temporary = control / "paused.tmp"
-                temporary.write_text(json.dumps({"nonce": nonce}))
+                temporary.write_text(json.dumps({"nonce": nonce, "request": request}))
                 temporary.replace(control / "paused.json")
-                paused = True
+                paused = request
         elif paused:
             (control / "paused.json").unlink(missing_ok=True)
             signal_children(signal.SIGCONT)
-            paused = False
+            paused = None
         time.sleep(0.02)
     signal_children(signal.SIGCONT)
     status = worker.returncode

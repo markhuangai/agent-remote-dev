@@ -86,11 +86,15 @@ export async function command(executable: string, args: string[], options: Comma
 
 export function processControl(directory: string, nonce: string): ProcessControl {
   return { directory, nonce, async freeze(copy) {
-    await writeFile(join(directory, "pause"), nonce, { mode: 0o600 });
+    const request = randomUUID();
+    await writeFile(join(directory, "pause"), request, { mode: 0o600 });
     try {
       const deadline = Date.now() + 5000;
       for (;;) {
-        try { if (JSON.parse(await readFile(join(directory, "paused.json"), "utf8")).nonce === nonce) break; }
+        try {
+          const paused = JSON.parse(await readFile(join(directory, "paused.json"), "utf8"));
+          if (paused.nonce === nonce && paused.request === request) break;
+        }
         catch (error: any) { if (error.code !== "ENOENT") throw error; }
         if (Date.now() >= deadline) throw new RunnerError("snapshot_pause_failed", "checkpoint");
         await new Promise(resolve => setTimeout(resolve, 10));

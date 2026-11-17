@@ -277,23 +277,68 @@ test("the real Actions logger retains required failure evidence after DEBUG filt
   assert.equal(evidence.stage,"checkpoint");assert.equal(evidence.expected_sha,"a".repeat(40));assert.equal(evidence.observed_sha,"b".repeat(40));assert.equal(evidence.last_durable_checkpoint.artifact_id,17);
 });
 
-test('a managed live SQLite/WAL writer pauses for consistent snapshots and resumes afterward', async t => {
+for (const mode of ['direct', 'threaded', 'resume-in-flight']) test(`a managed live SQLite/WAL writer pauses for consistent snapshots and resumes afterward (${mode})`, async t => {
   const f = await fixture(t), marker = join(f.temporary, 'counter'); let control;
+  const ready = join(f.temporary, 'resume-ready'), allow = join(f.temporary, 'resume-allow');
+  if (mode === 'resume-in-flight') {
+    const source = await readFile(join(root, '.build/supervise.py'), 'utf8');
+    const line = source.split('\n').findIndex(value => value.includes('(control / "paused.json").unlink')) + 1;
+    assert.ok(line > 0);
+    await writeFile(join(f.temporary, 'sitecustomize.py'), `import sys,time
+from pathlib import Path
+held=False
+def trace(frame,event,arg):
+ global held
+ if not held and event=='line' and frame.f_code.co_filename.endswith('/supervise.py') and frame.f_lineno==${line}:
+  held=True;Path(${JSON.stringify(ready)}).write_text('ready')
+  end=time.monotonic()+2
+  while not Path(${JSON.stringify(allow)}).exists() and time.monotonic()<end: time.sleep(0.001)
+ return trace
+sys.settrace(trace)
+`);
+    f.job.env.PYTHONPATH = f.temporary;
+  }
   const writer = `const fs=require('node:fs'),{DatabaseSync}=require('node:sqlite');
 const db=new DatabaseSync(process.env.CODEX_HOME+'/state_5.sqlite');db.exec('PRAGMA journal_mode=WAL; CREATE TABLE progress (value INTEGER); INSERT INTO progress VALUES (0); CREATE TABLE threads (id TEXT, rollout_path TEXT)');db.prepare('INSERT INTO threads VALUES (?, ?)').run(${JSON.stringify(sessionId)},process.env.CODEX_HOME+'/sessions/rollout.jsonl');
 fs.mkdirSync(process.env.CODEX_HOME+'/sessions');fs.writeFileSync(process.env.CODEX_HOME+'/sessions/rollout.jsonl',JSON.stringify({type:'session_meta',payload:{id:${JSON.stringify(sessionId)}}})+'\\n');
-setInterval(()=>{db.exec('UPDATE progress SET value=value+1');fs.writeFileSync(${JSON.stringify(marker)},String(db.prepare('SELECT value FROM progress').get().value))},5);`;
-  const running = command(process.execPath, ['-e', writer], { cwd: f.temporary, env: f.job.env, stage: 'writer', timeoutMs: 1500, onControl: value => { control = value; } }).catch(error => error);
+setInterval(()=>{db.exec('UPDATE progress SET value=value+1');fs.writeFileSync(${JSON.stringify(marker + '.tmp')},String(db.prepare('SELECT value FROM progress').get().value));fs.renameSync(${JSON.stringify(marker + '.tmp')},${JSON.stringify(marker)})},5);`;
+  const threaded = `import subprocess,sys,threading
+def run():
+ subprocess.run(sys.argv[1:],check=True)
+worker=threading.Thread(target=run);worker.start();worker.join()`;
+  const running = command(mode === 'threaded' ? 'python3' : process.execPath, mode === 'threaded' ? ['-c', threaded, process.execPath, '-e', writer] : ['-e', writer],
+    { cwd: f.temporary, env: f.job.env, stage: 'writer', timeoutMs: 3000, onControl: value => { control = value; } }).catch(error => error);
   const deadline = Date.now() + 1000;
   while (Date.now() < deadline) { try { if (Number(await readFile(marker)) > 3) break; } catch (error) { if (error.code !== 'ENOENT') throw error; } await new Promise(resolve => setTimeout(resolve, 10)); }
-  await control.freeze(async () => {
+  assert.ok(Number(await readFile(marker)) > 3, 'The real writer started before pausing');
+  const unchanged = async () => {
     const before = await readFile(marker, 'utf8'); await new Promise(resolve => setTimeout(resolve, 75)); assert.equal(await readFile(marker, 'utf8'), before);
-  });
+  };
+  await control.freeze(unchanged);
+  if (mode === 'resume-in-flight') {
+    const deadline = Date.now() + 1000;
+    for (;;) {
+      try { await readFile(ready); break; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      assert.ok(Date.now() < deadline, 'The supervisor reached the resume boundary');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    let copying = false;
+    const second = control.freeze(async () => { copying = true; await unchanged(); }).catch(error => error);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(copying, false, 'A previous acknowledgement cannot authorize this copy');
+    } finally {
+      await writeFile(allow, 'resume'); const result = await second; if (result instanceof Error) throw result;
+    }
+  }
   const exported = await exportCheckpoint(f.job, checkpoint(), f.log, undefined, control);
   const db = new DatabaseSync(join(exported.root, 'codex/state_5.sqlite'), { readOnly: true });
   assert.ok(db.prepare('SELECT value FROM progress').get().value > 0); db.close();
-  const before = Number(await readFile(marker)); await new Promise(resolve => setTimeout(resolve, 75)); assert.ok(Number(await readFile(marker)) > before);
+  const before = Number(await readFile(marker)), resumed = Date.now() + 750;
+  while (Number(await readFile(marker)) <= before && Date.now() < resumed) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(Number(await readFile(marker)) > before);
   const result = await running; assert.equal(result.reason, 'command_timeout'); assert.equal(result.details.quiescent, true);
+  const stopped = await readFile(marker, 'utf8'); await new Promise(resolve => setTimeout(resolve, 50)); assert.equal(await readFile(marker, 'utf8'), stopped);
 });
 
 test('an upload finalized remotely with a lost receipt does not poison later snapshot identities', async t => {
