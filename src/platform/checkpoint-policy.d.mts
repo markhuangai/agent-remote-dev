@@ -14,6 +14,7 @@ export function runnerLabels(value?: any): string[];
 export function instructionURL(value: any): string;
 export function instructions(value: any): any;
 export function validBranch(value: any): boolean;
-export function validateManifest(value: any, options?: {repository?: string; codexVersion?: string}): any;
+export function allowedStatePath(runner: string, path: string): boolean;
+export function validateManifest(value: any, options?: {repository?: string; runner?: string; runnerVersion?: string}): any;
 export function checkpointName(manifest: any): string;
 export function validateProducer(artifact: any, run: any, manifest: any, repository: string): any;

@@ -19,10 +19,15 @@ with zipfile.ZipFile(sys.argv[1], 'w', compression=zipfile.ZIP_DEFLATED) as z:
   z.writestr(info,item.get('text',''))`, path, JSON.stringify(entries)]);
   return path;
 }
-async function transport(t) {
-  const f = await fixture(t);
-  await mkdir(join(f.job.codexHome, 'sessions'));
-  await writeFile(join(f.job.codexHome, 'sessions/rollout.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: sessionId } }) + '\n');
+async function transport(t, runner = 'codex') {
+  const f = await fixture(t, runner);
+  if (runner === 'codex') {
+    await mkdir(join(f.job.runnerHome, 'sessions'));
+    await writeFile(join(f.job.runnerHome, 'sessions/rollout.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: sessionId } }) + '\n');
+  } else {
+    await mkdir(join(f.job.runnerHome, 'projects/remote-fixture'), { recursive: true });
+    await writeFile(join(f.job.runnerHome, `projects/remote-fixture/${sessionId}.jsonl`), JSON.stringify({ sessionId, type: 'user' }) + '\n');
+  }
   const exported = await exportCheckpoint(f.job, checkpoint(), f.log);
   const zip = join(f.temporary, 'snapshot.zip');
   await exec('python3', ['-c', `import json,sys,zipfile
@@ -34,7 +39,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
   const current = { ...parent, id: 20, status: 'in_progress' };
   const job = { id: 70, status: 'completed', conclusion: 'timed_out', steps: [
     { number: 1, name: 'Install and compile locked provider source', status: 'completed', conclusion: 'success', started_at: '2026-11-17T00:00:00Z' },
-    { number: 2, name: 'Execute Codex', status: 'completed', conclusion: 'timed_out', started_at: '2026-11-17T00:01:00Z' },
+    { number: 2, name: 'Execute agent', status: 'completed', conclusion: 'timed_out', started_at: '2026-11-17T00:01:00Z' },
     { number: 3, name: 'Save final session', status: 'skipped', conclusion: 'skipped', started_at: null },
   ] };
   const artifact = { id: 55, name: checkpointName(exported.manifest), workflow_run: { id: 13 }, size_in_bytes: bytes.length, expired: false, expires_at: '2099-01-01T00:00:00Z' };
@@ -44,7 +49,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
     if (path === `/repos/${repository}`) return { default_branch: 'main' };
     if (path.includes('/commits/main')) return { sha: 'a'.repeat(40) };
     if (path.includes('/collaborators/')) return { permission: state.permission };
-    if (path.includes('/contents/.remote-codex.yml?')) { const bytes = Buffer.from(state.config); return { type: 'file', encoding: 'base64', size: bytes.length, content: bytes.toString('base64') }; }
+    if (path.includes('/contents/.remote-dev.yml?')) { const bytes = Buffer.from(state.config); return { type: 'file', encoding: 'base64', size: bytes.length, content: bytes.toString('base64') }; }
     if (path.includes('/attempts/1/jobs?')) return { jobs: [state.job] };
     if (path.includes('/actions/runs/13/artifacts?')) return { artifacts: state.artifacts };
     if (path.endsWith('/actions/runs/13')) return state.parent;
@@ -59,7 +64,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
   const core = { info: () => {}, warning: () => {}, error: () => {} };
   const recover = async () => recoverExecution({ api, repository, runId: '13', attempt: '1', root: await root(), core });
   const prepare = async (extra = {}) => prepareExecution({ api, repository, runId: '20', attempt: '1', actor: 'Z-M-Huang', triggeringActor: 'Z-M-Huang',
-    ref: 'refs/heads/main', resumeRunId: '13', plan: 'New context', root: await root(), ...extra });
+    ref: 'refs/heads/main', resumeRunId: '13', plan: 'New context', runner, root: await root(), ...extra });
   return { f, api, state, root, recover, prepare, exported };
 }
 test('run-ID resume loads the latest verified full native state from an arbitrary caller workflow', async t => {
@@ -77,7 +82,7 @@ for (const failure of ['expired', 'missing', 'unrelated', 'version', 'active', '
   if (failure === 'expired') x.state.artifact.expired = true;
   if (failure === 'missing') x.state.artifacts = [];
   if (failure === 'unrelated') x.state.parent.repository = { full_name: 'other/repo' };
-  if (failure === 'version') extra.codexVersion = 'incompatible';
+  if (failure === 'version') extra.runnerVersion = 'incompatible';
   if (failure === 'active') x.state.parent.status = 'in_progress';
   if (failure === 'workflow') x.state.current.workflow_id = 8;
   if (failure === 'authorization') x.state.permission = 'read';
@@ -88,10 +93,23 @@ test('timeout recovery dispatches the actual consumer workflow with only plan/re
   const x = await transport(t); assert.equal((await x.recover()).dispatched, true);
   const dispatch = x.state.calls.find(call => call.options?.method === 'POST');
   assert.equal(dispatch.path, '/repos/fixture/repo/actions/workflows/7/dispatches');
-  assert.deepEqual(dispatch.options, { method: 'POST', ref: 'main', inputs: { 'resume-run-id': '13', plan: '' } });
+  assert.deepEqual(dispatch.options, { method: 'POST', ref: 'main', inputs: { runner: 'codex', 'resume-run-id': '13', plan: '' } });
   x.state.parent.status = 'in_progress';
   const child = await x.prepare({ actor: 'github-actions[bot]', triggeringActor: 'github-actions[bot]', plan: '' });
   assert.equal(child.auto_count, 1); assert.equal(child.activation_run_id, '13');
+});
+test('Claude timeout recovery keeps its runner and rejects a Codex resume', async t => {
+  const x = await transport(t, 'claude');
+  assert.equal((await x.recover()).dispatched, true);
+  assert.equal(x.state.calls.find(call => call.options?.method === 'POST').options.inputs.runner, 'claude');
+  assert.equal((await x.prepare()).restored.manifest.runner, 'claude');
+  await assert.rejects(x.prepare({ runner: 'codex' }), /checkpoint_runner_mismatch/);
+});
+test('legacy artifacts and invalid runner inputs fail with explicit migration/configuration reasons', async t => {
+  const x = await transport(t);
+  await assert.rejects(x.prepare({ runner: 'unknown' }), /invalid_runner/);
+  x.state.artifacts = [{ ...x.state.artifact, name: 'codex-session-r13-a1-1' }];
+  await assert.rejects(x.prepare(), /legacy_checkpoint_unsupported/);
 });
 test('workflow recovery adapter needs no scheduling environment or arguments', async context => {
   const recovery = await transport(context);
@@ -101,7 +119,7 @@ test('workflow recovery adapter needs no scheduling environment or arguments', a
   const result = await workflowCommand('recover', { github, core: { info() {}, setFailed(text) { assert.fail(text); } },
     env: { GITHUB_REPOSITORY: repository, GITHUB_RUN_ID: '13', GITHUB_RUN_ATTEMPT: '1', RUNNER_TEMP: recovery.f.temporary } });
   assert.equal(result.dispatched, true);
-  assert.deepEqual(recovery.state.calls.find(call => call.options?.method === 'POST').options.inputs, { 'resume-run-id': '13', plan: '' });
+  assert.deepEqual(recovery.state.calls.find(call => call.options?.method === 'POST').options.inputs, { runner: 'codex', 'resume-run-id': '13', plan: '' });
 });
 for (const scenario of ['error', 'clarification', 'cancelled', 'setup-timeout', 'upload-timeout', 'disabled', 'limit']) test(`automatic continuation stops for ${scenario}`, async t => {
   const x = await transport(t);
@@ -123,8 +141,8 @@ test('an ambiguous dispatch response is attempted once and reruns cannot dispatc
 });
 test('snapshot retention removes only old snapshots of this run and attempt after replacement', async t => {
   const x = await transport(t);
-  x.state.artifacts = [1, 2, 3, 4].map(id => ({ ...x.state.artifact, id, name: `codex-session-r13-a1-${id}` }));
-  x.state.artifacts.push({ id: 9, name: 'codex-session-r13-a2-1' }, { id: 10, name: 'unrelated-evidence' });
+  x.state.artifacts = [1, 2, 3, 4].map(id => ({ ...x.state.artifact, id, name: `remote-dev-session-r13-a1-${id}` }));
+  x.state.artifacts.push({ id: 9, name: 'remote-dev-session-r13-a2-1' }, { id: 10, name: 'unrelated-evidence' });
   await pruneSnapshots(x.api, repository, '13', '1');
   assert.deepEqual(x.state.calls.filter(call => call.options?.method === 'DELETE').map(call => call.path), ['/repos/fixture/repo/actions/artifacts/2', '/repos/fixture/repo/actions/artifacts/1']);
 });
@@ -134,21 +152,21 @@ for (const scenario of ['traversal', 'symlink', 'duplicate', 'schema', 'hash', '
   if (scenario === 'symlink') entries = [{ name: 'manifest.json', mode: 0o120777, text: 'outside' }];
   if (scenario === 'duplicate') entries = [{ name: 'manifest.json', text: '{}' }, { name: 'manifest.json', text: '{}' }];
   if (scenario === 'schema') entries = [{ name: 'manifest.json', text: JSON.stringify({ schema_version: 3, files: [] }) }];
-  if (scenario === 'hash') entries = [{ name: 'manifest.json', text: JSON.stringify({ schema_version: 4, files: [{ path: 'codex/sessions/rollout.jsonl', bytes: 4, sha256: '0'.repeat(64) }] }) }, { name: 'codex/sessions/rollout.jsonl', text: 'bad!' }];
-  if (scenario === 'extra') entries = [{ name: 'manifest.json', text: JSON.stringify({ schema_version: 4, files: [] }) }, { name: 'auth.json', text: 'credential' }];
+  if (scenario === 'hash') entries = [{ name: 'manifest.json', text: JSON.stringify({ schema_version: 5, runner: 'codex', files: [{ path: 'codex/sessions/rollout.jsonl', bytes: 4, sha256: '0'.repeat(64) }] }) }, { name: 'codex/sessions/rollout.jsonl', text: 'bad!' }];
+  if (scenario === 'extra') entries = [{ name: 'manifest.json', text: JSON.stringify({ schema_version: 5, runner: 'codex', files: [] }) }, { name: 'auth.json', text: 'credential' }];
   await assert.rejects(unpackArchive(f.job, await archive(f, entries), join(f.temporary, 'restore'), 'checkpoint', f.log));
   await assert.rejects(readFile(join(f.temporary, 'escape')), { code: 'ENOENT' });
 });
 test('manifest validation rejects legacy schemas, unsupported native versions and unsafe inventories', async t => {
   const x = await transport(t), manifest = x.exported.manifest;
   assert.equal(validateCheckpoint(manifest, repository).session_id, sessionId);
-  for (const changed of [{ ...manifest, schema_version: 3 }, { ...manifest, codex_version: '0.0.1' }, { ...manifest, files: [{ path: '../auth', bytes: 0, sha256: 'a'.repeat(64) }] }]) assert.throws(() => validateCheckpoint(changed, repository));
+  for (const changed of [{ ...manifest, schema_version: 4 }, { ...manifest, runner_version: '0.0.1' }, { ...manifest, files: [{ path: '../auth', bytes: 0, sha256: 'a'.repeat(64) }] }]) assert.throws(() => validateCheckpoint(changed, repository));
   assert.throws(() => validateProducer({ ...x.state.artifact, workflow_run: { id: 99 } }, x.state.parent, manifest, repository));
 });
 
 test('native timeout remains eligible when skipped cleanup steps have timestamps', () => {
   assert.equal(nativeTimedOut({ status: 'completed', conclusion: 'timed_out', steps: [
-    { number: 1, name: 'Execute Codex', started_at: '2026-11-17T00:00:00Z', conclusion: 'failure' },
+    { number: 1, name: 'Execute agent', started_at: '2026-11-17T00:00:00Z', conclusion: 'failure' },
     { number: 2, name: 'Save final session', started_at: '2026-11-17T01:00:00Z', status: 'completed', conclusion: 'skipped' },
   ] }), true);
 });

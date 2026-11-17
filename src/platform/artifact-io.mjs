@@ -23,7 +23,7 @@ export async function readArtifact({ api, repository, id, root, kind = 'record' 
     let failure;
     try { failure = JSON.parse(error.stderr); } catch {}
     const reason = /^[a-z_]{1,80}$/.test(failure?.reason ?? '') ? failure.reason : 'unsafe_checkpoint_archive';
-    invariant(false, reason, reason === 'unsupported_checkpoint_schema' ? 4 : null,
+    invariant(false, reason, reason === 'unsupported_checkpoint_schema' ? 5 : null,
       reason === 'unsupported_checkpoint_schema' && Number.isSafeInteger(failure.observed) ? failure.observed : null);
   }
   const value = JSON.parse(await readFile(join(destination, kind === 'checkpoint' ? 'manifest.json' : 'record.json'), 'utf8'));

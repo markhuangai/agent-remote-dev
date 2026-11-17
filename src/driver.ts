@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { runCodex } from "./codex.js";
+import { runnerAdapter } from "./runners.js";
 import { RunnerError } from "./contracts.js";
 import type { Diagnostics } from "./diagnostics.js";
 import type { Job } from "./setup.js";
@@ -10,7 +10,7 @@ export async function drive(input: { job: Job; cwd: string; log: Diagnostics; pl
   state: (value: { session?: string; outcome: string; control?: ProcessControl }) => Promise<void> }) {
   let session = input.session ?? null, outcome = "completed", reason = "native_return", response = "";
   try {
-    const result = await runCodex(input.job, input.cwd, input.plan, input.log, Infinity, "native", session ?? undefined,
+    const result = await runnerAdapter(input.job.runner).execute(input.job, input.cwd, input.plan, input.log, Infinity, "native", session ?? undefined,
       id => { session = id; void input.state({ session: id, outcome: "running" }); },
       control => { void input.state({ outcome: "running", control }); });
     response = result.result;

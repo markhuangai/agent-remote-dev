@@ -91,8 +91,8 @@ Records include run correlation, trusted workflow SHA, effective reviewer
 settings, elapsed time, and safe API status/request/cause metadata.
 
 ```bash
-gh run view <run-id> --repo markhuangai/agent-remote-dev-codex --log
-gh run view --job <job-id> --repo markhuangai/agent-remote-dev-codex --log
+gh run view <run-id> --repo markhuangai/agent-remote-dev --log
+gh run view --job <job-id> --repo markhuangai/agent-remote-dev --log
 ```
 
 Filter the logs for `review.resolve`, `review.complete`, `validation.failed`,
@@ -112,17 +112,25 @@ outside the checkout; preserve workflow logs and CodeQL results as evidence.
 
 ## Task workflows and published-version tests
 
+For audited delivery, invoke `$sdlc-plan-implementation` with the complete
+approved plan. Use it and its `plan-audit`/`pr-review-loop` dependencies from
+`markhuangai/agent-remote-dev-skills` at `224a5be4ddf40c6cf0a50b97885cb353e8522e2e`.
+Require independent audit conformance before tests and final `automation_clean`
+on the exact PR head. This repository runs full CI automatically; there is no
+review-first validation request or pre-PR remote test route. Keep human review
+and merge as separate gates. See the [setup instructions](setup.md#deliver-an-audited-implementation-through-a-pr).
+
 `runner-task.yml` is the normal development entrypoint and keeps its filename for
-run history and resume. Its form contains only `plan` (or new context) and
+run history and resume. Its form contains `runner` (`codex` or `claude`, default `codex`), `plan` (or new context) and
 `resume-run-id`. Repository owners configure runner labels and job timeout in
 `jobs.run.with`; this repository fixes them to `ubuntu-latest` and 360 minutes.
-Recovery sends only plan/resume and reapplies the current caller YAML settings.
-The native CLI, Git, SQLite, snapshot, resume, cancellation, credential-exclusion
+Recovery sends the recorded runner with plan/resume and reapplies the current caller YAML settings.
+Both native agents, Git, SQLite, snapshot, resume, cancellation, credential-exclusion
 and continuation regressions remain in the local and CI suites.
 
-`runner-published.yml`, named **Test published Codex workflow**, is the single
+`runner-published.yml`, named **Test published remote development workflow**, is the single
 maintainer test entrypoint. Its form offers `channel` (`stable` or `prerelease`),
-plan, resume ID, runner labels and timeout. Mutually exclusive jobs call literal
+agent runner, plan, resume ID, machine labels and timeout. Mutually exclusive jobs call literal
 `@v1` and `@v1-prerelease` references. Provider checkout uses the executing job's
 workflow identity, not the run's list of all declared reusable calls.
 

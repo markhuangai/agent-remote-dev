@@ -11,11 +11,11 @@ export type ProcessControl = { directory: string; nonce: string; freeze<T>(copy:
 export type CommandOptions = { cwd: string; env: NodeJS.ProcessEnv; stage: string; log?: Diagnostics; timeoutMs?: number;
   onControl?: (control: ProcessControl) => void; stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown> };
 export async function command(executable: string, args: string[], options: CommandOptions) {
-  if (options.env.CODEX_TASK_CANCELLED === "1") throw new RunnerError("command_cancelled", options.stage, "Task cancellation is latched; no new operation was started.");
+  if (options.env.REMOTE_DEV_TASK_CANCELLED === "1") throw new RunnerError("command_cancelled", options.stage, "Task cancellation is latched; no new operation was started.");
   const started = Date.now();
   const timeoutMs = options.timeoutMs ?? 180000;
   if (timeoutMs <= 0) throw new RunnerError("command_timeout", options.stage, "Task budget exhausted before command startup.");
-  const control = await mkdtemp(join(options.env.TMPDIR ?? tmpdir(), "codex-process-"));
+  const control = await mkdtemp(join(options.env.TMPDIR ?? tmpdir(), "remote-dev-process-"));
   const receiptPath = join(control, "quiescent.json"), nonce = randomUUID();
   const fd = options.stdoutFile ? openSync(options.stdoutFile, "wx", 0o600) : undefined;
   const child = spawn("python3", [join(import.meta.dirname, "supervise.py"), receiptPath, nonce, executable, ...args],

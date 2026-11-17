@@ -57,7 +57,7 @@ export async function publishRelease({ api, plan }) {
   await api(`/repos/${plan.repository}/git/refs`, { method: 'POST', ref: `refs/tags/${plan.version}`, sha: plan.source_sha });
   const release = await api(`/repos/${plan.repository}/releases`, { method: 'POST', tag_name: plan.version, target_commitish: plan.source_sha,
     name: plan.version, draft: false, prerelease: plan.prerelease, make_latest: plan.prerelease ? 'false' : 'true',
-    body: `Reusable remote Codex workflow. Source: ${plan.source_sha}` });
+    body: `Reusable remote development workflow. Source: ${plan.source_sha}` });
   invariant(positiveId(release.id) && release.tag_name === plan.version && release.draft === false && release.prerelease === plan.prerelease, 'release_publication_ambiguous');
   const current = await optional(api, `/repos/${plan.repository}/git/ref/tags/${plan.alias}`);
   invariant((current?.object.sha ?? null) === plan.alias_previous_sha, 'release_alias_changed');

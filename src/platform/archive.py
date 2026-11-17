@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import zipfile
@@ -47,7 +48,9 @@ def unpack(archive, destination, kind):
         expected = {record: None}
         if kind == "checkpoint":
             schema = payload.get("schema_version")
-            require(schema == 4, "unsupported_checkpoint_schema", expected=4, observed=schema if type(schema) is int else None)
+            require(schema == 5, "unsupported_checkpoint_schema", expected=5, observed=schema if type(schema) is int else None)
+            runner = payload.get("runner")
+            require(runner in ("codex", "claude"), "checkpoint_runner_mismatch")
             inventory = payload.get("files")
             require(isinstance(inventory, list) and len(inventory) <= 10000, "invalid_checkpoint_inventory")
             databases = {"state_5.sqlite", "thread_history_1.sqlite", "goals_1.sqlite", "queue_1.sqlite", "memories_1.sqlite", "memories_v2_1.sqlite"}
@@ -55,9 +58,16 @@ def unpack(archive, destination, kind):
                 require(isinstance(item, dict) and isinstance(item.get("path"), str), "invalid_checkpoint_file")
                 path = item["path"]
                 parts = path.split("/")
-                allowed = (len(parts) == 2 and parts[0] == "codex" and parts[1] in databases) or (
+                allowed = runner == "codex" and ((len(parts) == 2 and parts[0] == "codex" and parts[1] in databases) or (
                     len(parts) >= 3 and parts[0] == "codex" and parts[1] in ("sessions", "archived_sessions") and
-                    (path.endswith(".jsonl") or path.endswith(".jsonl.zst")))
+                    (path.endswith(".jsonl") or path.endswith(".jsonl.zst"))))
+                if runner == "claude":
+                    allowed = any(re.fullmatch(pattern, path) for pattern in [
+                        r"claude/projects/[A-Za-z0-9_-]+/[a-f0-9-]{36}\.jsonl",
+                        r"claude/projects/[A-Za-z0-9_-]+/[a-f0-9-]{36}/(?:subagents/agent-[A-Za-z0-9_-]+\.(?:jsonl|meta\.json)|(?:tool-results|mcp-tasks)/.+)",
+                        r"claude/projects/[A-Za-z0-9_-]+/memory/.+\.md",
+                        r"claude/(?:tasks/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\.json|agent-memory/[A-Za-z0-9_-]+/.+\.md)",
+                    ])
                 require(allowed and path not in expected, "unexpected_checkpoint_file")
                 expected[path] = item
         directories = {parent + "/" for name in expected for parent in [str(p) for p in Path(name).parents if str(p) != "."]}

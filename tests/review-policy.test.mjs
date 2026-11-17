@@ -49,13 +49,13 @@ function fixture(options = {}) {
   };
   const context = {
     eventName: "pull_request_target", actor: "Z-M-Huang",
-    repo: { owner: "markhuangai", repo: "agent-remote-dev-codex" },
+    repo: { owner: "markhuangai", repo: "agent-remote-dev" },
     serverUrl: "https://github.com", runId: 90,
     payload: { repository, pull_request: structuredClone(pull) },
     ...options.context,
   };
   const env = {
-    GITHUB_REPOSITORY: "markhuangai/agent-remote-dev-codex",
+    GITHUB_REPOSITORY: "markhuangai/agent-remote-dev",
     GITHUB_RUN_ID: "90", GITHUB_RUN_ATTEMPT: "1", GITHUB_WORKFLOW_SHA: "c".repeat(40),
     GITHUB_RETENTION_DAYS: "90", GITHUB_REF: "refs/heads/main", TRIGGERING_ACTOR: "Z-M-Huang",
     PR_NUMBER: "7", HEAD_SHA: head, HEAD_REF: "feature", HEAD_REPOSITORY_ID: "17",

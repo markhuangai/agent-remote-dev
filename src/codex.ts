@@ -1,10 +1,12 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
 import type { ProcessControl } from "./process.js";
 import { RunnerError } from "./contracts.js";
+import { parse, stringify } from "smol-toml";
+import { protectConfiguration } from "./credentials.js";
 
 // Command arguments can contain unpublished task content even after credential redaction.
 const commandNames = new Set(["cat", "head", "tail", "sed", "rg", "ls", "find", "pwd", "git", "gh", "npm", "npx", "node",
@@ -12,7 +14,7 @@ const commandNames = new Set(["cat", "head", "tail", "sed", "rg", "ls", "find", 
 
 export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
-    "-c", `sqlite_home=${JSON.stringify(job.codexHome)}`, "-c", `log_dir=${JSON.stringify(join(job.root, "logs"))}`];
+    "-c", `sqlite_home=${JSON.stringify(job.runnerHome)}`, "-c", `log_dir=${JSON.stringify(join(job.root, "logs"))}`];
   const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--trust", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-last-message", output];
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
@@ -71,4 +73,15 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
   if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "codex", "Codex did not return the expected conversation identity.",
     { expected_session: session ?? null, observed_session: observed ?? null });
   return { session: observed, result: await readFile(output, "utf8") };
+}
+
+export async function configureCodex(job: Job, raw: string, log: Diagnostics, _mcp = "") {
+  let config: any;
+  try { config = parse(raw); } catch { throw new RunnerError("invalid_codex_config", "configuration", "Codex TOML could not be parsed; configuration contents withheld."); }
+  protectConfiguration(config, log);
+  for (const key of ["sqlite_home", "log_dir", "sandbox_mode", "sandbox_workspace_write", "approval_policy", "default_permissions", "permissions", "skills", "allow_login_shell", "cli_auth_credentials_store", "mcp_oauth_credentials_store"]) delete config[key];
+  Object.assign(config, { sqlite_home: job.runnerHome, log_dir: join(job.root, "logs"), allow_login_shell: false,
+    cli_auth_credentials_store: "file", mcp_oauth_credentials_store: "file", skills: { bundled: { enabled: false } } });
+  await writeFile(join(job.runnerHome, "config.toml"), stringify(config), { mode: 0o600 });
+  log.event("runtime.setup", "INFO", { stage: "configuration", outcome: "success", paths: { home: job.home, runner_home: job.runnerHome } });
 }
