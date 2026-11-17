@@ -123,7 +123,8 @@ CLI operations.
 ## 4. Check repository configuration
 
 The root [`.remote-codex.yml`](../.remote-codex.yml) in this repository currently
-allows `Z-M-Huang`, selects no extra skills, and disables automatic continuation.
+allows `Z-M-Huang`, installs the skills from `markhuangai/agent-remote-dev-skills`,
+and disables automatic continuation.
 It downloads the shared Golden instructions as user-level `AGENTS.md` on each run.
 Both the initiating and triggering user must be allowed and have repository
 write, maintain or admin access. Changes must reach the default branch before
