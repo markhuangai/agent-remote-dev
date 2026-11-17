@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       action-ref:
-        description: Optional v1-prerelease or v1 channel for an actual published fresh/resume smoke pair per runner family
+        description: Optional v1-prerelease or v1 channel for an actual published workflow fresh/resume pair per runner family
         type: string
       self-hosted-labels:
         description: JSON labels for the provisioned self-hosted Linux runner
@@ -17,14 +17,6 @@ on:
         type: string
       authorization:
         description: Direct request authorizing smoke task branches, draft PRs, resumes, cancellation and scoped cleanup
-        required: true
-        type: string
-      git-author-name:
-        description: Explicit authorized job Git identity
-        required: true
-        type: string
-      git-author-email:
-        description: Explicit authorized job Git email
         required: true
         type: string
 
@@ -59,8 +51,6 @@ jobs:
         env:
           SELF_HOSTED_LABELS: ${{ inputs.self-hosted-labels }}
           QUALIFICATION_AUTHORIZATION: ${{ inputs.authorization }}
-          GIT_AUTHOR_NAME: ${{ inputs.git-author-name }}
-          GIT_AUTHOR_EMAIL: ${{ inputs.git-author-email }}
         with:
           retries: 0
           script: |

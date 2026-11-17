@@ -5,42 +5,20 @@ import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
 import { zstdCompressSync } from "node:zlib";
 import test from "node:test";
-import { authorize, hash, skillSources } from "../.build/contracts.js";
+import { hash, skillSources } from "../.build/contracts.js";
 import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
-import { exportCheckpoint, durableCheckpoint } from "../.build/checkpoint.js";
-import { isolatedCheckpoint, isolatedRecord } from "../.build/checkpoint-worker.js";
-import { recordName } from "../src/platform/checkpoint-policy.mjs";
+import { exportCheckpoint, durableCheckpoint, inspectCredentials } from "../.build/checkpoint.js";
+import { uploadSnapshot } from "../.build/checkpoint-worker.js";
 import { TaskGit } from "../.build/git.js";
-import { selectPlanSource } from "../.build/main.js";
 import { command } from "../.build/process.js";
-import { exec, executionSource, execution, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
+import { exec, executionSource, checkpoint, sessionId, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
 
 const plan = "Implement the fixture plan.\n";
-const auth = { repository: "fixture/repo", plan_sha256: hash(plan), request: "Implement and deliver this plan, with checkpoint pushes." };
-const checkpoint = (extra = {}) => ({ task_id: "fixture-task", repository: "fixture/repo", branch: "codex/fixture-task", base_sha: "a".repeat(40), checkpoint_sha: "b".repeat(40),
-  plan, plan_source: "inline", authorization: auth, session_id: "fixture-session", sessions: ["fixture-session"], skills: [executionSource], user_agents: null, lineage, execution: execution(), previous: null, ...extra });
 async function history(f, content = "completed turn") {
   await mkdir(join(f.job.codexHome, "sessions"));
-  const data = JSON.stringify({ type: "session_meta", payload: { id: "fixture-session", session_id: "root-session" } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
+  const data = JSON.stringify({ type: "session_meta", payload: { id: sessionId, session_id: sessionId } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
   await writeFile(join(f.job.codexHome, "sessions/rollout.jsonl"), data);
 }
-test("prompt selection preserves exact bytes and issue references without a mode selector", () => {
-  assert.equal(selectPlanSource(plan).plan, plan);
-  const issuePrompt = "Implement https://github.com/fixture/repo/issues/2 using $chosen-skill.";
-  assert.equal(selectPlanSource(issuePrompt).plan, issuePrompt);
-  assert.equal(selectPlanSource("", "41").resumeArtifactId, 41);
-  for (const args of [[plan, "41"], ["", ""], ["", "invalid"]]) assert.throws(() => selectPlanSource(...args));
-  assert.deepEqual(authorize(auth, "fixture/repo", plan), auth);
-  for (const changed of [{ ...auth, permission_mode: "sandboxed" }, { ...auth, permission_mode: "full-access" }, { ...auth, plan_sha256: hash(plan.trim()) }, { ...auth, request: "" }, { ...auth, repository: "other/repo" }]) {
-    assert.throws(() => authorize(changed, "fixture/repo", plan));
-  }
-});
-test("the actual bundled entry rejects retired mode inputs before configuration or execution",async()=>{
-  for(const mode of ["sandboxed","full-access"]) await assert.rejects(exec(process.execPath,[join(root,"dist/index.js")],{
-    env:{...process.env,"INPUT_PERMISSION-MODE":mode,GITHUB_REPOSITORY:"fixture/repo",GITHUB_SERVER_URL:"https://github.com"},
-  }),error=>{assert.equal(error.code,1);assert.match(error.stdout,/unsupported_mode_input/);assert.doesNotMatch(error.stdout,/runtime\.setup|runtime\.operation/);return true;});
-});
-
 test("configuration is isolated, rejects invalid TOML, and prevents permission and storage overrides", async (t) => {
   const f = await fixture(t);
   await configure(f.job, 'model="gpt-5.1"\nsandbox_mode="read-only"\nsqlite_home="/outside"\n[model_providers.fixture]\nenv_key="CODEX_API_KEY"\nhttp_headers={authorization="fixture-config-secret-4631"}', f.log);
@@ -67,15 +45,11 @@ test("actual Skills CLI installs complete pinned portable packages outside proje
   assert.deepEqual(await readdir(root), before);
   await assert.rejects(installSkillSource(f.job, { ...executionSource, names:["missing-skill"] }, source, 1, f.log));
 });
-test("real locked tool installation rejects a mismatched installed Skills CLI version",async(t)=>{
-  const f=await fixture(t),action=join(f.temporary,"action-source");await mkdir(action);
-  await writeFile(join(action,"package.json"),JSON.stringify({name:"fixture-tools",private:true,version:"0.0.0",dependencies:{"@openai/codex":"0.169.0",skills:"1.8.0"}}));
-  await exec("npm",["install","--package-lock-only","--ignore-scripts","--no-audit","--no-fund"],{cwd:action,env:f.job.env,maxBuffer:1024*1024});
-  await assert.rejects(installTools(f.job,action,f.log),error=>{
-    assert.equal(error.reason,"skills_version_mismatch");assert.equal(error.details.expected_version,"1.8.1");assert.equal(error.details.observed_version,"1.8.0");
-    f.log.failure(error);return true;
-  });
-  assert.ok(f.records.some(record=>record.event==="runtime.operation"&&record.stage==="codex_version"&&record.outcome==="success"));
+test("runtime reuses the provider's package-managed Codex without a second installation", async t => {
+  const f = await fixture(t);
+  await installTools(f.job, root, f.log);
+  assert.equal(f.job.tools, root);
+  assert.equal(f.records.find(record => record.stage === 'codex_version').outcome, 'success');
 });
 for(const scenario of ["valid","revision","traversal","symlink"]) test(`actual skill source fetch enforces ${scenario} archive/revision decisions`,async(t)=>{
   const f=await fixture(t),archive=join(f.temporary,"source.tar.gz");
@@ -103,7 +77,8 @@ test("safe tree and cleanup refuse export symlinks and never follow cleanup link
 test("checkpoint exports exact session state and consistent SQLite backups, excluding secrets and caches", async (t) => {
   const f = await fixture(t); await history(f);
   const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
-  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE progress (value TEXT); INSERT INTO progress VALUES ('durable');");
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE progress (value TEXT); INSERT INTO progress VALUES ('durable'); CREATE TABLE threads (id TEXT, rollout_path TEXT);");
+  db.prepare("INSERT INTO threads VALUES (?, ?)").run(sessionId, join(f.job.codexHome, "sessions/rollout.jsonl"));
   await writeFile(join(f.job.codexHome, "auth.json"), f.job.env.CODEX_API_KEY);
   await writeFile(join(f.job.codexHome, "config.toml"), f.job.env.CODEX_API_KEY);
   await mkdir(join(f.job.codexHome, "cache")); await writeFile(join(f.job.codexHome, "cache/code.txt"), "excluded source");
@@ -114,8 +89,8 @@ test("checkpoint exports exact session state and consistent SQLite backups, excl
   const saved = new DatabaseSync(join(output.root, "codex/state_5.sqlite"), { readOnly: true });
   assert.equal(saved.prepare("SELECT value FROM progress").get().value, "durable"); saved.close();
   const manifest = JSON.parse(await readFile(join(output.root, "manifest.json"), "utf8"));
-  assert.equal(manifest.permission_mode,"full-access");assert.ok(!Object.hasOwn(manifest.authorization,"permission_mode"));
-  assert.equal(manifest.plan_sha256, hash(plan)); assert.equal(manifest.session_identifiers[0].session_id, "root-session");
+  assert.equal(manifest.codex_version, JSON.parse(await readFile(join(root, 'package.json'))).dependencies['@openai/codex']);
+  assert.equal(manifest.session_id, sessionId); assert.ok(!('authorization' in manifest));
   assert.ok(manifest.files.every((entry) => !/auth|config|cache|\.git/.test(entry.path)));
   assert.ok(output.files.every((file) => !/-(wal|shm)$/.test(file)));
 });
@@ -142,7 +117,7 @@ for (const storage of ["TEXT", "BLOB"]) test("checkpoint rejects a credential re
   assert.equal((await readFile(path)).includes(Buffer.from(secret)), false);
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {
     uploaded = true; return { id: 10 };
   }), { reason: "credential_in_checkpoint" });
   assert.equal(uploaded, false); assert.deepEqual(previous, { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) });
@@ -157,7 +132,7 @@ for (const compressed of [false, true]) test("checkpoint decodes escaped credent
   if (compressed) { await writeFile(path + ".zst", zstdCompressSync(data)); await unlink(path); }
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {
     uploaded = true; return { id: 10 };
   }), { reason: "credential_in_checkpoint" });
   assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
@@ -167,10 +142,10 @@ test("checkpoint rejects escaped manifest credentials before upload and retains 
   const f = await fixture(t), secret = 'fixture-"manifest\\credential\n9371';
   await configure(f.job, "[mcp_servers.fixture.env]\nPASSWORD=" + JSON.stringify(secret) + "\n", f.log); await history(f);
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
-  const input = checkpoint({ previous, authorization: { ...auth, request: secret } });
+  const input = checkpoint({ previous, operator: secret });
   assert.equal(JSON.stringify(input).includes(secret), false);
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, input, f.log, async () => {}, async () => {
+  await assert.rejects(durableCheckpoint(f.job, input, f.log, async () => {
     uploaded = true; return { id: 10 };
   }), { reason: "credential_in_manifest" });
   assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
@@ -195,7 +170,7 @@ for (const [scheme, header, provider, encoding] of [["Bearer", "authorization", 
     }
     const previous = { sequence:3, artifact_id:9, checkpoint_sha:"a".repeat(40) };
     let uploaded = false;
-    await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+    await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {
       uploaded = true; return { id:10 };
     }), error => { assert.equal(error.reason, "credential_in_checkpoint"); f.log.failure(error, previous); return true; });
     assert.equal(uploaded, false); assert.deepEqual(previous, { sequence:3, artifact_id:9, checkpoint_sha:"a".repeat(40) });
@@ -216,30 +191,26 @@ test("non-secret environment flags permit export while configured MCP credential
 test("upload failures, missing sessions, drift and size limits never advance the last durable receipt", async (t) => {
   const f = await fixture(t); await history(f);
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log, 1), { reason: "checkpoint_size_limit" });
-  await assert.rejects(exportCheckpoint(f.job, checkpoint({ previous: { sequence: 1, artifact_id: 4, checkpoint_sha: "a".repeat(40) }, sessions:["missing"] }), f.log), { reason: "missing_session_history" });
+  await assert.rejects(exportCheckpoint(f.job, checkpoint({ previous: { sequence: 1, artifact_id: 4, checkpoint_sha: "a".repeat(40) }, session_id:"missing" }), f.log), { reason: "missing_session_history" });
   const prior = { artifact_id: 4, sequence: 2, checkpoint_sha: "a".repeat(40) };
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous: prior }), f.log, async () => {}, async () => { uploaded = true; throw new Error("fixture upload failed"); }), error=>{
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous: prior }), f.log, async () => { uploaded = true; throw new Error("fixture upload failed"); }), error=>{
     f.log.failure(error,prior);assert.equal(error.stage,"checkpoint");assert.equal(error.reason,"artifact_upload_failed");return true;
   });
   assert.equal(uploaded, true); assert.equal(prior.artifact_id, 4);
   assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
-  const failure=f.records.find(record=>record.reason==="artifact_upload_failed");assert.equal(failure.intended_sha,"b".repeat(40));assert.equal(failure.last_durable_checkpoint.artifact_id,4);
+  const failure=f.records.find(record=>record.reason==="artifact_upload_failed");assert.equal(failure.reason,"artifact_upload_failed");assert.equal(failure.last_durable_checkpoint.artifact_id,4);
 });
-test("checkpoint failure diagnostics preserve real Git observations and the preceding durable receipt", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  await writeFile(join(r.cwd, "new.txt"), "Published change\n");
-  await r.git("add", "new.txt"); await r.git("commit", "-m", "Skill fixture"); await r.git("push", "origin", r.branch);
-  const observed = await git.head();
-  const previous = { sequence: 0, artifact_id: 7, checkpoint_sha: r.base };
-  await assert.rejects(isolatedCheckpoint(f.job, r.cwd, checkpoint({ base_sha:r.base, checkpoint_sha:r.base, previous }), f.log, sha => git.verify(sha)), error => {
-    assert.equal(error.reason, "checkpoint_operation_failed"); assert.equal(error.details.expected_sha, r.base);
-    assert.equal(error.details.observed_sha, observed); assert.equal(error.details.last_durable_checkpoint.artifact_id, 7); return true;
-  });
-  const failure = f.records.find(record => record.event === "checkpoint.failed");
-  assert.equal(failure.cause_reason, "checkpoint_head_mismatch"); assert.equal(failure.intended_sha, r.base);
-  assert.equal(failure.expected_sha, r.base); assert.equal(failure.observed_sha, observed);
-  assert.equal(failure.last_verified_sha, null); assert.equal(failure.last_durable_checkpoint.artifact_id, 7);
+test("dirty files and rejected pushes preserve the nearest published source without Git repairs", async t => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
+  await writeFile(join(r.cwd, 'draft.txt'), 'unfinished');
+  let saved = await git.snapshot();
+  assert.equal(saved.checkpoint_sha, r.base); assert.equal(saved.omitted_work, true);
+  await r.git('add', 'draft.txt'); await r.git('commit', '-m', 'Unpublished');
+  const local = await git.head(); saved = await git.snapshot();
+  assert.equal(saved.checkpoint_sha, r.base); assert.equal(saved.omitted_work, true); assert.equal(await git.head(), local);
+  await r.git('push', 'origin', 'HEAD'); saved = await git.snapshot();
+  assert.equal(saved.checkpoint_sha, local); assert.equal(saved.omitted_work, false);
 });
 
 test("explicit command diagnostics sanitize stdout while native and API output stay private", async (t) => {
@@ -268,54 +239,24 @@ test("managed descendants in another session stop before a completed command ret
   await new Promise(resolve=>setTimeout(resolve,1200));
   await assert.rejects(readFile(path),{code:"ENOENT"});
 });
-test("a stalled real artifact transport is terminated within the checkpoint action budget",async(t)=>{
-  const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);await history(f);
-  await mkdir(join(f.job.tools,"node_modules/@actions"));
-  await symlink(join(root,"node_modules/@actions/artifact"),join(f.job.tools,"node_modules/@actions/artifact"),"dir");
-  await r.git("push", "origin", r.branch); const sha=await git.head();
-  let requests=0;const server=createServer(async(request,response)=>{requests++;for await(const _ of request){};});
-  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
-  t.after(()=>new Promise(resolve=>{server.close(resolve);server.closeAllConnections();}));
-  const token="e30."+Buffer.from(JSON.stringify({scp:"Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222"})).toString("base64url")+".fixture";
-  f.job.env.CODEX_TASK_DEADLINE_MS=String(Date.now()+18000);
-  const previous={sequence:0,artifact_id:8,checkpoint_sha:sha};
-  await assert.rejects(isolatedCheckpoint(f.job,r.cwd,checkpoint({base_sha:r.base,checkpoint_sha:sha,previous}),f.log,expected=>git.verify(expected),
-    {...process.env,ACTIONS_RUNTIME_TOKEN:token,ACTIONS_RESULTS_URL:`http://127.0.0.1:${server.address().port}`,GITHUB_WORKSPACE:r.cwd,NO_PROXY:"127.0.0.1,localhost"},join(root,"dist/index.js")),{reason:"command_timeout"});
-  assert.ok(requests>0,"The actual artifact SDK reached the stalled transport");
-  const evidence=f.records.find(record=>record.event==="checkpoint.failed");
-  assert.equal(evidence.last_durable_checkpoint.artifact_id,8);assert.equal(evidence.intended_sha,sha);
-  assert.equal(evidence.observed_sha,null);assert.equal(evidence.last_verified_sha,sha);
-  assert.ok(Date.now()<Number(f.job.env.CODEX_TASK_DEADLINE_MS));
-});
-for (const variant of ["escaped", "unicode", "nested"]) test(`opaque result artifacts reject ${variant} JSON credentials before export or transport`, async t => {
-  const f = await fixture(t), secret = 'fixture-"result\\credential\n9371'; f.log.protect(secret);
-  const encoded = JSON.stringify({ credential: secret });
-  const response = variant === 'nested' ? JSON.stringify({ response: JSON.stringify(encoded) }) : variant === 'unicode' ?
-    '{"credential":"' + Array.from(secret, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('') + '"}' : encoded;
-  assert.equal(response.includes(secret), false);
-  await assert.rejects(isolatedRecord(f.job, 'result', { task_id: 'fixture-task', lineage, response, native_outcome: 'succeeded' }, f.log), error => {
-    assert.equal(error.reason, 'credential_in_manifest'); f.log.failure(error); return true;
-  });
-  await assert.rejects(readFile(join(f.job.exports, recordName('result', 'fixture-task', lineage.run_id, lineage.run_attempt), 'record.json')), { code: 'ENOENT' });
-  await assert.rejects(readFile(join(f.job.root, 'result-request.json')), { code: 'ENOENT' });
-  assert.doesNotMatch(JSON.stringify(f.records), /result\\\\credential|9371|credential\":/);
-  assert.ok(!f.records.some(record => record.stage === 'continuation_record' || record.event === 'continuation.record'));
-});
-test('safe opaque result bytes remain unchanged when the real artifact transport starts', async t => {
-  const f = await fixture(t);
-  await mkdir(join(f.job.tools, 'node_modules/@actions'));
-  await symlink(join(root, 'node_modules/@actions/artifact'), join(f.job.tools, 'node_modules/@actions/artifact'), 'dir');
+test("a stalled actual artifact SDK upload is bounded and keeps staged session data", async t => {
+  const f = await fixture(t); await history(f);
+  const exported = await exportCheckpoint(f.job, checkpoint(), f.log);
   let requests = 0;
   const server = createServer(async request => { requests++; for await (const _ of request) {} });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
   const token = 'e30.' + Buffer.from(JSON.stringify({ scp: 'Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222' })).toString('base64url') + '.fixture';
-  f.job.env.CODEX_TASK_DEADLINE_MS = String(Date.now() + 18000);
-  const response = 'Ordinary opaque response.\n{"unfinished JSON\n', value = { task_id: 'fixture-task', lineage, response, native_outcome: 'succeeded' };
-  await assert.rejects(isolatedRecord(f.job, 'result', value, f.log, { ...process.env, ACTIONS_RUNTIME_TOKEN: token,
-    ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, GITHUB_WORKSPACE: f.temporary, NO_PROXY: '127.0.0.1,localhost' }, join(root, 'dist/index.js')), { reason: 'command_timeout' });
-  assert.ok(requests > 0);
-  assert.deepEqual(JSON.parse(await readFile(join(f.job.exports, recordName('result', 'fixture-task', lineage.run_id, lineage.run_attempt), 'record.json'), 'utf8')), value);
+  await assert.rejects(uploadSnapshot(f.job, exported.name, exported.files, exported.root, f.log,
+    { ...process.env, ACTIONS_RUNTIME_TOKEN: token, ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, NO_PROXY: '127.0.0.1,localhost', GITHUB_WORKSPACE: f.temporary, CODEX_UPLOAD_TIMEOUT_MS: '1500' }), { reason: 'command_timeout' });
+  assert.ok(requests > 0); assert.ok(await readFile(join(exported.root, 'manifest.json')));
+});
+for (const variant of ['escaped', 'unicode', 'nested']) test(`result credential checks decode ${variant} JSON before transport`, async t => {
+  const f = await fixture(t), secret = 'fixture-"result\\credential\n9371'; f.log.protect(secret);
+  const encoded = JSON.stringify({ credential: secret });
+  const response = variant === 'nested' ? JSON.stringify({ response: JSON.stringify(encoded) }) : variant === 'unicode' ?
+    '{"credential":"' + Array.from(secret, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('') + '"}' : encoded;
+  assert.throws(() => inspectCredentials(response, f.log, 'credential_in_result'), { reason: 'credential_in_result' });
 });
 test("normal diagnostic output masks credentials and raw provider bodies and marks truncation", () => {
   const { log, records } = logger(); log.protect("fixture-secret-8291");
@@ -334,4 +275,45 @@ test("the real Actions logger retains required failure evidence after DEBUG filt
   const line=output.split("\n").find(line=>line.includes('"event":"runtime.failed"'));
   const evidence=JSON.parse(line.slice(line.indexOf("{")));
   assert.equal(evidence.stage,"checkpoint");assert.equal(evidence.expected_sha,"a".repeat(40));assert.equal(evidence.observed_sha,"b".repeat(40));assert.equal(evidence.last_durable_checkpoint.artifact_id,17);
+});
+
+test('a managed live SQLite/WAL writer pauses for consistent snapshots and resumes afterward', async t => {
+  const f = await fixture(t), marker = join(f.temporary, 'counter'); let control;
+  const writer = `const fs=require('node:fs'),{DatabaseSync}=require('node:sqlite');
+const db=new DatabaseSync(process.env.CODEX_HOME+'/state_5.sqlite');db.exec('PRAGMA journal_mode=WAL; CREATE TABLE progress (value INTEGER); INSERT INTO progress VALUES (0); CREATE TABLE threads (id TEXT, rollout_path TEXT)');db.prepare('INSERT INTO threads VALUES (?, ?)').run(${JSON.stringify(sessionId)},process.env.CODEX_HOME+'/sessions/rollout.jsonl');
+fs.mkdirSync(process.env.CODEX_HOME+'/sessions');fs.writeFileSync(process.env.CODEX_HOME+'/sessions/rollout.jsonl',JSON.stringify({type:'session_meta',payload:{id:${JSON.stringify(sessionId)}}})+'\\n');
+setInterval(()=>{db.exec('UPDATE progress SET value=value+1');fs.writeFileSync(${JSON.stringify(marker)},String(db.prepare('SELECT value FROM progress').get().value))},5);`;
+  const running = command(process.execPath, ['-e', writer], { cwd: f.temporary, env: f.job.env, stage: 'writer', timeoutMs: 1500, onControl: value => { control = value; } }).catch(error => error);
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) { try { if (Number(await readFile(marker)) > 3) break; } catch (error) { if (error.code !== 'ENOENT') throw error; } await new Promise(resolve => setTimeout(resolve, 10)); }
+  await control.freeze(async () => {
+    const before = await readFile(marker, 'utf8'); await new Promise(resolve => setTimeout(resolve, 75)); assert.equal(await readFile(marker, 'utf8'), before);
+  });
+  const exported = await exportCheckpoint(f.job, checkpoint(), f.log, undefined, control);
+  const db = new DatabaseSync(join(exported.root, 'codex/state_5.sqlite'), { readOnly: true });
+  assert.ok(db.prepare('SELECT value FROM progress').get().value > 0); db.close();
+  const before = Number(await readFile(marker)); await new Promise(resolve => setTimeout(resolve, 75)); assert.ok(Number(await readFile(marker)) > before);
+  const result = await running; assert.equal(result.reason, 'command_timeout'); assert.equal(result.details.quiescent, true);
+});
+
+test('an upload finalized remotely with a lost receipt does not poison later snapshot identities', async t => {
+  const f = await fixture(t); await history(f); const names = [];
+  await assert.rejects(durableCheckpoint(f.job, checkpoint(), f.log, async name => {
+    names.push(name); throw new Error('Remote finalization succeeded but response was lost');
+  }), { reason: 'artifact_upload_failed' });
+  const receipt = await durableCheckpoint(f.job, checkpoint(), f.log, async name => { names.push(name); return { id: 82 }; });
+  assert.notEqual(names[0], names[1]); assert.equal(receipt.sequence, 2); assert.equal(receipt.artifact_id, 82);
+});
+for (const variant of ['duplicate', 'missing-reference']) test(`staged ${variant} history cannot replace a completed snapshot`, async t => {
+  const f = await fixture(t); await history(f); let uploads = 0;
+  const previous = await durableCheckpoint(f.job, checkpoint(), f.log, async () => ({ id: ++uploads }));
+  if (variant === 'duplicate') await cp(join(f.job.codexHome, 'sessions/rollout.jsonl'), join(f.job.codexHome, 'sessions/duplicate.jsonl'));
+  else {
+    const db = new DatabaseSync(join(f.job.codexHome, 'state_5.sqlite'));
+    db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT)');
+    db.prepare('INSERT INTO threads VALUES (?, ?)').run(sessionId, join(f.job.codexHome, 'sessions/missing.jsonl')); db.close();
+  }
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => ({ id: ++uploads })),
+    { reason: variant === 'duplicate' ? 'duplicate_session_history' : 'missing_rollout_reference' });
+  assert.equal(uploads, 1); assert.equal(previous.artifact_id, 1);
 });

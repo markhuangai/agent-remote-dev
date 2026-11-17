@@ -1,145 +1,117 @@
 import * as core from "@actions/core";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { authorize, hash, parseJson, requireValue, RunnerError, shaPattern, skillSources } from "./contracts.js";
-import { isolatedCheckpoint, isolatedRecord } from "./checkpoint-worker.js";
-import { DurableCheckpoint } from "./checkpoint.js";
+import { requireValue, versions, parseJson } from "./contracts.js";
+import { uploadSnapshot, startSnapshots, waitSnapshots, saveSnapshot, latestSnapshot } from "./checkpoint-worker.js";
+import { durableCheckpoint, inspectCredentials, CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
 import { Diagnostics } from "./diagnostics.js";
 import { drive } from "./driver.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { configure, createJob, fetchSkillSource, installSkillSource, installTools, installUserAgents, removeJob, Job } from "./setup.js";
-import { verifyResumeSettings } from "./continuation.js";
-import { loadCheckpoint, restoreCheckpoint } from "./resume.js";
-import { positiveId, taskPattern } from "./platform/checkpoint-policy.mjs";
-import { authorizeActivation, requireActive } from "./platform/continuation-policy.mjs";
+import { restoreCheckpoint } from "./resume.js";
+import { githubAPI, prepareExecution, pruneSnapshots } from "./platform/continuation-policy.mjs";
+import { resolveSkills } from "./platform/sources.mjs";
 import { fetchInstructions } from "./platform/instructions.mjs";
-import { invocationSource, prepareInvocation } from "./invocation.js";
 
-export function selectPlanSource(plan: string, resume = "") {
-  requireValue(Boolean(plan.trim()) !== Boolean(resume.trim()), "exactly_one_plan_source_required");
-  if (resume) { requireValue(positiveId(resume), "invalid_artifact_id"); return { plan: null, resumeArtifactId: Number(resume) }; }
-  requireValue(Buffer.byteLength(plan) <= 1024 * 1024, "plan_size_limit");
-  return { plan, resumeArtifactId: undefined };
-}
-export async function main() {
-  const started = Date.now();
-  let job: Job | undefined, latestCheckpoint: DurableCheckpoint | null = null, runRecord: any = null, cancelled = false;
-  const cancel = () => { cancelled = true; if (job) job.env.CODEX_TASK_CANCELLED = "1"; };
-  process.on("SIGINT", cancel); process.on("SIGTERM", cancel);
-  const log = new Diagnostics({ repository: process.env.GITHUB_REPOSITORY, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT,
-    workflow_sha: process.env.GITHUB_WORKFLOW_SHA, retention_days: process.env.GITHUB_RETENTION_DAYS });
-  const get = (name: string, required = false) => core.getInput(name, { required, trimWhitespace: false });
+export type SavedRun = { control?: { directory: string; nonce: string }; watcher_pid?: number; job: Job; metadata: CheckpointInput; secrets: string[]; response: string; latest: DurableCheckpoint | null };
+export async function main({ github }: { github: any }) {
+  let saved: SavedRun | undefined, pendingJob: Job | undefined;
+  const log = new Diagnostics({ repository: process.env.GITHUB_REPOSITORY, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT });
   try {
     requireValue(process.platform === "linux" && ["x64", "arm64"].includes(process.arch) && Number(process.versions.node.split(".")[0]) === 24, "unsupported_platform", "setup");
-    if (get("permission-mode").trim()) throw new RunnerError("unsupported_mode_input", "preflight", "Execution is always YOLO; remove the retired permission-mode input.");
-    const repository = process.env.GITHUB_REPOSITORY ?? "";
-    requireValue(/^[\w.-]+\/[\w.-]+$/.test(repository) && process.env.GITHUB_SERVER_URL === "https://github.com", "unsupported_repository");
-    const token = get("github-token", true), key = get("codex-api-key", true), config = get("codex-config", true);
-    for (const secret of [token, key, config, Buffer.from(`x-access-token:${token}`).toString("base64")]) log.protect(secret);
-    for (const name of ["ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"]) if (process.env[name]) log.protect(process.env[name]!);
-    requireValue(token.length >= 8 && key.length >= 8, "invalid_credential_input");
-    const workspace = await realpath(process.env.GITHUB_WORKSPACE ?? process.cwd()), cwd = await realpath(resolve(workspace, get("working-directory") || "."));
-    requireValue(cwd === workspace || cwd.startsWith(workspace + sep), "workspace_escape");
-    job = await createJob(process.env.RUNNER_TEMP ?? "/tmp", key, token, "github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com");
-    const currentJob = job;
-    let exchange = 0;
-    const api = async (path: string, options?: any): Promise<any> => {
-      const endpoint = path.replace(/^\//, ""), args = ["api", endpoint];
-      if (options?.method) args.push("--method", options.method);
-      const { method, ...body } = options ?? {};
-      if (Object.keys(body).length) args.push("--input", "-");
-      const zip = endpoint.endsWith("/zip"), file = join(currentJob.staging, `api-${++exchange}.zip`);
-      const output = await command("gh", args, { cwd, env: currentJob.env, stage: "preflight_api", log, stdin: Object.keys(body).length ? JSON.stringify(body) : undefined, ...(zip ? { stdoutFile: file } : {}) });
-      return zip ? readFile(file) : parseJson(output, "github_api");
-    };
-    const actionRoot = resolve(import.meta.dirname, "..");
-    const installedSource = await invocationSource(api, actionRoot, process.env, args => command("git", args, { cwd: actionRoot, env: currentJob.env, stage: "action_source", log }));
-    const verified = await prepareInvocation({ api, source: installedSource, plan: get("plan"), resumeRunId: get("resume-run-id"), core, env: { ...process.env, RUNNER_TEMP: job.staging } });
-    const execution = verified.execution;
-    const source = selectPlanSource(verified.plan, String(verified.resumeArtifactId));
-    const taskId = verified.taskId;
-    requireValue(taskPattern.test(taskId), "invalid_task_id");
-    Object.assign(job.env, { GIT_AUTHOR_NAME: execution.git_author_name, GIT_COMMITTER_NAME: execution.git_author_name,
-      GIT_AUTHOR_EMAIL: execution.git_author_email, GIT_COMMITTER_EMAIL: execution.git_author_email,
-      CODEX_TASK_DEADLINE_MS: String(started + execution.budget_minutes * 60000) });
+    const token = process.env.CODEX_GITHUB_TOKEN!, key = process.env.CODEX_API_KEY!, config = process.env.CODEX_CONFIG_TOML!;
+    requireValue(token?.length >= 8 && key?.length >= 8 && config, "invalid_credential_input");
+    for (const secret of [token, key, config, Buffer.from(`x-access-token:${token}`).toString("base64"), process.env.ACTIONS_RUNTIME_TOKEN, process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN]) if (secret) log.protect(secret);
+    const workspace = await realpath(process.env.GITHUB_WORKSPACE!), cwd = await realpath(join(workspace, "target"));
+    requireValue(cwd.startsWith(workspace + sep), "workspace_escape");
+    const job = pendingJob = await createJob(process.env.RUNNER_TEMP!, key, token, "github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com");
+    const statePath = join(job.root, "state.json"); core.setOutput("state-path", statePath);
+    const api = githubAPI(github), repository = process.env.GITHUB_REPOSITORY!;
+    const prepared = await prepareExecution({ api, repository, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+      actor: process.env.GITHUB_ACTOR, triggeringActor: process.env.TRIGGERING_ACTOR, ref: process.env.GITHUB_REF,
+      resumeRunId: process.env.CODEX_RESUME_RUN_ID ?? '', plan: process.env.CODEX_PLAN ?? '', root: job.staging, codexVersion: versions.codex });
+    const settings = prepared.settings;
+    Object.assign(job.env, { GIT_AUTHOR_NAME: settings.git_author_name, GIT_COMMITTER_NAME: settings.git_author_name,
+      GIT_AUTHOR_EMAIL: settings.git_author_email, GIT_COMMITTER_EMAIL: settings.git_author_email });
     await configure(job, config, log);
-    log.fields = { ...log.fields, platform: process.platform, architecture: process.arch, source_repository: execution.source_repository, action_source_sha: execution.source_sha,
-      budget_minutes: execution.budget_minutes, root_run_id: execution.root_run_id, parent_run_id: execution.parent_run_id, continuation_count: execution.continuation_count,
-      max_continuations: execution.max_continuations, user_agents_sha256: execution.user_agents_sha256,
-      project_config_sha256: execution.project_config?.sha256, project_config_revision: execution.project_config?.revision };
-    let selected = skillSources(verified.skills);
-    let restored: Awaited<ReturnType<typeof loadCheckpoint>> | undefined;
-    if (source.resumeArtifactId) {
-      restored = await loadCheckpoint(job, path => api(path), repository, source.resumeArtifactId, log, taskId);
-      verifyResumeSettings(restored.manifest.execution, execution);
-      selected = skillSources(restored.manifest.skills);
-    }
-    const plan = restored?.manifest.plan ?? source.plan;
-    requireValue(typeof plan === "string", "missing_plan");
-    const authorization = authorize(verified.authorization, repository, plan);
-    let userAgents = restored?.manifest.user_agents ?? null;
-    if (!restored && execution.user_agents_url) {
-      try { userAgents = await fetchInstructions(execution.user_agents_url, execution.user_agents_sha256!); }
-      catch (error: any) { throw new RunnerError(error.reason ?? "user_agents_download_failed", "instructions", "The approved user instructions could not be provisioned.", error.details); }
-    }
-    log.fields = { ...log.fields, task_id: taskId, plan_sha256: hash(plan), actor: process.env.GITHUB_ACTOR, skills: selected };
-    const git = new TaskGit(cwd, job.env, log);
-    requireValue((await git.run(["rev-parse", "--show-toplevel"])).trim() === cwd && await git.changedPaths() === "", "unsafe_worktree");
-    const origin = (await git.run(["remote", "get-url", "origin"])).trim();
-    requireValue(origin === `https://github.com/${repository}.git` || origin === `https://github.com/${repository}`, "origin_identity_mismatch");
-    if (!restored) {
-      const path = join(cwd, 'remote-codex.yml'), stat = await lstat(path);
-      requireValue(stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536 && hash(await readFile(path)) === execution.project_config?.sha256, 'checkout_project_config_mismatch');
-    }
-    await command("python3", ["-c", "import sys; assert sys.version_info >= (3,12)"], { cwd, env: job.env, stage: "python_version", log });
     await installTools(job, resolve(import.meta.dirname, ".."), log);
-    for (const [index, skill] of selected.entries()) await installSkillSource(job, skill, await fetchSkillSource(job, skill, index, log), index, log);
+    const skillAPI = async (path: string) => parseJson(await command("gh", ["api", path.replace(/^\//, '')], { cwd, env: job.env, stage: "skill_source", log }), "skills");
+    const skills = await resolveSkills(skillAPI, settings.skills);
+    for (const [index, skill] of skills.entries()) await installSkillSource(job, skill, await fetchSkillSource(job, skill, index, log), index, log);
+    const userAgents = settings.user_agents_url ? await fetchInstructions(settings.user_agents_url) : null;
     await installUserAgents(job, userAgents, log);
-    if (restored) { await restoreCheckpoint(job, restored.root, restored.manifest, git, log); latestCheckpoint = restored.receipt; }
-    const base = restored?.manifest.base_sha ?? await git.head();
-    requireValue(shaPattern.test(base), "invalid_initial_revision");
-    const lineage = { repository, workflow_ref: process.env.GITHUB_WORKFLOW_REF, workflow_sha: process.env.GITHUB_WORKFLOW_SHA, run_id: process.env.GITHUB_RUN_ID,
-      run_attempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
-      triggering_actor: process.env.TRIGGERING_ACTOR || process.env.GITHUB_TRIGGERING_ACTOR || process.env.GITHUB_ACTOR,
-      runner_labels: process.env.CODEX_RUNNER_LABELS ? parseJson(process.env.CODEX_RUNNER_LABELS, "runner_metadata") : null };
-    runRecord = { schema_version: 3, repository, task_id: taskId, initial_sha: base, plan_sha256: hash(plan), authorization, execution, lineage, skills: selected, invocation: installedSource, runner_labels: lineage.runner_labels,
-      plan_source: restored?.manifest.plan_source ?? "inline", resume_artifact_id: restored?.receipt.artifact_id ?? null };
-    await isolatedRecord(job, "run", runRecord, log);
-    await requireActive(api, repository, taskId, execution.activation_run_id, execution.request_id);
-    await authorizeActivation(api, repository, execution);
-    for (const [name, value] of Object.entries({ "base-sha": base, "root-run-id": execution.root_run_id,
-      "parent-run-id": execution.parent_run_id ?? "", "continuation-count": execution.continuation_count })) core.setOutput(name, value);
-    const result = await drive({ job, git, log, plan, planSource: runRecord.plan_source, authorization, repository, taskId, base, skills: selected, userAgents,
-      budgetMs: execution.budget_minutes * 60000, started, execution, cancelled: () => cancelled, lineage,
-      resume: restored ? { session: restored.manifest.session_id, checkpoint: restored.receipt } : undefined,
-      checkpoint: async input => {
-        await requireActive(api, repository, taskId, execution.activation_run_id, execution.request_id);
-        const receipt = await isolatedCheckpoint(currentJob, cwd, input, log, sha => git.verify(sha));
-        latestCheckpoint = receipt;
-        core.setOutput("checkpoint-sha", receipt.checkpoint_sha); core.setOutput("artifact-id", receipt.artifact_id); core.setOutput("branch", input.branch ?? "");
-        return receipt;
-      },
-      result: async value => {
-        const receipt = await isolatedRecord(currentJob, "result", { schema_version: 3, repository, task_id: taskId, lineage, ...value }, log);
-        core.setOutput("result-artifact-id", receipt.artifact_id);
-      },
-    });
-    core.setOutput("status", result.status); core.setOutput("session-id", result.session ?? "");
-    core.setOutput("native-outcome", result.nativeOutcome);
-    await isolatedRecord(job, "outcome", { schema_version: 3, repository, task_id: taskId, lineage, status: result.status, reason: result.reason, native_outcome: result.nativeOutcome, checkpoint: result.checkpoint }, log);
-    if (!["completed", "continuing"].includes(result.status)) core.setFailed(`Native invocation ${result.status}; inspect infrastructure diagnostics and the selected skill's result.`);
+    const git = new TaskGit(cwd, job.env, log);
+    requireValue((await git.run(["rev-parse", "--show-toplevel"])).trim() === cwd && !await git.changedPaths(), "unsafe_worktree");
+    const origin = (await git.run(["remote", "get-url", "origin"])).trim();
+    requireValue([`https://github.com/${repository}.git`, `https://github.com/${repository}`].includes(origin), "origin_identity_mismatch");
+    const restored = prepared.restored;
+    if (restored) await restoreCheckpoint(job, restored.root, restored.manifest, git, log);
+    const metadata: CheckpointInput = { repository, ...await git.snapshot(), session_id: restored?.manifest.session_id ?? '',
+      root_run_id: prepared.root_run_id, activation_run_id: prepared.activation_run_id, auto_count: prepared.auto_count, operator: prepared.operator, provider_sha: process.env.CODEX_PROVIDER_SHA,
+      lineage: prepared.lineage, outcome: "running", workspace: cwd };
+    saved = { job, metadata, secrets: log.protectedValues, response: '', latest: null };
+    const state = saved;
+    let writes = Promise.resolve();
+    const persist = () => { writes = writes.then(async () => {
+      await writeFile(statePath + ".tmp", JSON.stringify(state), { mode: 0o600 }); await rename(statePath + ".tmp", statePath);
+    }); return writes; };
+    await persist();
+    state.watcher_pid = await startSnapshots(statePath, job); await persist();
+    let logged = 0;
+    const flushLogs = async () => {
+      let content;
+      try { content = await readFile(join(job.root, "snapshots.log"), "utf8"); } catch (error: any) { if (error.code === 'ENOENT') return; throw error; }
+      const end = content.lastIndexOf("\n") + 1;
+      for (const line of content.slice(logged, end).split("\n").filter(line => line.startsWith("{"))) core.info(line);
+      logged = end;
+    };
+    const logs = setInterval(() => { void flushLogs(); }, 1000); logs.unref();
+    log.fields = { ...log.fields, session_id: metadata.session_id, root_run_id: metadata.root_run_id, continuation_count: metadata.auto_count,
+      job_timeout_minutes: Number(process.env.CODEX_TIMEOUT_MINUTES), project_config_sha256: prepared.config_sha256, skills, user_agents_sha256: userAgents?.sha256 ?? null };
+    let prompt = process.env.CODEX_PLAN ?? '';
+    if (restored) prompt = `Continue this conversation using the current repository configuration. The checkout is the published revision ${restored.manifest.checkpoint_sha}. ` +
+      (restored.manifest.omitted_work ? 'Uncommitted or unpushed work from the previous runner was not restored; inspect the checkout and recreate missing work as needed. ' : '') +
+      `\n\nAdditional context:\n${prompt || 'Continue the unfinished task.'}`;
+    const result = await drive({ job, cwd, log, plan: prompt, session: restored?.manifest.session_id,
+      state: async value => {
+        if (value.session) { metadata.session_id = value.session; log.fields.session_id = value.session; }
+        if (value.control) state.control = { directory: value.control.directory, nonce: value.control.nonce };
+        metadata.outcome = value.outcome as CheckpointInput['outcome']; await persist();
+      } });
+    clearInterval(logs); await flushLogs();
+    state.response = result.response; await persist();
+    core.setOutput("session-id", result.session ?? ''); core.setOutput("status", result.outcome);
+    if (result.outcome !== 'completed') core.setFailed(`Native invocation ${result.outcome}; inspect the saved session and diagnostics.`);
   } catch (error) {
-    log.failure(error, latestCheckpoint);
-    core.setOutput("status", cancelled ? "cancelled" : "failed");
-    core.setFailed("Runner infrastructure failed; inspect structured diagnostics and retain the last durable checkpoint.");
-    if (job && runRecord) {
-      try { await isolatedRecord(job, "outcome", { schema_version: 3, repository: runRecord.repository, task_id: runRecord.task_id, lineage: runRecord.lineage,
-        status: cancelled ? "cancelled" : "failed", reason: error instanceof RunnerError ? error.reason : "infrastructure_failed", checkpoint: latestCheckpoint }, log); }
-      catch (recordError) { log.failure(recordError, latestCheckpoint); }
-    }
-  } finally {
-    process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel);
-    if (job) { await removeJob(job.root); log.event("runtime.cleanup", "INFO", { outcome: "removed_job_temporary_files" }); }
+    log.failure(error, saved?.latest);
+    if (saved) { saved.metadata.outcome = "failed"; await writeFile(join(saved.job.root, "state.json"), JSON.stringify(saved), { mode: 0o600 }); }
+    if (!saved && pendingJob) await removeJob(pendingJob.root);
+    core.setFailed("Remote Codex failed; inspect structured diagnostics.");
   }
+}
+export async function finish({ github, statePath }: { github: any; statePath: string }) {
+  if (!statePath) return;
+  const temporary = await realpath(process.env.RUNNER_TEMP!), path = resolve(statePath);
+  requireValue(path.startsWith(temporary + sep) && /\/codex-task-[^/]+\/state\.json$/.test(path) && !(await lstat(path)).isSymbolicLink(), "unsafe_final_state");
+  let saved: SavedRun;
+  try { saved = JSON.parse(await readFile(path, "utf8")); }
+  catch (error: any) { if (error.code === 'ENOENT') return; throw error; }
+  const log = new Diagnostics({ repository: saved.metadata.repository, run_id: saved.metadata.lineage.run_id, session_id: saved.metadata.session_id });
+  for (const secret of saved.secrets) log.protect(secret);
+  try {
+    await waitSnapshots(saved);
+    saved.latest = await latestSnapshot(saved.job);
+    const workerLog = await readFile(join(saved.job.root, "snapshots.log"), "utf8").catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
+    for (const line of workerLog.split("\n").filter(line => line.startsWith("{"))) core.info(line);
+    if (saved.metadata.session_id) {
+      const receipt = await saveSnapshot(saved, log, githubAPI(github));
+      saved.latest = receipt; core.setOutput("artifact-id", receipt.artifact_id);
+    }
+    inspectCredentials(saved.response, log, "credential_in_result");
+    const file = join(saved.job.exports, "record.json"); await writeFile(file, JSON.stringify({ response: saved.response, native_outcome: saved.metadata.outcome, session_id: saved.metadata.session_id }), { mode: 0o600 });
+    await uploadSnapshot(saved.job, `codex-result-r${saved.metadata.lineage.run_id}-a${saved.metadata.lineage.run_attempt}`, [file], saved.job.exports, log);
+    await core.summary.addTable([["Outcome", "Session", "Saved artifact"], [saved.metadata.outcome, saved.metadata.session_id || "unavailable", String(saved.latest?.artifact_id ?? "unavailable")]]).write();
+  } catch (error) { log.failure(error, saved.latest); core.setFailed("Final session export failed; retain the last completed snapshot."); }
+  finally { await removeJob(saved.job.root); }
 }

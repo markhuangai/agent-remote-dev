@@ -1,20 +1,20 @@
 import { DatabaseSync } from "node:sqlite";
 import { cp, lstat, mkdir, readFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { checkpointBytes, databases, positiveId, validateManifest, validateProducer } from "./platform/checkpoint-policy.mjs";
-import { authorize, parseJson, requireValue, RunnerError, skillSources, versions } from "./contracts.js";
+import { zstdDecompressSync } from "node:zlib";
+import { checkpointBytes, databases, validateManifest } from "./platform/checkpoint-policy.mjs";
+import { requireValue, RunnerError, versions } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
+import { inspectCredentials, validateDatabase } from "./checkpoint.js";
 import { Job, safeTree } from "./setup.js";
 import { TaskGit } from "./git.js";
-import { zstdDecompressSync } from "node:zlib";
-import { CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
-import { Execution } from "./continuation.js";
 
-export type Manifest = CheckpointInput & { schema_version: 3; execution: Execution; workspace: string; codex_home: string;
-  sequence: number; files: { path: string; sha256: string; bytes: number }[]; plan_sha256: string };
+export function validateCheckpoint(value: unknown, repository: string) {
+  return validateManifest(value, { repository, codexVersion: versions.codex });
+}
 export async function unpackArchive(job: Job, archive: string, destination: string, kind: "checkpoint" | "record", log: Diagnostics) {
-  try { await command("python3", [join(import.meta.dirname, "archive.py"), archive, destination, kind], { cwd: job.root, env: job.env, stage: "resume_archive", log }); }
+  try { await command("python3", [join(import.meta.dirname, "platform/archive.py"), archive, destination, kind], { cwd: job.root, env: job.env, stage: "resume_archive", log }); }
   catch (error) {
     let failure: any;
     try { failure = JSON.parse(error instanceof RunnerError ? error.nativeCause : "null"); } catch {}
@@ -23,54 +23,10 @@ export async function unpackArchive(job: Job, archive: string, destination: stri
       "invalid_checkpoint_file", "unexpected_checkpoint_file", "archive_inventory_mismatch", "checkpoint_file_hash_mismatch", "restore_destination_exists", "archive_read_failed"];
     const reason = allowed.includes(failure?.reason) ? failure.reason : "unsafe_checkpoint_archive";
     throw new RunnerError(reason, "resume", "Archive validation rejected the requested checkpoint.", reason === "unsupported_checkpoint_schema" ?
-      { expected: 3, observed: Number.isSafeInteger(failure.observed) ? failure.observed : null } : {});
+      { expected: 4, observed: Number.isSafeInteger(failure.observed) ? failure.observed : null } : {});
   }
 }
-export function validateCheckpoint(value: unknown, repository: string, taskId?: string): Manifest {
-  try {
-    const manifest = validateManifest(value, { repository, taskId, versions });
-    authorize(manifest.authorization, repository, manifest.plan);
-    skillSources(manifest.skills);
-    return manifest as Manifest;
-  } catch (error: any) {
-    if (error instanceof RunnerError) throw error;
-    throw new RunnerError(error.reason ?? "invalid_checkpoint_manifest", "resume", "Checkpoint invariant rejected.", error.details);
-  }
-}
-export async function downloadArtifact(job: Job, api: (endpoint: string) => Promise<any>, repository: string, id: number,
-  kind: "checkpoint" | "record", log: Diagnostics) {
-  requireValue(positiveId(id), "invalid_artifact_id", "resume");
-  const artifact = await api(`repos/${repository}/actions/artifacts/${id}`);
-  if (artifact.id !== id || artifact.expired || !(Date.parse(artifact.expires_at) > Date.now())) throw new RunnerError("checkpoint_artifact_expired", "resume", "The requested artifact is missing, expired or has a different identity.", { artifact_id: id });
-  requireValue(Number.isSafeInteger(artifact.size_in_bytes) && artifact.size_in_bytes > 0 && artifact.size_in_bytes <= (kind === "checkpoint" ? checkpointBytes : 2 * 1024 * 1024), "checkpoint_size_limit", "resume");
-  const archive = join(job.staging, `artifact-${id}.zip`), root = join(job.staging, `artifact-${id}`);
-  await command("gh", ["api", `repos/${repository}/actions/artifacts/${id}/zip`], { cwd: job.root, env: job.env, stage: "resume_download", stdoutFile: archive, log });
-  await unpackArchive(job, archive, root, kind, log);
-  return { artifact, root, value: parseJson(await readFile(join(root, kind === "checkpoint" ? "manifest.json" : "record.json"), "utf8"), "resume") };
-}
-export async function loadCheckpoint(job: Job, api: (endpoint: string) => Promise<any>, repository: string, id: number, log: Diagnostics, taskId?: string) {
-  const started = Date.now();
-  log.event("resume.validate", "INFO", { artifact_id: id, outcome: "started" });
-  try {
-    const loaded = await downloadArtifact(job, api, repository, id, "checkpoint", log);
-    const manifest = validateCheckpoint(loaded.value, repository, taskId);
-    const runId = String(manifest.lineage.run_id), attempt = String(manifest.lineage.run_attempt);
-    const run = await api(`repos/${repository}/actions/runs/${runId}/attempts/${attempt}`);
-    try { validateProducer(loaded.artifact, run, manifest, repository); }
-    catch (error: any) { throw new RunnerError(error.reason, "resume", "Artifact producer does not match the checkpoint.", error.details); }
-    requireValue(run.status === "completed", "checkpoint_producer_active", "resume");
-    const workflow = await api(`repos/${repository}/actions/workflows/${run.workflow_id}`);
-    requireValue(workflow.path === run.path && workflow.state === "active", "checkpoint_workflow_mismatch", "resume");
-    log.event("resume.validate", "INFO", { artifact_id: id, producer_run_id: runId, producer_attempt: attempt, task_id: manifest.task_id,
-      checkpoint_sha: manifest.checkpoint_sha, session_id: manifest.session_id, outcome: "verified", elapsed_ms: Date.now() - started });
-    return { ...loaded, manifest, run, receipt: { artifact_id: id, checkpoint_sha: manifest.checkpoint_sha, sequence: manifest.sequence } as DurableCheckpoint };
-  } catch (error: any) {
-    log.event("resume.validate", "ERROR", { artifact_id: id, outcome: "rejected", reason: error.reason ?? "artifact_transport_failed", ...error.details,
-      elapsed_ms: Date.now() - started, corrective_action: "Use an unexpired schema-3 checkpoint from the trusted task workflow and resolve the rejected invariant before resuming." });
-    throw error;
-  }
-}
-export async function restoreCheckpoint(job: Job, root: string, manifest: Manifest, git: TaskGit, log: Diagnostics) {
+export async function restoreCheckpoint(job: Job, root: string, manifest: any, git: TaskGit, log: Diagnostics) {
   try { await restoreVerifiedCheckpoint(job, root, manifest, git, log); }
   catch (error: any) {
     log.event("resume.restore", "ERROR", { outcome: "rejected", task_id: manifest.task_id, session_id: manifest.session_id,
@@ -78,7 +34,7 @@ export async function restoreCheckpoint(job: Job, root: string, manifest: Manife
     throw error;
   }
 }
-async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manifest, git: TaskGit, log: Diagnostics) {
+async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: any, git: TaskGit, log: Diagnostics) {
   const started = Date.now();
   const files = await safeTree(join(root, "codex"));
   let decodedBytes = 0;
@@ -90,34 +46,19 @@ async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manif
     let rows: any[];
     try { rows = decoded.toString("utf8").trimEnd().split("\n").map(line => JSON.parse(line)); }
     catch { throw new RunnerError("invalid_session_history", "resume"); }
-    const inspect = (value: any): void => {
-      if (typeof value === "string") for (const secret of log.protectedValues) requireValue(!value.includes(secret), "credential_in_checkpoint", "resume");
-      else if (value && typeof value === "object") for (const child of Object.values(value)) inspect(child);
-    };
-    inspect(rows);
+    inspectCredentials(rows, log);
     const meta = rows[0];
-    requireValue(meta?.type === "session_meta" && Array.isArray((manifest as any).session_identifiers) &&
-      (manifest as any).session_identifiers.some((entry: any) => entry.thread_id === meta.payload?.id && entry.session_id === (meta.payload?.session_id ?? meta.payload?.id)), "checkpoint_session_mismatch", "resume");
+    requireValue(meta?.type === "session_meta" && typeof meta.payload?.id === "string", "checkpoint_session_mismatch", "resume");
     requireValue(!identifiers.includes(meta.payload.id), "duplicate_session_history", "resume");
     identifiers.push(meta.payload.id);
   }
-  requireValue(manifest.sessions.every(id => identifiers.includes(id)), "missing_session_history", "resume");
-  git.branch = manifest.branch;
-  requireValue((await git.run(["status", "--porcelain", "--untracked-files=all"])).trim() === "", "unsafe_worktree", "resume");
-  await git.run(["fetch", "--no-tags", "origin", manifest.checkpoint_sha]);
-  requireValue((await git.run(["rev-parse", "FETCH_HEAD"])).trim() === manifest.checkpoint_sha, "resume_fetch_drift", "resume");
-  if (manifest.branch === null) await git.run(["switch", "--detach", manifest.checkpoint_sha]);
-  else {
-    const local = (await git.run(["branch", "--list", "--format=%(objectname)", manifest.branch])).trim();
-    if (local && local !== manifest.checkpoint_sha) await git.run(["switch", "--detach", manifest.checkpoint_sha]);
-    else await git.run(local ? ["switch", manifest.branch] : ["switch", "-c", manifest.branch, manifest.checkpoint_sha]);
-  }
-  git.branch = await git.currentBranch();
-  await git.verify(manifest.checkpoint_sha);
+  requireValue(identifiers.includes(manifest.session_id), "missing_session_history", "resume");
+  await git.restore(manifest.branch, manifest.checkpoint_sha);
   const source = join(root, "codex");
   for (const name of databases) {
     const database = join(source, name);
     if (!files.includes(database)) continue;
+    validateDatabase(database, log);
     const db = new DatabaseSync(database);
     try {
       db.exec("PRAGMA trusted_schema=OFF");
@@ -128,7 +69,7 @@ async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manif
         for (const row of rows) {
           requireValue(typeof row.rollout_path === "string" && row.rollout_path.startsWith(manifest.codex_home + sep), "unsafe_rollout_reference", "resume");
           const relative = row.rollout_path.slice(manifest.codex_home.length + 1);
-          requireValue(manifest.files.some(file => file.path === `codex/${relative}`), "missing_rollout_reference", "resume");
+          requireValue(manifest.files.some((file: any) => file.path === `codex/${relative}`), "missing_rollout_reference", "resume");
           requireValue(resolve(job.codexHome, relative).startsWith(job.codexHome + sep), "unsafe_rollout_reference", "resume");
           const cwd = typeof row.cwd === "string" && (row.cwd === manifest.workspace || row.cwd.startsWith(manifest.workspace + sep)) ? git.cwd + row.cwd.slice(manifest.workspace.length) : row.cwd;
           update.run(join(job.codexHome, relative), cwd, row.id);

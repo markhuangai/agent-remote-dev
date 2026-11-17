@@ -3,19 +3,22 @@ name: Reusable remote Codex
 on:
   workflow_call:
     inputs:
+      plan:
+        description: Refined plan for a new task, or additional context for a resumed conversation
+        type: string
+        default: ''
+      resume-run-id:
+        description: Prior run containing the native session to resume
+        type: string
+        default: ''
       runs-on:
-        description: Linux runner labels selected by the consumer workflow
+        description: JSON array of consumer-selected Linux runner labels
         type: string
         default: '["ubuntu-latest"]'
-      resume-run-id:
-        type: string
-        default: ''
-      plan:
-        type: string
-        default: ''
-      request:
-        type: string
-        default: ''
+      timeout-minutes:
+        description: GitHub job timeout, subject to the selected runner's limits
+        type: number
+        default: 360
     secrets:
       codex-config:
         required: true
@@ -26,28 +29,21 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 env:
-  CODEX_RUNNER_PROTOCOL: '3'
   TRIGGERING_ACTOR: ${{ github.triggering_actor }}
 
 jobs:
   resolve:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'workflow_dispatch'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      provider_repository: ${{ steps.source.outputs.repository }}
       provider_sha: ${{ steps.source.outputs.sha }}
-      operation: ${{ steps.authorize.outputs.operation }}
-      eligible: ${{ steps.controller.outputs.eligible }}
-      task_id: ${{ steps.prepare.outputs.task_id || steps.authorize.outputs.task_id || steps.controller.outputs.task_id }}
-      source_repository: ${{ steps.prepare.outputs.source_repository }}
       source_sha: ${{ steps.prepare.outputs.source_sha }}
-      request: ${{ steps.prepare.outputs.request || steps.authorize.outputs.request }}
+      root_run_id: ${{ steps.prepare.outputs.root_run_id }}
     steps:
-      - name: Resolve this reusable workflow's immutable implementation
+      - name: Resolve the reusable workflow's immutable provider source
         id: source
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
@@ -57,184 +53,122 @@ jobs:
             const prefix = 'markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@';
             const references = (run.referenced_workflows || []).filter(item => item.path?.startsWith(prefix));
             if (run.id !== context.runId || run.run_attempt !== Number(process.env.GITHUB_RUN_ATTEMPT) ||
-                run.repository?.full_name !== `${context.repo.owner}/${context.repo.repo}` || run.event !== context.eventName || run.head_branch !== 'main' ||
+                run.repository?.full_name !== `${context.repo.owner}/${context.repo.repo}` || run.event !== 'workflow_dispatch' ||
                 run.head_sha !== process.env.GITHUB_WORKFLOW_SHA || references.length !== 1 || !/^[a-f0-9]{40}$/.test(references[0].sha)) {
-              core.error(JSON.stringify({ event: 'submission.provider', level: 'ERROR', repository: `${context.repo.owner}/${context.repo.repo}`,
-                run_id: context.runId, run_attempt: process.env.GITHUB_RUN_ATTEMPT, outcome: 'blocked', reason: 'provider_workflow_identity_unavailable' }));
               throw new Error('provider_workflow_identity_unavailable');
             }
-            core.setOutput('repository', 'markhuangai/agent-remote-dev-codex');
             core.setOutput('sha', references[0].sha);
-            core.info(JSON.stringify({ event: 'submission.provider', level: 'INFO', source_repository: 'markhuangai/agent-remote-dev-codex',
-              source_sha: references[0].sha, repository: `${context.repo.owner}/${context.repo.repo}`, run_id: context.runId,
-              run_attempt: process.env.GITHUB_RUN_ATTEMPT, outcome: 'verified' }));
-      - name: Load the provider's prebuilt helpers
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: ${{ steps.source.outputs.repository }}
+          repository: markhuangai/agent-remote-dev-codex
           ref: ${{ steps.source.outputs.sha }}
           path: provider
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - name: Authorize the task before exposing task credentials
-        id: authorize
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROVIDER_REPOSITORY: ${{ steps.source.outputs.repository }}
-          PROVIDER_SHA: ${{ steps.source.outputs.sha }}
-          TASK_REQUEST: ${{ inputs.request }}
-          TASK_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
-        run: node provider/dist/control.mjs authorize
-      - name: Resolve completed task continuation
-        id: controller
-        if: github.event_name == 'workflow_run'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CONTINUATION_MODE: resolve
-        run: node provider/dist/control.mjs controller
-      - name: Freeze configuration and selected packages
+      - name: Install locked provider dependencies
+        working-directory: provider
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Authorize and resolve the conversation
         id: prepare
-        if: github.event_name == 'workflow_dispatch' && steps.authorize.outputs.operation == 'execute'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          GH_TOKEN: ${{ secrets.github-token }}
-          PROVIDER_REPOSITORY: ${{ steps.source.outputs.repository }}
-          PROVIDER_SHA: ${{ steps.source.outputs.sha }}
-          TASK_PLAN: ${{ inputs.plan }}
-          TASK_REQUEST: ${{ inputs.request }}
-          TASK_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
-        run: node provider/dist/control.mjs prepare
+          CODEX_PLAN: ${{ inputs.plan }}
+          CODEX_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { workflowCommand } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/provider/src/platform/control.mjs').href);
+            await workflowCommand('prepare', { github, core });
 
   execute:
+    name: Codex execution
     needs: resolve
-    if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.operation == 'execute'
     runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 360
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     concurrency:
-      group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
+      group: codex-session-${{ github.repository_id }}-${{ needs.resolve.outputs.root_run_id }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: ${{ needs.resolve.outputs.provider_repository }}
+          repository: markhuangai/agent-remote-dev-codex
           ref: ${{ needs.resolve.outputs.provider_sha }}
           path: provider
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - name: Recheck authority and stop fences after acquiring the task lock
-        id: request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROVIDER_REPOSITORY: ${{ needs.resolve.outputs.provider_repository }}
-          PROVIDER_SHA: ${{ needs.resolve.outputs.provider_sha }}
-          TASK_REQUEST: ${{ needs.resolve.outputs.request }}
-        run: node provider/dist/control.mjs task
-      - name: Load the frozen action bundle
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: ${{ steps.request.outputs.source_repository }}
-          ref: ${{ steps.request.outputs.source_sha }}
-          path: action-source
-          persist-credentials: false
+      - name: Install and compile locked provider source
+        working-directory: provider
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
       - name: Checkout the consumer repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           path: target
+          fetch-depth: 0
           persist-credentials: false
-      - name: Execute native Codex with the selected skills
-        uses: ./action-source
+      - name: Execute Codex
+        id: native
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          CODEX_TASK_REQUEST: ${{ needs.resolve.outputs.request }}
-          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
+          CODEX_PLAN: ${{ inputs.plan }}
+          CODEX_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
+          CODEX_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          CODEX_PLATFORM_TOKEN: ${{ github.token }}
+          CODEX_PROVIDER_SHA: ${{ needs.resolve.outputs.provider_sha }}
+          CODEX_CONFIG_TOML: ${{ secrets.codex-config }}
+          CODEX_API_KEY: ${{ secrets.codex-api-key }}
+          CODEX_GITHUB_TOKEN: ${{ secrets.github-token }}
         with:
-          working-directory: target
-          plan: ${{ steps.request.outputs.plan }}
-          codex-config: ${{ secrets.codex-config }}
-          codex-api-key: ${{ secrets.codex-api-key }}
-          github-token: ${{ secrets.github-token }}
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { main } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/provider/.build/main.js').href);
+            await main({ github });
+      - name: Save final session
+        if: always() && steps.native.outputs.state-path != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          CODEX_STATE_PATH: ${{ steps.native.outputs.state-path }}
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { finish } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/provider/.build/main.js').href);
+            await finish({ github, statePath: process.env.CODEX_STATE_PATH });
 
-  dispatch:
-    needs: resolve
-    if: github.event_name == 'workflow_run' && needs.resolve.outputs.eligible == 'true'
+  recover:
+    needs: [resolve, execute]
+    if: always() && !cancelled() && needs.resolve.result == 'success' && needs.execute.result != 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: write
-    concurrency:
-      group: codex-dispatch-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: ${{ needs.resolve.outputs.provider_repository }}
+          repository: markhuangai/agent-remote-dev-codex
           ref: ${{ needs.resolve.outputs.provider_sha }}
           path: provider
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - name: Revalidate the parent and prepare its dispatch claim
-        id: prepare
+      - name: Install locked recovery dependencies
+        working-directory: provider
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Continue after timeout
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          GH_TOKEN: ${{ github.token }}
-          CONTINUATION_MODE: prepare
-        run: node provider/dist/control.mjs controller
-      - name: Persist the claim before dispatch
-        id: claim
-        if: steps.prepare.outputs.upload == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+          CODEX_RUNS_ON: ${{ inputs.runs-on }}
+          CODEX_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
         with:
-          name: ${{ steps.prepare.outputs.claim_name }}
-          path: ${{ steps.prepare.outputs.claim_path }}
-          if-no-files-found: error
-          overwrite: false
-      - name: Dispatch once or reconcile the existing claim
-        if: steps.prepare.outputs.eligible == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CONTINUATION_MODE: dispatch
-          CLAIM_ARTIFACT_ID: ${{ steps.claim.outputs.artifact-id || steps.prepare.outputs.existing_claim_id }}
-          NEW_CLAIM: ${{ steps.prepare.outputs.upload }}
-        run: node provider/dist/control.mjs controller
-
-  stop:
-    needs: resolve
-    if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.operation == 'stop'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: ${{ needs.resolve.outputs.provider_repository }}
-          ref: ${{ needs.resolve.outputs.provider_sha }}
-          path: provider
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24
-      - name: Prepare the task-scoped stop receipt
-        id: stop
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TASK_REQUEST: ${{ needs.resolve.outputs.request }}
-        run: node provider/dist/control.mjs stop
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ${{ steps.stop.outputs.name }}
-          path: ${{ steps.stop.outputs.file }}
-          if-no-files-found: error
-          overwrite: false
-      - name: Cancel active and queued task runs
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TASK_ID: ${{ needs.resolve.outputs.task_id }}
-        run: node provider/dist/control.mjs cancel
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { workflowCommand } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/provider/src/platform/control.mjs').href);
+            await workflowCommand('recover', { github, core });

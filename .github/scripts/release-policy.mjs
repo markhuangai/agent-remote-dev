@@ -1,4 +1,4 @@
-import { digest, invariant, positiveId, shaPattern } from '../../src/platform/checkpoint-policy.mjs';
+import { invariant, positiveId, shaPattern } from '../../src/platform/checkpoint-policy.mjs';
 import { authorizeActors, pages } from '../../src/platform/continuation-policy.mjs';
 import { logEvent, safeError } from '../../src/platform/runtime-log.mjs';
 
@@ -53,28 +53,19 @@ export async function prepareRelease({ api, repository, version, sourceSha, acto
   const checks = await sourceChecks(api, repository, sourceSha);
   return { ...parsed, repository, source_sha: sourceSha, alias_previous_sha: alias?.object.sha ?? null, checks };
 }
-export async function publishRelease({ api, upload, plan, assets }) {
-  const names = ['action.tar.gz', 'remote-codex.tar.gz', 'SHA256SUMS', 'release-manifest.json'];
-  invariant(Array.isArray(assets) && assets.length === names.length && new Set(assets.map(asset => asset.name)).size === names.length && names.every(name => assets.some(asset => asset.name === name && Buffer.isBuffer(asset.data) && asset.data.length > 0)), 'invalid_release_assets');
-  const sums = assets.find(asset => asset.name === 'SHA256SUMS').data.toString('utf8').trim().split('\n');
-  invariant(sums.length === 2 && ['action.tar.gz', 'remote-codex.tar.gz'].every(name => sums.includes(`${digest(assets.find(asset => asset.name === name).data)}  ${name}`)), 'release_asset_hash_mismatch');
-  let manifest;
-  try { manifest = JSON.parse(assets.find(asset => asset.name === 'release-manifest.json').data.toString('utf8')); } catch { invariant(false, 'invalid_release_manifest'); }
-  invariant(manifest.version === plan.version && manifest.repository === plan.repository && manifest.source_sha === plan.source_sha && manifest.bundle_verified === true && manifest.protocol_version === 3, 'release_manifest_source_mismatch');
+export async function publishRelease({ api, plan }) {
   await api(`/repos/${plan.repository}/git/refs`, { method: 'POST', ref: `refs/tags/${plan.version}`, sha: plan.source_sha });
-  const release = await api(`/repos/${plan.repository}/releases`, { method: 'POST', tag_name: plan.version, target_commitish: plan.source_sha, name: plan.version,
-    draft: true, prerelease: plan.prerelease, body: `Source: ${plan.source_sha}\nProtocol/checkpoint: 3\nSource/bundle and installed package verification passed.` });
-  invariant(positiveId(release.id) && release.tag_name === plan.version && release.draft === true, 'release_creation_ambiguous');
-  for (const asset of assets) await upload(release.id, asset);
-  const published = await api(`/repos/${plan.repository}/releases/${release.id}`, { method: 'PATCH', draft: false, make_latest: plan.prerelease ? 'false' : 'true' });
-  invariant(published.draft === false && published.tag_name === plan.version && published.prerelease === plan.prerelease, 'release_publication_ambiguous');
+  const release = await api(`/repos/${plan.repository}/releases`, { method: 'POST', tag_name: plan.version, target_commitish: plan.source_sha,
+    name: plan.version, draft: false, prerelease: plan.prerelease, make_latest: plan.prerelease ? 'false' : 'true',
+    body: `Reusable remote Codex workflow. Source: ${plan.source_sha}` });
+  invariant(positiveId(release.id) && release.tag_name === plan.version && release.draft === false && release.prerelease === plan.prerelease, 'release_publication_ambiguous');
   const current = await optional(api, `/repos/${plan.repository}/git/ref/tags/${plan.alias}`);
   invariant((current?.object.sha ?? null) === plan.alias_previous_sha, 'release_alias_changed');
   if (current) await api(`/repos/${plan.repository}/git/refs/tags/${plan.alias}`, { method: 'PATCH', sha: plan.source_sha, force: false });
   else await api(`/repos/${plan.repository}/git/refs`, { method: 'POST', ref: `refs/tags/${plan.alias}`, sha: plan.source_sha });
   const exact = await api(`/repos/${plan.repository}/git/ref/tags/${plan.version}`), alias = await api(`/repos/${plan.repository}/git/ref/tags/${plan.alias}`);
   invariant(exact.object?.sha === plan.source_sha && alias.object?.sha === plan.source_sha, 'release_ref_verification_failed');
-  return { release_id: release.id, version: plan.version, source_sha: plan.source_sha, alias: plan.alias, alias_target: plan.source_sha, bundle_verified: true };
+  return { release_id: release.id, version: plan.version, source_sha: plan.source_sha, alias: plan.alias };
 }
 export async function releasePreflight({ github, context, core, env = process.env }) {
   const started = Date.now(), repository = `${context.repo.owner}/${context.repo.repo}`;

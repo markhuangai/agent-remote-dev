@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
+import type { ProcessControl } from "./process.js";
 import { RunnerError } from "./contracts.js";
 
 export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
@@ -12,11 +13,11 @@ export function codexArgs(job: Job, cwd: string, output: string, session?: strin
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
-  onSession?: (id: string) => void) {
+  onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
   let observed: string | undefined, identityChanged = false;
   await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, output, session), {
-    cwd, env: job.env, stage: "codex", log, timeoutMs, stdin: prompt, collect: false,
+    cwd, env: job.env, stage: "codex", onControl, log, timeoutMs, stdin: prompt, collect: false,
     onLine(line) {
       let value: any;
       try { value = JSON.parse(line); } catch { return; }

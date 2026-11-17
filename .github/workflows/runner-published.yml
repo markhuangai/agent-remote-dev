@@ -1,157 +1,40 @@
-name: Published Codex qualification
-run-name: ${{ fromJSON(inputs.request).operation == 'stop' && format('Codex stop {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).stop_key) || (fromJSON(inputs.request).resume_artifact_id && format('Codex task {0} / {1}', fromJSON(inputs.request).task_id, fromJSON(inputs.request).dispatch_key || format('manual-resume-{0}-{1}-{2}', fromJSON(inputs.request).resume_artifact_id, fromJSON(inputs.request).source_sha, fromJSON(inputs.request).registration_key))) || format('Codex request {0} / request-{1}', fromJSON(inputs.request).request_id, fromJSON(inputs.request).registration_key) }}
+name: Codex published v1
+run-name: ${{ inputs.resume-run-id && format('Codex resume {0}', inputs.resume-run-id) || (inputs.qualification-id && format('Codex qualification {0}', inputs.qualification-id)) || 'Codex task' }}
 
 on:
   workflow_dispatch:
     inputs:
+      qualification-id:
+        description: Optional correlation label for explicitly authorized live qualification
+        type: string
+      plan:
+        description: Refined plan or new context for a resumed conversation
+        type: string
+      resume-run-id:
+        description: Prior run containing the conversation
+        type: string
       runs-on:
-        description: Linux runner labels selected by this workflow's caller
+        description: JSON array of Linux runner labels
         type: string
         default: '["ubuntu-latest"]'
-      request:
-        description: Internal published-action qualification envelope
-        required: true
-        type: string
+      timeout-minutes:
+        description: GitHub job timeout in minutes
+        type: number
+        default: 360
 
 permissions:
   contents: read
-  actions: read
-  issues: read
-
-env:
-  TRIGGERING_ACTOR: ${{ github.triggering_actor }}
-  CODEX_RUNNER_PROTOCOL: '3'
+  actions: write
 
 jobs:
-  resolve:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      operation: ${{ steps.request.outputs.operation }}
-      task_id: ${{ steps.request.outputs.task_id }}
-      published_ref: ${{ steps.request.outputs.published_ref }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24
-      - name: Install locked helper dependencies
-        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - id: request
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          TASK_REQUEST: ${{ inputs.request }}
-        with:
-          retries: 0
-          script: |
-            const { pathToFileURL } = require('node:url');
-            const { prepareTaskRequest } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/src/platform/continuation-policy.mjs').href);
-            const request = await prepareTaskRequest({ github, context, core });
-            for (const name of ['operation', 'task_id', 'runner', 'published_ref']) core.setOutput(name, request[name] || '');
-
-  prerelease:
-    needs: resolve
-    if: needs.resolve.outputs.operation == 'execute' && needs.resolve.outputs.published_ref == 'v1-prerelease'
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 360
-    concurrency:
-      group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout trusted task policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: trusted
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24
-      - name: Install locked helper dependencies
-        working-directory: trusted
-        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - name: Revalidate actor, frozen request, and stop fence after acquiring the task lock
-        id: request
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          TASK_REQUEST: ${{ inputs.request }}
-        with:
-          retries: 0
-          script: |
-            const { pathToFileURL } = require('node:url');
-            const { prepareTaskRequest } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/trusted/src/platform/continuation-policy.mjs').href);
-            core.setOutput('parameters', JSON.stringify(await prepareTaskRequest({ github, context, core })));
-      - name: Checkout target repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: target
-          persist-credentials: false
-      - name: Execute native Codex with selected skills
-        id: native
-        env:
-          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
-        uses: markhuangai/agent-remote-dev-codex@v1-prerelease
-        with:
-          working-directory: target
-          plan: ${{ fromJSON(steps.request.outputs.parameters).plan }}
-          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
-          codex-api-key: ${{ secrets.CODEX_API_KEY }}
-          github-token: ${{ secrets.REMOTE_DEV_PAT }}
-
-  stable:
-    needs: resolve
-    if: needs.resolve.outputs.operation == 'execute' && needs.resolve.outputs.published_ref == 'v1'
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 360
-    concurrency:
-      group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout trusted task policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: trusted
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24
-      - name: Install locked helper dependencies
-        working-directory: trusted
-        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - name: Revalidate actor, frozen request, and stop fence after acquiring the task lock
-        id: request
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          TASK_REQUEST: ${{ inputs.request }}
-        with:
-          retries: 0
-          script: |
-            const { pathToFileURL } = require('node:url');
-            const { prepareTaskRequest } = await import(pathToFileURL(
-              process.env.GITHUB_WORKSPACE + '/trusted/src/platform/continuation-policy.mjs').href);
-            core.setOutput('parameters', JSON.stringify(await prepareTaskRequest({ github, context, core })));
-      - name: Checkout target repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: target
-          persist-credentials: false
-      - name: Execute native Codex with selected skills
-        id: native
-        env:
-          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
-        uses: markhuangai/agent-remote-dev-codex@v1
-        with:
-          working-directory: target
-          plan: ${{ fromJSON(steps.request.outputs.parameters).plan }}
-          codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
-          codex-api-key: ${{ secrets.CODEX_API_KEY }}
-          github-token: ${{ secrets.REMOTE_DEV_PAT }}
+  run:
+    uses: markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@v1
+    with:
+      plan: ${{ inputs.plan }}
+      resume-run-id: ${{ inputs.resume-run-id }}
+      runs-on: ${{ inputs.runs-on }}
+      timeout-minutes: ${{ inputs.timeout-minutes }}
+    secrets:
+      codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
+      codex-api-key: ${{ secrets.CODEX_API_KEY }}
+      github-token: ${{ secrets.REMOTE_DEV_PAT }}

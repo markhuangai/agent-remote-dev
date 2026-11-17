@@ -14,16 +14,49 @@ def children():
     return [int(value) for value in path.read_text().split()]
 
 
+def descendants():
+    found = []
+    pending = children()
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.append(pid)
+        try:
+            pending.extend(int(value) for value in Path(f"/proc/{pid}/task/{pid}/children").read_text().split())
+        except FileNotFoundError:
+            pass
+    return found
+
+
 def signal_children(kind):
-    for pid in children():
+    for pid in descendants():
         try:
             stat = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-            if int(stat[1]) == os.getpid():
-                os.kill(pid, kind)
+            os.kill(pid, kind)
         except ProcessLookupError:
             pass
         except FileNotFoundError:
             pass
+
+
+def freeze_children():
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        before = set(descendants())
+        signal_children(signal.SIGSTOP)
+        time.sleep(0.001)
+        after = set(descendants())
+        stopped = True
+        for pid in after:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+                stopped = stopped and state in ("T", "t", "Z")
+            except FileNotFoundError:
+                pass
+        if before == after and stopped:
+            return
+    raise RuntimeError("Managed writers did not pause for snapshot")
 
 
 def main():
@@ -43,11 +76,26 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+    control = Path(receipt).parent
+    paused = False
     worker = subprocess.Popen(command, start_new_session=True)
     while worker.poll() is None:
         if stopping_at is not None:
+            signal_children(signal.SIGCONT)
             signal_children(signal.SIGKILL if time.monotonic() - stopping_at >= 1 else signal.SIGTERM)
+        elif (control / "pause").exists():
+            if not paused:
+                freeze_children()
+                temporary = control / "paused.tmp"
+                temporary.write_text(json.dumps({"nonce": nonce}))
+                temporary.replace(control / "paused.json")
+                paused = True
+        elif paused:
+            (control / "paused.json").unlink(missing_ok=True)
+            signal_children(signal.SIGCONT)
+            paused = False
         time.sleep(0.02)
+    signal_children(signal.SIGCONT)
     status = worker.returncode
     started = time.monotonic()
     while True:
@@ -68,5 +116,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as error:
+        signal_children(signal.SIGCONT)
+        signal_children(signal.SIGKILL)
         print(f"Worker supervision failed: {error}", file=sys.stderr)
         sys.exit(70)

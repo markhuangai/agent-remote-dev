@@ -4,7 +4,7 @@ This repository implements a remote Codex execution platform for Linux. Skills
 control task workflows and completion; the platform provides isolated setup,
 native execution, conversation persistence, cross-run resume, continuation and
 cancellation. Work only within the linked issue and approved scope. Use Node.js 24 for runtime, policy helpers and tests.
-Keep helpers dependency-free and test their actual decisions. API fixtures may
+Use locked package.json dependencies and test helpers’ actual decisions. API fixtures may
 isolate GitHub transport; do not replace the policy under test.
 
 ## Validation
@@ -22,7 +22,7 @@ execution for each language, including partial reruns; a successful parent does
 not override a failed, missing, skipped, or ambiguous child. These workflows
 validate the exact PR head rather than a mutable branch name.
 
-Full CI runs automatically. The action supports full-access/YOLO execution only,
+Full CI runs automatically. The workflow supports full-access/YOLO execution only,
 with no mode selector. CI requires successful real YOLO execution on both
 architectures. There is
 no review-first controller, validation label, container image, shared database,

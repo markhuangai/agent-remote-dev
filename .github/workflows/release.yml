@@ -1,4 +1,4 @@
-name: Publish Linux release
+name: Publish workflow release
 
 on:
   workflow_dispatch:
@@ -42,16 +42,13 @@ jobs:
             await releasePreflight({ github, context, core });
 
   build:
-    name: Build and verify source
+    name: Verify source
     needs: authorize
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       actions: read
-    outputs:
-      artifact_id: ${{ steps.assets.outputs.artifact-id }}
-      artifact_digest: ${{ steps.assets.outputs.artifact-digest }}
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -61,28 +58,12 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - name: Verify source and complete distribution
+      - name: Verify source
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           npm ci --ignore-scripts --no-audit --no-fund
           npm run check
           npm run test:skill-install
-      - name: Prepare reproducible release assets
-        run: |
-          mkdir "$RUNNER_TEMP/release-assets"
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/action.tar" action.yml dist package.json package-lock.json
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/release-assets/remote-codex.tar" -C skills remote-codex
-          gzip -n "$RUNNER_TEMP/release-assets/action.tar" "$RUNNER_TEMP/release-assets/remote-codex.tar"
-          cd "$RUNNER_TEMP/release-assets"
-          sha256sum action.tar.gz remote-codex.tar.gz > SHA256SUMS
-      - name: Transfer release assets as data
-        id: assets
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: linux-release-assets-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/release-assets/*
-          if-no-files-found: error
-          overwrite: false
 
   publish:
     needs: build
@@ -105,27 +86,16 @@ jobs:
           node-version: 24
       - name: Install locked helper dependencies
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - name: Verify artifact against source and publish
+      - name: Publish immutable version and forward-only alias
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          RELEASE_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
-          RELEASE_ARTIFACT_DIGEST: sha256:${{ needs.build.outputs.artifact_digest }}
         with:
           retries: 0
           script: |
             const { pathToFileURL } = require('node:url');
-            const root = process.env.GITHUB_WORKSPACE;
-            const { releasePreflight, publishRelease } = await import(pathToFileURL(root + '/.github/scripts/release-policy.mjs').href);
-            const { verifyReleaseArtifact } = await import(pathToFileURL(root + '/.github/scripts/release-artifact.mjs').href);
+            const { releasePreflight, publishRelease } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
             const plan = await releasePreflight({ github, context, core });
-            const api = async (route, options) => (await github.request(`${options?.method || 'GET'} ${route}`, options)).data;
-            const assets = await verifyReleaseArtifact({ api, plan, core, artifactId: process.env.RELEASE_ARTIFACT_ID,
-              artifactDigest: process.env.RELEASE_ARTIFACT_DIGEST, runId: context.runId, runAttempt: process.env.GITHUB_RUN_ATTEMPT,
-              workflowSha: process.env.GITHUB_WORKFLOW_SHA, root: process.env.RUNNER_TEMP + '/release-artifact' });
-            const upload = async (release_id, asset) => {
-              const result = await github.rest.repos.uploadReleaseAsset({ ...context.repo, release_id, name: asset.name, data: asset.data,
-                headers: { 'content-type': 'application/octet-stream', 'content-length': asset.data.length } });
-              if (result.data.state !== 'uploaded' || result.data.size !== asset.data.length) throw new Error('release_asset_upload_unverified');
+            const api = async (path, options = {}) => {
+              const { method = 'GET', ...data } = options;
+              return (await github.request(`${method} ${path}`, data)).data;
             };
-            const receipt = await publishRelease({ api, upload, plan, assets });
-            core.info(JSON.stringify({ event: 'release.complete', level: 'INFO', ...receipt, run_id: context.runId, run_attempt: process.env.GITHUB_RUN_ATTEMPT }));
+            await publishRelease({ api, plan });

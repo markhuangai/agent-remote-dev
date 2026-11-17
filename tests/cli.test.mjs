@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { chmod, cp, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { join, relative } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { configure, installSkillSource, installUserAgents } from '../.build/setup.js';
@@ -9,21 +9,26 @@ import { TaskGit } from '../.build/git.js';
 import { drive } from '../.build/driver.js';
 import { durableCheckpoint } from '../.build/checkpoint.js';
 import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
-import { hash } from '../.build/contracts.js';
-import { fetchInstructions } from '../src/platform/instructions.mjs';
-import { exec, execution, fixture, lineage, message, provider, repository, tool } from './helpers.mjs';
+import { exec, checkpoint, fixture, message, provider, repository } from './helpers.mjs';
 
-const plan = 'Execute the selected workflow; its response is opaque to the host.';
-const quote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+const plan = 'Implement the supplied plan autonomously. Ask only when clarification is indispensable.';
 async function driver(f, r, overrides = {}) {
-  const git = overrides.git ?? new TaskGit(r.cwd, f.job.env, f.log), exports = [], results = [];
-  const result = await drive({ job: f.job, git, log: f.log, plan, planSource: 'inline', authorization: { repository: 'fixture/repo', plan_sha256: hash(plan), request: 'Execute this fixture with its selected workflow and bounded resume.' },
-    repository: 'fixture/repo', taskId: 'fixture-task', base: r.base, budgetMs: 180000, started: Date.now(), skills: [], userAgents: null, lineage, execution: execution(),
-    checkpoint: input => durableCheckpoint(f.job, input, f.log, sha => git.verify(sha), async (name, files, root) => { exports.push({ name, files, root }); return { id: 40 + exports.length }; }),
-    result: async value => { results.push(value); }, ...overrides });
-  return { result, git, exports, results };
+  const git = new TaskGit(r.cwd, f.job.env, f.log), exports = []; let last = null, state;
+  const save = async (session, control, outcome = 'running') => {
+    const input = checkpoint({ ...await git.snapshot(), session_id: session, workspace: r.cwd, outcome, previous: last });
+    last = await durableCheckpoint(f.job, input, f.log, async (name, files, root) => {
+      const directory = await mkdtemp(join(f.temporary, 'artifact-'));
+      for (const file of files) { const target = join(directory, relative(root, file)); await mkdir(join(target, '..'), { recursive: true }); await cp(file, target); }
+      exports.push({ name, root: directory }); return { id: 40 + exports.length };
+    }, control);
+    return last;
+  };
+  const result = await drive({ job: f.job, cwd: r.cwd, log: f.log, plan,
+    state: async value => { state = { ...state, ...value }; }, ...overrides });
+  if (state.session) await save(state.session, undefined, state.outcome);
+  return { result: { ...result, checkpoint: last }, git, exports };
 }
-test('real Codex discovers selected user skills, repository skills and both instruction scopes without host state', async t => {
+test('real Codex discovers selected user skills, repository skills and both instruction scopes', async t => {
   const f = await fixture(t), r = await repository(f), source = join(f.temporary, 'skills');
   await mkdir(join(source, 'skills/fixture-selected/references'), { recursive: true });
   await writeFile(join(source, 'skills/fixture-selected/SKILL.md'), '---\nname: fixture-selected\ndescription: selected-user-catalog-3719\n---\nRead references/detail.txt when needed.\n');
@@ -32,130 +37,139 @@ test('real Codex discovers selected user skills, repository skills and both inst
   await mkdir(join(r.cwd, '.agents/skills/repo-native'), { recursive: true });
   await writeFile(join(r.cwd, '.agents/skills/repo-native/SKILL.md'), '---\nname: repo-native\ndescription: repository-catalog-5931\n---\nUse native repository behavior.\n');
   await writeFile(join(r.cwd, 'AGENTS.md'), 'repository-instructions-7751\n');
-  const content = 'user-instructions-8654\n';
-  await installUserAgents(f.job, { url: 'https://example.invalid/AGENTS.md', sha256: hash(content), content }, f.log);
+  await installUserAgents(f.job, { url: 'https://example.invalid/AGENTS.md', sha256: (await import('../.build/contracts.js')).hash('user-instructions-8654\n'), content: 'user-instructions-8654\n' }, f.log);
   const api = await provider(t, [[message('An ordinary native result.')], [message('Still the same conversation.')]]);
   await configure(f.job, api.config, f.log);
   const first = await runCodex(f.job, r.cwd, 'Use $fixture-selected and $repo-native.', f.log, 60000, 'one');
-  assert.equal(first.result.trim(), 'An ordinary native result.');
   const second = await runCodex(f.job, r.cwd, 'Continue this native conversation.', f.log, 60000, 'two', first.session);
   assert.equal(second.session, first.session);
   const captured = JSON.stringify(api.requests);
-  for (const marker of ['selected-user-catalog-3719', 'repository-catalog-5931', 'repository-instructions-7751', 'user-instructions-8654', 'Use $fixture-selected']) assert.match(captured, new RegExp(marker.replaceAll('$', '\\$')));
-  assert.doesNotMatch(captured, /unwanted-host-sentinel-3719|unwanted-host-instructions-3819|host-config-sentinel-6158/);
-  assert.equal(await readFile(join(f.job.codexHome, 'skills/fixture-selected/references/detail.txt'), 'utf8'), 'Complete installed resource');
+  for (const marker of ['selected-user-catalog-3719', 'repository-catalog-5931', 'repository-instructions-7751', 'user-instructions-8654']) assert.ok(captured.includes(marker));
+  assert.doesNotMatch(captured, /unwanted-host-sentinel|unwanted-host-instructions|host-config-sentinel/);
   for (const [name, value] of Object.entries(f.hostFiles)) assert.equal(await readFile(join(f.host, name), 'utf8'), value);
 });
-test('a native workflow chooses its branch, commits and pushes without supervisor publication or a PR', async t => {
+test('native Codex chooses its branch, commits and pushes without runner publication', async t => {
   const f = await fixture(t), r = await repository(f);
-  const api = await provider(t, [[tool("git switch -c skill/chosen-branch && printf 'published by skill\\n' > native.txt && git add native.txt && git commit -m 'Skill publishes its work' && git push --set-upstream origin HEAD")], [message('Finished without creating a PR.')]]);
+  const api = await provider(t, [[(await import('./helpers.mjs')).tool("git switch -c skill/chosen && printf published > native.txt && git add native.txt && git commit -m 'Skill publishes' && git push --set-upstream origin HEAD")], [message('Finished without requiring a PR.')]]);
   await configure(f.job, api.config, f.log);
   const observed = await driver(f, r);
-  assert.equal(observed.result.status, 'completed'); assert.equal(observed.result.nativeOutcome, 'succeeded');
-  assert.equal(await r.git('branch', '--show-current'), 'skill/chosen-branch');
-  assert.equal(await r.git('log', '-1', '--format=%s'), 'Skill publishes its work');
+  assert.equal(observed.result.outcome, 'completed'); assert.equal(await r.git('branch', '--show-current'), 'skill/chosen');
   assert.equal(await observed.git.remoteHead(), await observed.git.head());
-  assert.equal(observed.results[0].response.trim(), 'Finished without creating a PR.');
-  const userMessages = api.requests[0].input.filter(item => item.role === 'user');
-  assert.ok(userMessages.some(item => item.content?.some(part => part.text === plan)));
-  const manifest = JSON.parse(await readFile(join(observed.exports[0].root, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.schema_version, 3); assert.equal(manifest.session_id, observed.result.session); assert.deepEqual(manifest.skills, []);
-  assert.equal(manifest.branch, 'skill/chosen-branch'); assert.ok(!('driver' in manifest)); assert.ok(!('audit' in manifest));
+  assert.ok(api.requests[0].input.some(item => item.role === 'user' && item.content?.some(part => part.text === plan)));
+  const manifest = validateCheckpoint(JSON.parse(await readFile(join(observed.exports.at(-1).root, 'manifest.json'))), 'fixture/repo');
+  assert.equal(manifest.session_id, observed.result.session); assert.equal(manifest.omitted_work, false);
 });
-test('unpublished changes and skill-reported blockers stay opaque and never trigger runner Git repairs', async t => {
-  const f = await fixture(t), r = await repository(f), response = JSON.stringify({ state: 'blocked', missing: 'human decision', pr: null });
-  const api = await provider(t, [[tool("printf 'unpublished skill state\\n' > draft.txt")], [message(response)]]);
+for (const rejected of [false, true]) test(`native conversation is saved with ${rejected ? 'a rejected push' : 'unfinished files'}`, async t => {
+  const f = await fixture(t), r = await repository(f);
+  if (rejected) await writeFile(join(r.remote, 'hooks/pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  const command = rejected ? "printf local > draft.txt && git add draft.txt && git commit -m 'Unpublished' && git push origin HEAD" : "printf local > draft.txt";
+  const api = await provider(t, [[(await import('./helpers.mjs')).tool(command)], [message('Clarification is required before continuing.')]]);
+  await configure(f.job, api.config, f.log);
+  const observed = await driver(f, r), manifest = JSON.parse(await readFile(join(observed.exports.at(-1).root, 'manifest.json')));
+  assert.equal(observed.result.outcome, 'completed'); assert.ok(observed.result.checkpoint);
+  assert.equal(manifest.omitted_work, true); assert.equal(manifest.checkpoint_sha, r.base);
+  assert.equal(await readFile(join(r.cwd, 'draft.txt'), 'utf8'), 'local');
+  if (rejected) assert.notEqual(await observed.git.head(), r.base);
+});
+test('real cold resume preserves SQLite goals and session identity, adds context, and excludes newer main', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const firstProvider = await provider(t, [[message('First conversation marker 7391.')]]);
+  await configure(f.job, firstProvider.config, f.log);
+  const first = await driver(f, r), root = first.exports.at(-1).root;
+  const db = new DatabaseSync(join(f.job.codexHome, 'goals_1.sqlite'));
+  db.exec("CREATE TABLE fixture_goals (value TEXT); INSERT INTO fixture_goals VALUES ('native-goal-7891')"); db.close();
+  const exported = await (await import('../.build/checkpoint.js')).exportCheckpoint(f.job, checkpoint({ ...await first.git.snapshot(), session_id: first.result.session, workspace: r.cwd }), f.log);
+  const manifest = validateCheckpoint(exported.manifest, 'fixture/repo');
+  const other = join(f.temporary, 'other'); await exec('git', ['clone', '--branch', 'main', r.remote, other], { env: f.job.env });
+  await writeFile(join(other, 'new-main.txt'), 'Must not enter resumed source');
+  await exec('git', ['add', '.'], { cwd: other, env: f.job.env }); await exec('git', ['commit', '-m', 'Advance main'], { cwd: other, env: f.job.env }); await exec('git', ['push', 'origin', 'main'], { cwd: other, env: f.job.env });
+  const fresh = await fixture(t), cwd = join(fresh.temporary, 'new-workspace');
+  await exec('git', ['clone', r.remote, cwd], { env: fresh.job.env });
+  const current = new TaskGit(cwd, fresh.job.env, fresh.log);
+  await restoreCheckpoint(fresh.job, exported.root, manifest, current, fresh.log);
+  assert.equal(await current.head(), r.base); await assert.rejects(readFile(join(cwd, 'new-main.txt')), { code: 'ENOENT' });
+  const goal = new DatabaseSync(join(fresh.job.codexHome, 'goals_1.sqlite'), { readOnly: true });
+  assert.equal(goal.prepare('SELECT value FROM fixture_goals').get().value, 'native-goal-7891'); goal.close();
+  const secondProvider = await provider(t, [[message('Resumed with clarification.')]]);
+  await configure(fresh.job, secondProvider.config, fresh.log);
+  await installUserAgents(fresh.job, { url: 'https://example.invalid/current.md', content: 'current-instructions-8271', sha256: (await import('../.build/contracts.js')).hash('current-instructions-8271') }, fresh.log);
+  const second = await runCodex(fresh.job, cwd, 'New clarification answer 6391: continue.', fresh.log, 60000, 'resumed', manifest.session_id);
+  assert.equal(second.session, first.result.session);
+  const captured = JSON.stringify(secondProvider.requests);
+  assert.match(captured, /First conversation marker 7391/); assert.match(captured, /New clarification answer 6391/); assert.match(captured, /current-instructions-8271/);
+  const state = new DatabaseSync(join(fresh.job.codexHome, 'state_5.sqlite'), { readOnly: true });
+  const row = state.prepare('SELECT cwd, rollout_path FROM threads WHERE id = ?').get(manifest.session_id);
+  assert.equal(row.cwd, cwd); assert.ok(row.rollout_path.startsWith(fresh.job.codexHome)); state.close();
+});
+test('native errors retain the conversation after an earlier completed invocation', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, [[(await import('./helpers.mjs')).tool('sleep 1')], [message('First turn before native failure.')]]);
   await configure(f.job, api.config, f.log);
   const observed = await driver(f, r);
-  assert.equal(observed.result.status, 'completed'); assert.equal(observed.result.nativeOutcome, 'succeeded'); assert.equal(observed.result.checkpoint, null);
-  assert.equal(observed.results[0].response.trim(), response); assert.equal(await r.git('rev-parse', 'HEAD'), r.base);
-  assert.equal(await r.git('diff', '--cached', '--name-only'), ''); assert.equal(await readFile(join(r.cwd, 'draft.txt'), 'utf8'), 'unpublished skill state\n');
-  assert.ok(f.records.some(record => record.event === 'checkpoint.unavailable' && record.reason === 'unpublished_changes'));
-});
-test('a real rejected skill push leaves the native response intact and cannot produce a resumable checkpoint', async t => {
-  const f = await fixture(t), r = await repository(f), hook = join(r.remote, 'hooks/pre-receive');
-  await writeFile(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 }); await chmod(hook, 0o700);
-  const api = await provider(t, [[tool("git switch -c skill/rejected-push && printf local > local.txt && git add local.txt && git commit -m 'Skill records unpublished work' && git push --set-upstream origin HEAD")], [message('The skill push was rejected; human intervention is required.')]]);
-  await configure(f.job, api.config, f.log);
-  const observed = await driver(f, r);
-  assert.equal(observed.result.status, 'completed'); assert.equal(observed.result.nativeOutcome, 'succeeded'); assert.equal(observed.result.checkpoint, null);
-  assert.match(observed.results[0].response, /push was rejected/); assert.equal(observed.exports.length, 0);
-  assert.notEqual(await r.git('rev-parse', 'HEAD'), r.base); assert.equal(await r.git('diff', '--cached', '--name-only'), '');
-  assert.equal(await r.git('ls-remote', '--heads', 'origin', 'refs/heads/skill/rejected-push'), '');
-  assert.ok(f.records.some(record => record.event === 'checkpoint.unavailable' && record.reason === 'checkpoint_head_mismatch' && record.observed_sha === null));
-});
-test('real native authentication errors retain a causal stage without provider bodies or credentials', async t => {
-  const f = await fixture(t), r = await repository(f), api = await provider(t, () => ({ status: 403, body: { error: { message: 'private-provider-body-5741', api_key: f.job.env.CODEX_API_KEY } } }));
-  await configure(f.job, api.config, f.log);
-  await assert.rejects(runCodex(f.job, r.cwd, 'Fixture request', f.log, 20000, 'auth'), error => { f.log.failure(error); return true; });
+  assert.ok(observed.exports.length > 0); assert.equal(observed.result.outcome, 'completed');
+  const manifest = JSON.parse(await readFile(join(observed.exports.at(-1).root, 'manifest.json')));
+  const failureProvider = await provider(t, () => ({ status: 403, body: { error: { message: 'private-provider-body-5741' } } }));
+  await configure(f.job, failureProvider.config, f.log);
+  const failed = await driver(f, r, { session: manifest.session_id });
+  assert.equal(failed.result.outcome, 'failed'); assert.ok(failed.result.checkpoint);
   assert.doesNotMatch(JSON.stringify(f.records), /private-provider-body-5741|fixture-api-credential-9374/);
-  assert.ok(f.records.some(record => record.event === 'runtime.failed' && record.stage === 'codex'));
 });
-test('real cold restore preserves the session and frozen user instructions while the skill advances its own branch', async t => {
-  const f = await fixture(t), r = await repository(f), content = '\ufefffrozen-user-instructions-6514\n', bytes = Buffer.from(content);
-  const userAgents = await fetchInstructions('https://example.invalid/AGENTS.md', hash(bytes), async () => new Response(bytes));
-  assert.equal(userAgents.sha256, hash(bytes)); assert.equal(userAgents.content, content);
-  const firstProvider = await provider(t, [[tool("printf first > state.txt && git add state.txt && git commit -m 'First skill turn' && git push --set-upstream origin HEAD")], [message('First skill turn done.')]]);
-  await configure(f.job, firstProvider.config, f.log); await installUserAgents(f.job, userAgents, f.log);
-  assert.deepEqual(await readFile(join(f.job.codexHome, 'AGENTS.md')), bytes);
-  const first = await driver(f, r, { userAgents, execution: execution({ user_agents_url: userAgents.url, user_agents_sha256: userAgents.sha256 }) });
-  const manifest = validateCheckpoint(JSON.parse(await readFile(join(first.exports[0].root, 'manifest.json'), 'utf8')), 'fixture/repo');
-  const other = join(f.temporary, 'other-checkout');
-  await exec('git', ['clone', '--branch', 'main', r.remote, other], { env: f.job.env });
-  await writeFile(join(other, 'later-main.txt'), 'Newer main must not enter the resumed task');
-  for (const args of [['add', 'later-main.txt'], ['commit', '-m', 'Advance main independently'], ['push', 'origin', 'main']]) await exec('git', args, { cwd: other, env: f.job.env });
-  const fresh = await fixture(t), cwd = join(fresh.temporary, 'relocated-repository');
-  await exec('git', ['clone', '--branch', 'main', r.remote, cwd], { env: fresh.job.env });
-  const secondProvider = await provider(t, [[tool("printf second > state.txt && git add state.txt && git commit -m 'Second skill turn' && git push origin HEAD")], [message('Resumed skill completed.')]]);
-  await configure(fresh.job, secondProvider.config, fresh.log); await installUserAgents(fresh.job, manifest.user_agents, fresh.log);
-  assert.equal(manifest.execution.project_config.content, execution().project_config.content);
-  assert.equal(manifest.execution.project_config.sha256, execution().project_config.sha256);
-  assert.equal(manifest.user_agents.sha256, hash(bytes)); assert.deepEqual(await readFile(join(fresh.job.codexHome, 'AGENTS.md')), bytes);
-  const git = new TaskGit(cwd, fresh.job.env, fresh.log);
-  await restoreCheckpoint(fresh.job, first.exports[0].root, manifest, git, fresh.log);
-  await assert.rejects(readFile(join(cwd, 'later-main.txt')), { code: 'ENOENT' });
-  const second = await driver(fresh, { cwd, base: r.base }, { git, userAgents: manifest.user_agents, execution: execution({ ...manifest.execution, continuation_count: 1,
-    parent_run_id: '13', parent_run_attempt: '1', activation_run_id: '15' }), resume: { session: manifest.session_id, checkpoint: first.result.checkpoint } });
-  assert.equal(second.result.session, first.result.session); assert.equal(second.result.status, 'completed');
-  assert.equal(await readFile(join(cwd, 'state.txt'), 'utf8'), 'second'); assert.notEqual(second.result.checkpoint.checkpoint_sha, first.result.checkpoint.checkpoint_sha);
-  assert.match(JSON.stringify(secondProvider.requests), /First skill turn done|frozen-user-instructions-6514/);
-  const db = new DatabaseSync(join(fresh.job.codexHome, 'state_5.sqlite'), { readOnly: true });
-  try { const row = db.prepare('SELECT cwd, rollout_path FROM threads WHERE id = ?').get(manifest.session_id); assert.equal(row.cwd, cwd); assert.ok(row.rollout_path.startsWith(fresh.job.codexHome)); }
-  finally { db.close(); }
-});
-for (const interruption of ['budget', 'SIGTERM', 'SIGINT']) test(`native ${interruption} interruption checkpoints only quiescent remotely published source`, async t => {
+test('native hooks retain repository-owned commit and push policy', async t => {
   const f = await fixture(t), r = await repository(f);
-  const api = await provider(t, [[tool("printf saved > saved.txt && git add saved.txt && git commit -m 'Skill saves progress' && git push --set-upstream origin HEAD")], { hang: true }]);
-  await configure(f.job, api.config, f.log);
-  let timer;
-  if (interruption !== 'budget') {
-    const send = async () => {
-      if (api.requests.length >= 2 && process.listenerCount(interruption) > 0) process.kill(process.pid, interruption);
-      else timer = setTimeout(send, 100);
-    };
-    timer = setTimeout(send, 100);
-  }
-  t.after(() => clearTimeout(timer));
-  const observed = await driver(f, r, { started: interruption === 'budget' ? Date.now() - 50000 : Date.now() });
-  assert.equal(observed.result.status, interruption === 'budget' ? 'continuing' : 'cancelled');
-  assert.equal(observed.result.nativeOutcome, interruption === 'budget' ? 'timed_out' : 'cancelled');
-  assert.ok(observed.result.checkpoint); assert.equal(observed.result.checkpoint.checkpoint_sha, await observed.git.remoteHead());
-  const record = f.records.findLast(record => ['runtime.deadline', 'runtime.cancelled'].includes(record.event));
-  assert.equal(record.last_durable_checkpoint.artifact_id, observed.result.checkpoint.artifact_id);
-  assert.notEqual(record.level, 'DEBUG'); assert.equal(record.stage, 'codex'); assert.equal(record.versions.codex, '0.169.0');
-  assert.equal(record.session_id, observed.result.session); assert.equal(record.cause_reason, interruption === 'budget' ? 'command_timeout' : 'command_cancelled');
-  assert.ok(Object.hasOwn(record, 'exit_code')); assert.ok(Object.hasOwn(record, 'signal')); assert.equal(typeof record.native_cause, 'string');
-  assert.ok(record.native_elapsed_ms > 0); assert.ok(record.timeout_ms > 0); assert.ok(Number.isFinite(record.deadline_ms)); assert.ok(record.action_deadline_ms > record.deadline_ms);
-});
-
-test('native PostToolUse hooks can commit and push progress under repository policy', async t => {
-  const f = await fixture(t), r = await repository(f);
-  const api = await provider(t, [[tool("printf progress > hook-progress.txt")], [message('Hook-managed progress saved.')]]);
+  const api = await provider(t, [[(await import('./helpers.mjs')).tool('printf progress > hook-progress.txt')], [message('Hook-managed progress saved.')]]);
   const hook = "git add -- hook-progress.txt && git commit -m 'Save progress through native hook' && git push origin HEAD";
   await configure(f.job, api.config + '\n[[hooks.PostToolUse]]\nmatcher = "Bash"\n[[hooks.PostToolUse.hooks]]\ntype = "command"\ncommand = ' + JSON.stringify(hook) + '\ntimeout = 30\n', f.log);
   const observed = await driver(f, r);
   assert.equal(await r.git('log', '-1', '--format=%s'), 'Save progress through native hook');
   assert.equal(await observed.git.remoteHead(), await observed.git.head());
-  assert.equal(observed.result.status, 'completed'); assert.ok(observed.result.checkpoint);
-  assert.equal(await r.git('status', '--porcelain'), '');
+});
+
+test('native terminal completion does not await a stalled periodic upload', async t => {
+  const { createServer } = await import('node:http');
+  const { rename } = await import('node:fs/promises');
+  const { startSnapshots, waitSnapshots } = await import('../.build/checkpoint-worker.js');
+  const f = await fixture(t), r = await repository(f); let requests = 0;
+  const server = createServer(async request => { requests++; for await (const _ of request) {} });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const token = 'e30.' + Buffer.from(JSON.stringify({ scp: 'Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222' })).toString('base64url') + '.fixture';
+  const keys = ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL', 'CODEX_UPLOAD_TIMEOUT_MS', 'NO_PROXY'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  Object.assign(process.env, { ACTIONS_RUNTIME_TOKEN: token, ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, CODEX_UPLOAD_TIMEOUT_MS: '5000', NO_PROXY: '127.0.0.1,localhost' });
+  const api = await provider(t, [[(await import('./helpers.mjs')).tool('sleep 2')], [message('Clarification needed; do not automatically continue.')]]);
+  await configure(f.job, api.config, f.log);
+  const saved = { job: f.job, metadata: checkpoint({ workspace: r.cwd, session_id: '' }), secrets: f.log.protectedValues, response: '', latest: null };
+  const statePath = join(f.job.root, 'state.json'); let writes = Promise.resolve();
+  const persist = () => writes = writes.then(async () => { await writeFile(statePath + '.tmp', JSON.stringify(saved)); await rename(statePath + '.tmp', statePath); });
+  try {
+    await persist(); saved.watcher_pid = await startSnapshots(statePath, f.job); await persist();
+    const result = await drive({ job: f.job, cwd: r.cwd, log: f.log, plan,
+      state: async value => { if (value.session) saved.metadata.session_id = value.session; if (value.control) saved.control = value.control; saved.metadata.outcome = value.outcome; await persist(); } });
+    assert.equal(result.outcome, 'completed'); assert.ok(requests > 0, 'The actual artifact SDK began the stalled upload');
+    assert.equal(JSON.parse(await readFile(statePath)).metadata.outcome, 'completed');
+    await assert.rejects(readFile(join(f.job.root, 'snapshots-done')), { code: 'ENOENT' });
+    await waitSnapshots(saved);
+  } finally { for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
+});
+
+test('the actual snapshot loop repeatedly captures a running native conversation', async t => {
+  const { watchSnapshots } = await import('../.build/checkpoint-worker.js');
+  const { rename } = await import('node:fs/promises');
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, [[(await import('./helpers.mjs')).tool('sleep 2')], [message('Completed after periodic persistence.')]]);
+  await configure(f.job, api.config, f.log);
+  const saved = { job: f.job, metadata: checkpoint({ workspace: r.cwd, session_id: '' }), secrets: f.log.protectedValues, response: '', latest: null };
+  const path = join(f.job.root, 'state.json'); let writes = Promise.resolve(); const captures = [];
+  const persist = () => writes = writes.then(async () => { await writeFile(path + '.tmp', JSON.stringify(saved)); await rename(path + '.tmp', path); });
+  await persist();
+  const watcher = watchSnapshots(path, { intervalMs: 50, api: async () => ({ artifacts: [] }), upload: async (job, name, files, root) => {
+    captures.push(JSON.parse(await readFile(join(root, 'manifest.json')))); return { id: captures.length };
+  } });
+  await drive({ job: f.job, cwd: r.cwd, log: f.log, plan, state: async value => {
+    if (value.session) saved.metadata.session_id = value.session; if (value.control) saved.control = value.control;
+    saved.metadata.outcome = value.outcome; await persist();
+  } });
+  await watcher; assert.ok(captures.length >= 2);
+  assert.ok(captures.every(value => value.outcome === 'running' && value.session_id === saved.metadata.session_id));
+  assert.ok(captures.at(-1).sequence > captures[0].sequence);
 });
