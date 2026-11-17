@@ -4,7 +4,7 @@ import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parse } from 'yaml';
-import { actionResources } from '../.build/invocation.js';
+import { actionResources } from '../scripts/build.mjs';
 import { digest } from '../src/platform/checkpoint-policy.mjs';
 import { verifyReleaseArtifact } from '../.github/scripts/release-artifact.mjs';
 import { publishRelease, releaseVersion } from '../.github/scripts/release-policy.mjs';
@@ -58,7 +58,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
 `, zip, assets, variant]);
   let payload = await readFile(zip);
   const records = [], core = Object.fromEntries(['info', 'warning', 'error', 'debug'].map(level => [level, line => records.push(JSON.parse(line))]));
-  const plan = { ...releaseVersion('v1.0.0-rc.0'), repository: 'fixture/repo', source_sha: sourceSha, qualification: { run_id: 100 } };
+  const plan = { ...releaseVersion('v1.0.0-rc.0'), repository: 'fixture/repo', source_sha: sourceSha };
   const workflowSha = 'a'.repeat(40), artifactDigest = `sha256:${digest(payload)}`, calls = [];
   const artifact = { id: 15, name: 'linux-release-assets-99-2', digest: artifactDigest, size_in_bytes: payload.length, expired: false,
     expires_at: new Date(Date.now() + 86400000).toISOString(), created_at: '2026-01-01T00:01:00Z', workflow_run: { id: 99, head_sha: workflowSha } };
@@ -76,13 +76,13 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
     if (path === `/repos/${plan.repository}/git/trees/${sourceSha}?recursive=1`) return { tree, truncated: false };
     throw new Error(`Unexpected release transport ${path}`);
   };
-  return { ...f, core, records, calls, plan, options: { api, plan, core, artifactId: 15, artifactDigest, runId: '99', runAttempt: '2', workflowSha, root: join(f.temporary, 'publisher') } };
+  return { ...f, core, records, calls, plan, sourceFiles: tree.length, options: { api, plan, core, artifactId: 15, artifactDigest, runId: '99', runAttempt: '2', workflowSha, root: join(f.temporary, 'publisher') } };
 }
 
 test('trusted publisher verifies actual GNU release archives against an exact Git source tree', async t => {
   const f = await archiveFixture(t), assets = await verifyReleaseArtifact(f.options);
   const manifest = JSON.parse(assets.find(asset => asset.name === 'release-manifest.json').data);
-  assert.equal(manifest.source_sha, f.plan.source_sha); assert.equal(manifest.artifact.artifact_id, 15); assert.ok(manifest.artifact.files > 20);
+  assert.equal(manifest.source_sha, f.plan.source_sha); assert.equal(manifest.artifact.artifact_id, 15); assert.equal(manifest.artifact.files, f.sourceFiles);
   assert.ok(f.records.some(record => record.event === 'release.artifact' && record.level === 'INFO' && record.outcome === 'verified'));
 });
 

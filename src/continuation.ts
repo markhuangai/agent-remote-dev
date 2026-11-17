@@ -1,7 +1,7 @@
 import { same } from "./platform/checkpoint-policy.mjs";
 import { requireValue } from "./contracts.js";
 
-export type Execution = { source_repository: string; source_sha: string; runner: string[]; auto_continue: boolean; max_continuations: number; continuation_count: number;
+export type Execution = { source_repository: string; source_sha: string; auto_continue: boolean; max_continuations: number; continuation_count: number;
   budget_minutes: number; root_run_id: string; root_run_attempt: string; activation_run_id: string; activation_run_attempt: string; parent_run_id: string | null; parent_run_attempt: string | null;
   git_author_name: string; git_author_email: string; user_agents_url: string | null; user_agents_sha256: string | null;
   request_id: string; published_ref: string | null; project_config: { revision: string; sha256: string; content: string } };

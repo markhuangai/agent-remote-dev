@@ -5,7 +5,7 @@ import test from 'node:test';
 import { skillSources, hash } from '../.build/contracts.js';
 import { fetchInstructions } from '../src/platform/instructions.mjs';
 import { digest, registrationKey, runnerLabels } from '../src/platform/checkpoint-policy.mjs';
-import { dispatchOnce, prepareQueue, queuePrepared, resolveSkills, resolveSource, waitForStop } from '../src/platform/submission.mjs';
+import { dispatchOnce, resolveSkills, resolveSource, waitForStop } from '../src/platform/submission.mjs';
 import { exec, root } from './helpers.mjs';
 
 test('the complete selected skill list defaults empty and permits SDLC names without reserved defaults', () => {
@@ -106,34 +106,6 @@ test('a retained checkpoint can start a new explicit resume activation while ret
   const second = { ...first, activation_key: 'b'.repeat(32) }, resumed = await dispatchOnce(api, 'fixture/repo', second, 'Z-M-Huang', timing);
   assert.notEqual(resumed.run_id, stopped.run_id); assert.equal(resumed.activation_key, second.activation_key);
   assert.equal((await dispatchOnce(api, 'fixture/repo', second, 'Z-M-Huang', timing)).run_id, resumed.run_id); assert.equal(posts, 2);
-});
-test('queue freezes repository configuration and passes issue references verbatim without issue interpretation', async () => {
-  const repository = 'fixture/repo', plan = 'Implement https://github.com/fixture/repo/issues/4 using $chosen-skill.\n';
-  let content = 'allowed-actors: [Z-M-Huang]\nskills: []\n';
-  const files = new Map(), manifest = JSON.parse(await readFile(join(root, 'dist/protocol.json'), 'utf8'));
-  for (const path of Object.keys(manifest.files)) files.set(path, await readFile(join(root, path)));
-  let dispatches = 0;
-  const api = async (path, options) => {
-    if (options?.method === 'POST') { dispatches++; throw new Error('No dispatch expected'); }
-    if (path === '/user') return { login: 'Z-M-Huang' };
-    if (path.includes('/collaborators/')) return { permission: 'write' };
-    if (path.includes('/git/ref/heads/main')) return { object: { sha: 'a'.repeat(40) } };
-    if (path.includes('/contents/')) {
-      const name = path.split('/contents/')[1].split('?')[0];
-      const bytes = name === 'remote-codex.yml' ? Buffer.from(content) : name.endsWith('/protocol.json') ? Buffer.from(JSON.stringify(manifest)) : files.get(name);
-      assert.ok(bytes, `Unexpected resource ${name}`); return { size: bytes.length, encoding: 'base64', content: bytes.toString('base64') };
-    }
-    if (path.includes('/commits/')) return { sha: 'a'.repeat(40) };
-    if (path.includes('/actions/workflows/')) return { path: `.github/workflows/${path.split('/').at(-1)}`, state: 'active' };
-    throw new Error(`Unexpected fixture ${path}`);
-  };
-  const prepared = await prepareQueue(api, { repo: repository, plan, source_repository: 'fixture/action', source_ref: 'a'.repeat(40) });
-  assert.equal(prepared.request.plan, plan); assert.equal(prepared.request.plan_sha256, digest(plan));
-  assert.equal(prepared.request.project_config.content, content); assert.equal(prepared.request.project_config.sha256, digest(content));
-  assert.equal(prepared.request.task_id, undefined); assert.equal(prepared.request.authorization, undefined); assert.equal(prepared.request.issue_url, undefined);
-  content += 'budget-minutes: 5\n';
-  await assert.rejects(queuePrepared(api, prepared), error => { assert.equal(error.reason, 'project_config_hash_mismatch'); assert.equal(error.details.observed, digest(content)); return true; });
-  assert.equal(dispatches, 0);
 });
 test('stop waits for native workers and continuation controllers and fails within its bounded timeout', async () => {
   let now = 0, stuck = false;

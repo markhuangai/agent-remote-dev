@@ -4,6 +4,10 @@ run-name: ${{ fromJSON(inputs.request).operation == 'stop' && format('Codex stop
 on:
   workflow_dispatch:
     inputs:
+      runs-on:
+        description: Linux runner labels selected by this workflow's caller
+        type: string
+        default: '["ubuntu-latest"]'
       request:
         description: Internal published-action qualification envelope
         required: true
@@ -26,7 +30,6 @@ jobs:
     outputs:
       operation: ${{ steps.request.outputs.operation }}
       task_id: ${{ steps.request.outputs.task_id }}
-      runner: ${{ steps.request.outputs.runner }}
       published_ref: ${{ steps.request.outputs.published_ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -52,7 +55,7 @@ jobs:
   prerelease:
     needs: resolve
     if: needs.resolve.outputs.operation == 'execute' && needs.resolve.outputs.published_ref == 'v1-prerelease'
-    runs-on: ${{ fromJSON(needs.resolve.outputs.runner) }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 360
     concurrency:
       group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
@@ -87,6 +90,8 @@ jobs:
           persist-credentials: false
       - name: Execute native Codex with selected skills
         id: native
+        env:
+          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
         uses: markhuangai/agent-remote-dev-codex@v1-prerelease
         with:
           working-directory: target
@@ -98,7 +103,7 @@ jobs:
   stable:
     needs: resolve
     if: needs.resolve.outputs.operation == 'execute' && needs.resolve.outputs.published_ref == 'v1'
-    runs-on: ${{ fromJSON(needs.resolve.outputs.runner) }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 360
     concurrency:
       group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
@@ -133,6 +138,8 @@ jobs:
           persist-credentials: false
       - name: Execute native Codex with selected skills
         id: native
+        env:
+          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
         uses: markhuangai/agent-remote-dev-codex@v1
         with:
           working-directory: target

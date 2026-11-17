@@ -3,6 +3,13 @@ name: Reusable remote Codex
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: Linux runner labels selected by the consumer workflow
+        type: string
+        default: '["ubuntu-latest"]'
+      resume-run-id:
+        type: string
+        default: ''
       plan:
         type: string
         default: ''
@@ -36,7 +43,6 @@ jobs:
       operation: ${{ steps.authorize.outputs.operation }}
       eligible: ${{ steps.controller.outputs.eligible }}
       task_id: ${{ steps.prepare.outputs.task_id || steps.authorize.outputs.task_id || steps.controller.outputs.task_id }}
-      runner: ${{ steps.prepare.outputs.runner }}
       source_repository: ${{ steps.prepare.outputs.source_repository }}
       source_sha: ${{ steps.prepare.outputs.source_sha }}
       request: ${{ steps.prepare.outputs.request || steps.authorize.outputs.request }}
@@ -80,6 +86,7 @@ jobs:
           PROVIDER_REPOSITORY: ${{ steps.source.outputs.repository }}
           PROVIDER_SHA: ${{ steps.source.outputs.sha }}
           TASK_REQUEST: ${{ inputs.request }}
+          TASK_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
         run: node provider/dist/control.mjs authorize
       - name: Resolve completed task continuation
         id: controller
@@ -97,12 +104,13 @@ jobs:
           PROVIDER_SHA: ${{ steps.source.outputs.sha }}
           TASK_PLAN: ${{ inputs.plan }}
           TASK_REQUEST: ${{ inputs.request }}
+          TASK_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
         run: node provider/dist/control.mjs prepare
 
   execute:
     needs: resolve
     if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.operation == 'execute'
-    runs-on: ${{ fromJSON(needs.resolve.outputs.runner) }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 360
     concurrency:
       group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
@@ -142,6 +150,7 @@ jobs:
         uses: ./action-source
         env:
           CODEX_TASK_REQUEST: ${{ needs.resolve.outputs.request }}
+          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
         with:
           working-directory: target
           plan: ${{ steps.request.outputs.plan }}

@@ -15,10 +15,6 @@ export function registrationKey(request) {
   return digest(JSON.stringify(frozen));
 }
 export const databases = ['state_5.sqlite', 'thread_history_1.sqlite', 'goals_1.sqlite', 'queue_1.sqlite', 'memories_1.sqlite', 'memories_v2_1.sqlite'];
-export const protocolContract = { protocol_version: 3, checkpoint_schema: 3, request_input: 'request', task_workflow: 'runner-task.yml', controller_workflow: 'runner-continuation.yml', published_workflow: 'runner-published.yml' };
-export const protocolFiles = ['.github/workflows/runner-task.yml', '.github/workflows/runner-continuation.yml', '.github/workflows/runner-published.yml',
-  ...['checkpoint-policy.mjs', 'continuation-policy.mjs', 'artifact-io.mjs', 'protocol-policy.mjs', 'runtime-log.mjs', 'instructions.mjs', 'archive.py',
-    'project-config.mjs', 'sources.mjs', 'yaml.cjs', 'yaml-licenses.txt'].map(name => `src/platform/${name}`)];
 export const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const identity = value => value === null || typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value) ? value :
@@ -71,7 +67,6 @@ export function authorization(value, repository, plan) {
 }
 export function executionSettings(value) {
   invariant(object(value) && repositoryPattern.test(value.source_repository) && shaPattern.test(value.source_sha), 'invalid_action_source');
-  runnerLabels(value.runner);
   invariant(typeof value.auto_continue === 'boolean' && Number.isSafeInteger(value.max_continuations) && value.max_continuations >= 0 && value.max_continuations <= 100, 'invalid_continuation_limit');
   invariant(Number.isSafeInteger(value.continuation_count) && value.continuation_count >= 0 && value.continuation_count <= value.max_continuations, 'continuation_limit_exceeded', value.max_continuations, value.continuation_count);
   invariant(Number.isFinite(value.budget_minutes) && value.budget_minutes >= 3 && value.budget_minutes <= 300, 'invalid_budget');
@@ -140,11 +135,4 @@ export function validateProducer(artifact, run, manifest, repository) {
 export function frozenExecution(value) {
   const { continuation_count, parent_run_id, parent_run_attempt, activation_run_id, activation_run_attempt, ...fixed } = value;
   return fixed;
-}
-export function validateFrozenRoot(manifest, request, root) {
-  invariant(request.schema_version === 3 && request.repository === manifest.repository && request.task_id === manifest.task_id && request.plan_sha256 === manifest.plan_sha256 &&
-    same(request.authorization, manifest.authorization) && same(request.skills, manifest.skills) && request.plan_source === manifest.plan_source &&
-    same(frozenExecution(request.execution), frozenExecution(manifest.execution)) && String(root.id) === manifest.execution.root_run_id && Number(root.run_attempt) === Number(manifest.execution.root_run_attempt) &&
-    request.lineage?.workflow_sha === root.head_sha && String(request.lineage?.run_id) === String(root.id) && Number(request.lineage?.run_attempt) === Number(root.run_attempt) &&
-    request.lineage?.actor === root.actor?.login && request.lineage?.triggering_actor === root.triggering_actor?.login, 'checkpoint_root_contract_mismatch');
 }

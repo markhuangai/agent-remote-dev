@@ -1,16 +1,9 @@
 import { spawn } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, lstat, rmdir, unlink } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { authorization, digest, executionSettings, invariant, positiveId, registrationKey, repositoryPattern, runnerLabels, shaPattern, sources, taskPattern } from './checkpoint-policy.mjs';
-import { authorizeActors, loadVerifiedCheckpoint, manualRunName, pages, submissionRunName } from './continuation-policy.mjs';
-import { verifyProtocol } from './protocol-policy.mjs';
-import { fetchInstructions } from './instructions.mjs';
+import { invariant, registrationKey, repositoryPattern, taskPattern } from './checkpoint-policy.mjs';
+import { manualRunName, pages, submissionRunName } from './continuation-policy.mjs';
 import { readArtifact } from './artifact-io.mjs';
 import { logEvent, safeError } from './runtime-log.mjs';
-import { freezeProjectConfig, readProjectConfig } from './project-config.mjs';
-import { resolveSource, resolveSkills } from './sources.mjs';
 export { resolveSource, resolveSkills } from './sources.mjs';
 
 const sink = Object.fromEntries(['info', 'warning', 'error', 'debug'].map(level => [level, line => { if (level !== 'debug') process.stderr.write(line + '\n'); }]));
@@ -36,34 +29,7 @@ export function githubAPI(path, options = {}) {
     child.stdin.end(Object.keys(body).length ? JSON.stringify(body) : undefined);
   });
 }
-export async function removeTemporary(path) {
-  const stat = await lstat(path);
-  if (stat.isDirectory() && !stat.isSymbolicLink()) { for (const name of await readdir(path)) await removeTemporary(join(path, name)); await rmdir(path); }
-  else await unlink(path);
-}
-export async function prepareQueue(api, options) {
-  const repository = options.repo;
-  invariant(repositoryPattern.test(repository), 'invalid_repository');
-  const actor = (await api('/user')).login;
-  const revision = await authorizeActors(api, repository, actor, actor);
-  const protocol = await verifyProtocol(api, repository);
-  const action = protocol.provider ?? await resolveSource(api, options.source_repository ?? 'markhuangai/agent-remote-dev-codex', options.source_ref ?? 'v1');
-  if (protocol.provider && (options.source_repository || options.source_ref)) {
-    const requested = await resolveSource(api, options.source_repository ?? action.repository, options.source_ref ?? action.sha);
-    invariant(requested.repository === action.repository && requested.sha === action.sha, 'provider_runtime_source_changed');
-  }
-  const plan = options.plan;
-  invariant(typeof plan === 'string' && plan.trim() && Buffer.byteLength(plan) <= 1024 * 1024, 'invalid_plan');
-  const settings = await freezeProjectConfig(api, repository, revision);
-  const request = { request_id: options.request_id ?? randomUUID(), source_repository: action.repository, source_sha: action.sha,
-    plan, plan_sha256: digest(plan), ...settings };
-  invariant(taskPattern.test(request.request_id), 'invalid_request_identity');
-  invariant(Buffer.byteLength(JSON.stringify({ ...request, registration_key: registrationKey(request) })) <= 65535, 'workflow_input_size_limit');
-  log('submission.prepare', 'INFO', { repository, request_id: request.request_id, plan_sha256: request.plan_sha256, action, skills: request.skills, runner: request.runner,
-    project_config_sha256: request.project_config.sha256, user_agents_sha256: request.user_agents_sha256, actor, outcome: 'frozen' });
-  return { protocol_version: 3, repository, actor, action, request, request_sha256: digest(JSON.stringify(request)) };
-}
-export async function dispatchOnce(api, repository, request, actor, { now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+export async function dispatchOnce(api, repository, request, actor, { now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), runner = ['ubuntu-latest'] } = {}) {
   invariant(!request.dispatch_key, 'automatic_dispatch_requires_claim');
   invariant(!request.published_ref || ['v1-prerelease', 'v1'].includes(request.published_ref) && request.operation !== 'stop', 'invalid_published_reference');
   const workflow = request.published_ref ? 'runner-published.yml' : 'runner-task.yml';
@@ -86,7 +52,7 @@ export async function dispatchOnce(api, repository, request, actor, { now = Date
   let run = await find(), apiError = null;
   if (!run) {
     log('submission.dispatch', 'INFO', { repository, request_id: request.request_id ?? null, task_id: request.task_id ?? null, workflow, published_ref: request.published_ref ?? null, ref: 'main', actor, request_sha256: key, activation_key: request.activation_key ?? null, outcome: 'requesting' });
-    try { await api(`/repos/${repository}/actions/workflows/${workflow}/dispatches`, { method: 'POST', ref: 'main', inputs: { request: JSON.stringify(payload) } }); }
+    try { await api(`/repos/${repository}/actions/workflows/${workflow}/dispatches`, { method: 'POST', ref: 'main', inputs: { request: JSON.stringify(payload), 'runs-on': JSON.stringify(runner) } }); }
     catch (error) { apiError = safeError(error); }
   }
   const deadline = now() + 300000;
@@ -96,21 +62,6 @@ export async function dispatchOnce(api, repository, request, actor, { now = Date
     source_repository: request.source_repository ?? null, source_sha: request.source_sha ?? null, plan_sha256: request.plan_sha256 ?? null, request_sha256: key, activation_key: request.activation_key ?? null };
   log('submission.dispatch', 'INFO', { ...receipt, api_error: apiError, outcome: 'registered' });
   return receipt;
-}
-export async function queuePrepared(api, prepared, timing) {
-  invariant(prepared.protocol_version === 3 && repositoryPattern.test(prepared.repository) && prepared.request_sha256 === digest(JSON.stringify(prepared.request)), 'prepared_request_changed');
-  const actor = (await api('/user')).login;
-  invariant(actor === prepared.actor, 'authenticated_actor_changed');
-  const revision = await authorizeActors(api, prepared.repository, actor, actor);
-  const protocol = await verifyProtocol(api, prepared.repository);
-  if (protocol.provider) invariant(protocol.provider.repository === prepared.request.source_repository && protocol.provider.sha === prepared.request.source_sha,
-    'provider_runtime_source_changed', prepared.request.source_sha, protocol.provider.sha);
-  await readProjectConfig(api, prepared.repository, revision, prepared.request.project_config?.sha256);
-  invariant(typeof prepared.request.plan === 'string' && digest(prepared.request.plan) === prepared.request.plan_sha256, 'plan_hash_mismatch');
-  sources(prepared.request.skills); runnerLabels(prepared.request.runner);
-  invariant((await api(`/repos/${prepared.request.source_repository}/commits/${prepared.request.source_sha}`)).sha === prepared.request.source_sha, 'action_source_mismatch');
-  if (prepared.request.user_agents_url) await fetchInstructions(prepared.request.user_agents_url, prepared.request.user_agents_sha256);
-  return { ...await dispatchOnce(api, prepared.repository, prepared.request, actor, timing), action: prepared.action };
 }
 export async function inspectTask(api, repository, taskId, root, showResult = false) {
   invariant(repositoryPattern.test(repository) && taskPattern.test(taskId), 'invalid_task_identity');
@@ -129,7 +80,7 @@ export async function inspectTask(api, repository, taskId, root, showResult = fa
       invariant(value.schema_version === 3 && value.repository === repository && value.task_id === taskId && String(value.lineage?.run_id) === String(run.id) &&
         Number(value.lineage?.run_attempt) === Number(run.run_attempt) && value.lineage?.workflow_sha === run.head_sha && loaded.artifact.workflow_run?.id === run.id, 'run_record_identity_mismatch');
       if (kind === 'run') Object.assign(summary, { plan_sha256: value.plan_sha256, source_repository: value.execution.source_repository, source_sha: value.execution.source_sha, parent_run_id: value.execution.parent_run_id,
-        root_run_id: value.execution.root_run_id, continuation_count: value.execution.continuation_count, runner: value.execution.runner, invocation: value.invocation, execution: value.execution });
+        root_run_id: value.execution.root_run_id, continuation_count: value.execution.continuation_count, invocation: value.invocation, execution: value.execution });
       else if (kind === 'outcome') Object.assign(summary, { infrastructure_status: value.status, native_outcome: value.native_outcome, reason: value.reason, checkpoint: value.checkpoint });
       else summary.native_response = value.response;
     }
@@ -154,52 +105,4 @@ export async function waitForStop(api, repository, taskId, receipt, { now = Date
     log('submission.stop', 'INFO', { task_id: taskId, stop_run_id: receipt.run_id, pending_run_ids: pending.map(run => run.id), elapsed_ms: now() - started, timeout_ms: 900000, outcome: 'waiting_for_cancellation' });
     await sleep(Math.min(10000, deadline - now()));
   }
-}
-function argumentsFor(argv) {
-  const [command, ...args] = argv, options = {};
-  for (let index = 0; index < args.length; index++) {
-    invariant(args[index].startsWith('--'), 'invalid_argument');
-    const key = args[index].slice(2).replaceAll('-', '_');
-    if (['dry_run', 'show_result'].includes(key)) options[key] = true;
-    else { invariant(index + 1 < args.length && !args[index + 1].startsWith('--'), 'missing_argument_value'); options[key] = args[++index]; }
-  }
-  const allowed = { queue: ['repo', 'plan', 'plan_file', 'source_repository', 'source_ref', 'request_id', 'prepared', 'dry_run'],
-    status: ['repo', 'run_id', 'show_result'], resume: ['repo', 'run_id', 'artifact_id', 'activation_key'], stop: ['repo', 'run_id', 'stop_key'] };
-  invariant(allowed[command] && Object.keys(options).every(key => allowed[command].includes(key)), 'unsupported_argument');
-  return { command, options };
-}
-export async function cli(argv, api = githubAPI) {
-  if (!argv.length || ['--help', 'help'].includes(argv[0])) { process.stdout.write('remote-codex queue|status|resume|stop --repo OWNER/REPO (see bundled references/usage.md)\n'); return; }
-  const { command, options } = argumentsFor(argv), temporary = await mkdtemp(join(tmpdir(), 'remote-codex-'));
-  let diagnostic = { repository: repositoryPattern.test(options.repo ?? '') ? options.repo : null, task_id: taskPattern.test(options.run_id ?? '') ? options.run_id : null };
-  try {
-    let result;
-    if (command === 'queue') {
-      const prepared = options.prepared ? JSON.parse(await readFile(options.prepared, 'utf8')) : await prepareQueue(api, { ...options,
-        plan: options.plan_file ? await readFile(options.plan_file, 'utf8') : options.plan });
-      diagnostic = { repository: prepared.repository, task_id: prepared.request?.request_id };
-      result = options.dry_run ? prepared : await queuePrepared(api, prepared);
-    } else {
-      invariant(repositoryPattern.test(options.repo) && positiveId(options.run_id), 'invalid_task_identity');
-      if (command === 'status') result = await inspectTask(api, options.repo, options.run_id, temporary, options.show_result);
-      else {
-        const actor = (await api('/user')).login;
-        await authorizeActors(api, options.repo, actor, actor); await verifyProtocol(api, options.repo);
-        if (command === 'stop') {
-          const receipt = await dispatchOnce(api, options.repo, { operation: 'stop', task_id: options.run_id, stop_key: options.stop_key ?? randomBytes(16).toString('hex') }, actor);
-          result = await waitForStop(api, options.repo, options.run_id, receipt);
-        }
-        else {
-          invariant(command === 'resume' && positiveId(options.artifact_id), 'invalid_command_or_artifact');
-          const loaded = await loadVerifiedCheckpoint({ api, repository: options.repo, id: Number(options.artifact_id), taskId: options.run_id,
-            io: (id, kind) => readArtifact({ api, repository: options.repo, id, root: temporary, kind }) });
-          result = await dispatchOnce(api, options.repo, { task_id: options.run_id, source_repository: loaded.manifest.execution.source_repository,
-            source_sha: loaded.manifest.execution.source_sha, ...(loaded.manifest.execution.published_ref ? { published_ref: loaded.manifest.execution.published_ref } : {}),
-            resume_artifact_id: Number(options.artifact_id), activation_key: options.activation_key ?? randomBytes(16).toString('hex') }, actor);
-        }
-      }
-    }
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n'); return result;
-  } catch (error) { log('submission.failed', 'ERROR', { ...diagnostic, ...safeError(error), ...error.details, command, outcome: 'blocked' }); throw error; }
-  finally { await removeTemporary(temporary); }
 }

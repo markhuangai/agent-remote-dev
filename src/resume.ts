@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { cp, lstat, mkdir, readFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { checkpointBytes, databases, positiveId, recordName, validateFrozenRoot, validateManifest, validateProducer } from "./platform/checkpoint-policy.mjs";
+import { checkpointBytes, databases, positiveId, validateManifest, validateProducer } from "./platform/checkpoint-policy.mjs";
 import { authorize, parseJson, requireValue, RunnerError, skillSources, versions } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
@@ -61,21 +61,6 @@ export async function loadCheckpoint(job: Job, api: (endpoint: string) => Promis
     requireValue(run.status === "completed", "checkpoint_producer_active", "resume");
     const workflow = await api(`repos/${repository}/actions/workflows/${run.workflow_id}`);
     requireValue(workflow.path === run.path && workflow.state === "active", "checkpoint_workflow_mismatch", "resume");
-    const rootRun = await api(`repos/${repository}/actions/runs/${manifest.execution.root_run_id}/attempts/${manifest.execution.root_run_attempt}`);
-    const artifacts: any[] = [];
-    for (let page = 1; ; page++) {
-      requireValue(page <= 100, "artifact_collection_truncated", "resume");
-      const batch = await api(`repos/${repository}/actions/runs/${rootRun.id}/artifacts?per_page=100&page=${page}`);
-      requireValue(Array.isArray(batch.artifacts), "invalid_artifact_collection", "resume");
-      artifacts.push(...batch.artifacts);
-      if (batch.artifacts.length < 100) break;
-    }
-    const matches = artifacts.filter(artifact => artifact.name === recordName("run", manifest.task_id, String(rootRun.id), String(rootRun.run_attempt)));
-    requireValue(matches.length === 1, "missing_or_ambiguous_root_record", "resume");
-    const rootRecord = await downloadArtifact(job, api, repository, matches[0].id, "record", log);
-    requireValue(rootRecord.artifact.workflow_run?.id === rootRun.id, "root_record_producer_mismatch", "resume");
-    try { validateFrozenRoot(manifest, rootRecord.value, rootRun); }
-    catch (error: any) { throw new RunnerError(error.reason, "resume", "The checkpoint differs from its frozen root execution contract.", error.details); }
     log.event("resume.validate", "INFO", { artifact_id: id, producer_run_id: runId, producer_attempt: attempt, task_id: manifest.task_id,
       checkpoint_sha: manifest.checkpoint_sha, session_id: manifest.session_id, outcome: "verified", elapsed_ms: Date.now() - started });
     return { ...loaded, manifest, run, receipt: { artifact_id: id, checkpoint_sha: manifest.checkpoint_sha, sequence: manifest.sequence } as DurableCheckpoint };
@@ -118,18 +103,16 @@ async function restoreVerifiedCheckpoint(job: Job, root: string, manifest: Manif
   }
   requireValue(manifest.sessions.every(id => identifiers.includes(id)), "missing_session_history", "resume");
   git.branch = manifest.branch;
-  const observed = await git.remoteHead(manifest.checkpoint_sha);
-  if (observed !== manifest.checkpoint_sha) throw new RunnerError("resume_branch_drift", "resume", "The task branch no longer matches its durable checkpoint.",
-    { expected_sha: manifest.checkpoint_sha, observed_sha: observed, artifact_sequence: manifest.sequence });
   requireValue((await git.run(["status", "--porcelain", "--untracked-files=all"])).trim() === "", "unsafe_worktree", "resume");
-  await git.run(["fetch", "origin", manifest.branch ? `refs/heads/${manifest.branch}` : manifest.checkpoint_sha]);
+  await git.run(["fetch", "--no-tags", "origin", manifest.checkpoint_sha]);
   requireValue((await git.run(["rev-parse", "FETCH_HEAD"])).trim() === manifest.checkpoint_sha, "resume_fetch_drift", "resume");
   if (manifest.branch === null) await git.run(["switch", "--detach", manifest.checkpoint_sha]);
   else {
     const local = (await git.run(["branch", "--list", "--format=%(objectname)", manifest.branch])).trim();
-    requireValue(!local || local === manifest.checkpoint_sha, "resume_local_branch_drift", "resume");
-    await git.run(local ? ["switch", manifest.branch] : ["switch", "-c", manifest.branch, manifest.checkpoint_sha]);
+    if (local && local !== manifest.checkpoint_sha) await git.run(["switch", "--detach", manifest.checkpoint_sha]);
+    else await git.run(local ? ["switch", manifest.branch] : ["switch", "-c", manifest.branch, manifest.checkpoint_sha]);
   }
+  git.branch = await git.currentBranch();
   await git.verify(manifest.checkpoint_sha);
   const source = join(root, "codex");
   for (const name of databases) {

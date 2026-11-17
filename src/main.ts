@@ -55,7 +55,7 @@ export async function main() {
     };
     const actionRoot = resolve(import.meta.dirname, "..");
     const installedSource = await invocationSource(api, actionRoot, process.env, args => command("git", args, { cwd: actionRoot, env: currentJob.env, stage: "action_source", log }));
-    const verified = await prepareInvocation({ api, source: installedSource, plan: get("plan"), core, env: { ...process.env, RUNNER_TEMP: job.staging } });
+    const verified = await prepareInvocation({ api, source: installedSource, plan: get("plan"), resumeRunId: get("resume-run-id"), core, env: { ...process.env, RUNNER_TEMP: job.staging } });
     const execution = verified.execution;
     const source = selectPlanSource(verified.plan, String(verified.resumeArtifactId));
     const taskId = verified.taskId;
@@ -65,7 +65,7 @@ export async function main() {
       CODEX_TASK_DEADLINE_MS: String(started + execution.budget_minutes * 60000) });
     await configure(job, config, log);
     log.fields = { ...log.fields, platform: process.platform, architecture: process.arch, source_repository: execution.source_repository, action_source_sha: execution.source_sha,
-      runner: execution.runner, budget_minutes: execution.budget_minutes, root_run_id: execution.root_run_id, parent_run_id: execution.parent_run_id, continuation_count: execution.continuation_count,
+      budget_minutes: execution.budget_minutes, root_run_id: execution.root_run_id, parent_run_id: execution.parent_run_id, continuation_count: execution.continuation_count,
       max_continuations: execution.max_continuations, user_agents_sha256: execution.user_agents_sha256,
       project_config_sha256: execution.project_config?.sha256, project_config_revision: execution.project_config?.revision };
     let selected = skillSources(verified.skills);
@@ -101,8 +101,9 @@ export async function main() {
     requireValue(shaPattern.test(base), "invalid_initial_revision");
     const lineage = { repository, workflow_ref: process.env.GITHUB_WORKFLOW_REF, workflow_sha: process.env.GITHUB_WORKFLOW_SHA, run_id: process.env.GITHUB_RUN_ID,
       run_attempt: process.env.GITHUB_RUN_ATTEMPT, actor: process.env.GITHUB_ACTOR,
-      triggering_actor: process.env.TRIGGERING_ACTOR || process.env.GITHUB_TRIGGERING_ACTOR || process.env.GITHUB_ACTOR };
-    runRecord = { schema_version: 3, repository, task_id: taskId, initial_sha: base, plan_sha256: hash(plan), authorization, execution, lineage, skills: selected, invocation: installedSource,
+      triggering_actor: process.env.TRIGGERING_ACTOR || process.env.GITHUB_TRIGGERING_ACTOR || process.env.GITHUB_ACTOR,
+      runner_labels: process.env.CODEX_RUNNER_LABELS ? parseJson(process.env.CODEX_RUNNER_LABELS, "runner_metadata") : null };
+    runRecord = { schema_version: 3, repository, task_id: taskId, initial_sha: base, plan_sha256: hash(plan), authorization, execution, lineage, skills: selected, invocation: installedSource, runner_labels: lineage.runner_labels,
       plan_source: restored?.manifest.plan_source ?? "inline", resume_artifact_id: restored?.receipt.artifact_id ?? null };
     await isolatedRecord(job, "run", runRecord, log);
     await requireActive(api, repository, taskId, execution.activation_run_id, execution.request_id);

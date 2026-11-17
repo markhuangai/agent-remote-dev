@@ -8,7 +8,7 @@ import { RunnerError } from "./contracts.js";
 export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
     "-c", `sqlite_home=${JSON.stringify(job.codexHome)}`, "-c", `log_dir=${JSON.stringify(join(job.root, "logs"))}`];
-  const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-last-message", output];
+  const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--trust", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-last-message", output];
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,

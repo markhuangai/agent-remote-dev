@@ -5,8 +5,8 @@ optional user-level instructions. Skills own workflow state, Git changes, tests,
 audits, PRs and completion. The runner provisions an isolated job, supervises
 processes and transports verified native sessions across fresh runners.
 
-Release qualification is pending. Use an explicitly authorized exact source
-commit until the post-merge qualification and publication gates pass.
+Releases have not been published. Use an explicitly authorized exact source
+commit until a maintainer publishes a version.
 
 ## Run the action
 
@@ -31,7 +31,9 @@ on:
     inputs:
       plan:
         description: Prompt for Codex, including any issue references
-        required: true
+        type: string
+      resume-run-id:
+        description: Prior run whose saved conversation should be restored
         type: string
 permissions:
   contents: read
@@ -47,6 +49,7 @@ jobs:
       - uses: markhuangai/agent-remote-dev-codex@v1-prerelease
         with:
           plan: ${{ inputs.plan }}
+          resume-run-id: ${{ inputs.resume-run-id }}
           github-token: ${{ secrets.REMOTE_DEV_PAT }}
           codex-api-key: ${{ secrets.CODEX_API_KEY }}
           codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
@@ -64,14 +67,11 @@ an already allocated runner; set `runs-on` in the job. The optional
 labels before allocating execution. Its single caller also supports the local
 client, cross-run resume, stop and automatic continuation described below.
 
-The action derives and verifies its exact source from `uses:` metadata or a
-local action checkout. A moving ref that changes between download and source
-verification rejects mismatched resources. Callers supply no source identities,
-task IDs, authorization JSON or continuation context. Git identity defaults to
-`github-actions[bot]` in the isolated child; configure persistent settings in
-`remote-codex.yml`. Unknown keys, malformed YAML, duplicate keys, aliases,
-invalid identities and unsupported runners fail explicitly. Keep credentials
-in GitHub secrets.
+The action uses the package selected by `uses:`. Build and release checks verify
+that committed bundles match source; execution does not download a second
+package inventory. Callers supply no source identities, task IDs or authorization
+JSON. Configure skills, user instructions and task settings in `remote-codex.yml`;
+keep credentials in GitHub secrets. Runner selection belongs to the workflow.
 
 Run manual workflows on trusted `main`. The exact prompt is passed to Codex;
 issue URLs, issue content and dependency decisions belong to the selected skills.
@@ -195,65 +195,47 @@ retains logs under its existing policy; records include `GITHUB_RETENTION_DAYS`.
 No additional log sink or payload artifact is created. Temporary tools live
 outside the checkout; preserve workflow logs and CodeQL results as evidence.
 
-## Optional local client
+## Local skill and GitHub tools
 
-Install the complete `remote-codex` skill with Skills CLI 1.8.1 when a local agent
-should submit and manage tasks. Its [usage guide](skills/remote-codex/references/usage.md)
-describes Node 24, GitHub CLI and Python 3.12+ prerequisites. It never transfers
-local Codex history or credentials. The client reads the target's committed
-`remote-codex.yml` rather than requiring settings on every invocation.
-
-The optional installer writes exactly two files: `remote-codex.yml` and
-`.github/workflows/runner-task.yml`. That caller template includes the internal
-request input and completion event needed for queue/resume/stop and optional
-automatic continuation. All executable helpers remain in our bundled package.
-Review and merge these two files before using the client. Installation refuses
-existing files and linked destinations; it does not commit, push, configure
-secrets or register runners. Set `auto-continue: true` only with this compatible
-single-file caller. Qualification and release tooling stays in this provider repository.
+The optional [remote-codex skill](skills/remote-codex/SKILL.md) contains only
+`SKILL.md`. It teaches a local agent to use GitHub CLI or GitHub MCP. There is no
+local application, installer, generated caller or consumer helper directory.
+Create the workflow and project configuration shown above using your normal
+repository process.
 
 ```bash
-node <installed-skill>/scripts/install-workflows.mjs --directory . --actors LOGIN --ref v1
-node <installed-skill>/scripts/remote-codex.mjs queue --repo OWNER/REPO \
-  --plan-file prompt.md --dry-run
-node <installed-skill>/scripts/remote-codex.mjs queue --prepared prepared-task.json
+gh workflow run remote-codex.yml --repo OWNER/REPO --ref main -F plan=@prompt.md
+gh run list --repo OWNER/REPO --workflow remote-codex.yml
+gh run view RUN_ID --repo OWNER/REPO --log
+gh workflow run remote-codex.yml --repo OWNER/REPO --ref main -f resume-run-id=RUN_ID
+gh run cancel RUN_ID --repo OWNER/REPO
 ```
 
-Save dry-run JSON as `prepared-task.json` in a task-owned temporary directory.
-Prompt and configuration hashes are rechecked before one dispatch. Workflow
-requests are limited to 65,535 bytes; use a short prompt referencing an existing
-issue for larger task descriptions. A request identity exists only to reconcile
-ambiguous pre-dispatch responses. The resulting GitHub run ID identifies the
-task and remains its root through continuation. Initial-run reruns are rejected;
-use an explicit resume for retained checkpoints.
+Use the filename of your consumer workflow. If a dispatch response is uncertain,
+inspect existing runs before submitting again. GitHub run IDs identify executions;
+resume takes the prior run ID and selects its latest checkpoint.
 
-`npm run build` in this provider repository builds the native runtime and shared
-`src/platform/` implementation into `dist/`, generates `dist/protocol.json`, and
-regenerates the workflow/client bundles and self-contained skill
-package. These are prebuilt Node 24 programs for both supported Linux
-architectures. Consumers do not build them or install this project's npm
-dependencies. Separate native executables are unnecessary for GitHub Actions.
+`npm run build` builds the native action and optional workflow helper into
+`dist/`. These are prebuilt Node 24 programs with supporting Python files;
+consumers neither build them nor install this project's dependencies. The local
+skill has no generated code or package inventory.
 
 ## Runners, credentials and trust
 
 Execution is Linux x64/arm64 with Node 24, Git, npm, GitHub CLI and Python 3.12+.
-Use `["ubuntu-latest"]` or `["self-hosted","Linux"]` with optional architecture or
-custom labels. Native arm64 hosted execution can use `["ubuntu-24.04-arm"]`.
-The selected labels are frozen across continuation. A self-hosted runner must
-already be provisioned; the action does not install host packages or register it.
+Set `jobs.<job>.runs-on` in the consumer workflow, for example `ubuntu-latest`,
+`ubuntu-24.04-arm`, or `[self-hosted, Linux, ARM64]`. The project configuration
+rejects `runner`; it never allocates machines or freezes runner labels in a
+conversation. Self-hosted machines must already have the required host tools.
+The optional reusable workflow takes `runs-on` from its caller workflow; its
+internal dispatch preserves that workflow choice for automatic children.
 
-Both the original and triggering user must appear in reviewed
-`remote-codex.yml` under `allowed-actors` and have repository write/maintain/admin
-permission. The initial allowlist here is `Z-M-Huang`; consumer installation
-requires explicit logins. The reusable workflow checks actors on trusted `main` before the secret-bearing execution
-step and again after acquiring the per-task lock; standalone action setup checks
-actors before native execution. Automatic bot children need
-a unique verified controller claim. Each automatic dispatch and execution also
-rechecks the humans behind the current explicit activation against current `main`
-and repository write permission. Activation is bound to its exact run attempt;
-rerunning that activation invalidates its automatic children. An authorized manual
-resume can establish a new activation after another operator loses access.
-This policy is separate from AI-review trust.
+Both the original and triggering user must appear in the latest `main` version
+of `remote-codex.yml` under `allowed-actors` and have repository write/maintain/admin
+permission. Resume checks the current policy, independently of the source commit
+being restored. Automatic children verify their transport claim and recheck the
+current permissions of the initiating user. There are no historical approval
+snapshots. This policy is separate from AI-review trust.
 
 Provision these runtime secrets:
 
@@ -310,8 +292,9 @@ Archive validation rejects traversal, absolute/drive paths, links, duplicate or
 encrypted entries, unexpected files, hash mismatches and expansion beyond 256 MiB.
 SQLite integrity and credential exclusion are checked. Native session IDs and
 relocated rollout paths are verified before resuming the explicit conversation.
-Changed settings, expired artifacts, producer mismatches and source drift stop
-resume without rewinding Git. Versions 1 and 2 are explicitly rejected, with no
+Invalid saved settings, expired artifacts, producer mismatches and missing source commits stop
+resume. A newer branch tip does not block restoration: the saved commit is
+checked out without merging main or rewriting an existing local branch. Versions 1 and 2 are explicitly rejected, with no
 migration of their SDLC state.
 
 Outputs describe infrastructure: observed `branch`, `base-sha`,
@@ -320,18 +303,24 @@ Outputs describe infrastructure: observed `branch`, `base-sha`,
 the native invocation returned; `continuing` means a durable deadline handoff.
 The response artifact is protected task output, not an execution authority.
 
-```bash
-node <installed-skill>/scripts/remote-codex.mjs status --repo OWNER/REPO --run-id ROOT_RUN_ID
-node <installed-skill>/scripts/remote-codex.mjs status --repo OWNER/REPO --run-id ROOT_RUN_ID --show-result
-node <installed-skill>/scripts/remote-codex.mjs resume --repo OWNER/REPO --run-id ROOT_RUN_ID --artifact-id ID
-node <installed-skill>/scripts/remote-codex.mjs stop --repo OWNER/REPO --run-id ROOT_RUN_ID
-```
+Resume restores the saved conversation, original skill revisions, instruction
+bytes and committed source revision. Current main changes do not alter that
+workspace. A checkpoint contains no uncommitted files or unpushed commits;
+those changes cannot be recovered on another runner.
 
-Stop requests persist a cancellation receipt and fence child dispatch and queued
-execution through native run identity, even after artifacts expire. A later
-explicit manual resume can establish a new activation within the same frozen
-continuation allowance. The helper follows parent/child/controller URLs; it does
-not parse skill phases or claim a PR passed review.
+Native Codex hooks load from its standard user configuration or the restored
+repository's `.codex/hooks.json` / `.codex/config.toml`. The action enables hooks
+noninteractively for this authorized YOLO invocation. Configure a native
+`PostToolUse` hook to commit and push coherent progress frequently. The repository
+or selected skill supplies that hook's policy and commands; the platform does not
+stage, commit, push, create branches or force-push for checkpointing. A local
+commit alone is insufficient: the revision must be available from the remote.
+Hooks from task code execute with the same privileges as Codex.
+
+GitHub cancellation stops the selected run. For optional automatic continuation,
+the reusable workflow also has a task-wide stop route that fences queued children;
+a later explicit manual resume can reactivate the task. Cancellation or native
+failure does not automatically restart execution.
 
 ## Diagnose runtime infrastructure
 
@@ -356,42 +345,24 @@ evidence under repository retention. Strings over 512 characters and bounded-lis
 omissions are marked; credentials, raw prompts/instructions/provider bodies and
 arbitrary PR text are excluded from logs.
 
-## Qualification and publication
+## Live platform tests and publication
 
-No live qualification or release is claimed by this implementation PR. After
-human merge, provision runtime secrets and a self-hosted Linux runner, then
-separately authorize `runner-acceptance.yml` on trusted `main`. Supply an exact
-merged source SHA and direct authorization for uniquely identified smoke branches,
-draft PRs, resume/cancellation and scoped cleanup. The harness runs `fresh`,
-`cold-resume`, `deadline`, `cancellation` and `failed-push` on hosted and self-hosted
-Linux. An ordinary test prompt defines each scenario without installing a skill.
-The harness checks real run/session/source evidence. Cleanup fences owned tasks, closes proven smoke
-PRs without merging, removes only their proven branches and retains evidence.
-Missing scenarios, mismatched sessions/source or unproven cleanup fail qualification.
+Our repository retains `runner-acceptance.yml`, `runner-published.yml`, the
+qualification harness and its fixtures. These are maintainer integration tests,
+not consumer setup. After merge and separate authorization, they exercise fresh
+execution, cold resume, deadlines, cancellation and failed pushes on hosted and
+self-hosted Linux. They verify native sessions and test-owned Git changes, clean
+up only their own branches/PRs, and retain evidence. They do not prescribe the
+consumer's development workflow.
 
-`release.yml` is a separate maintainer-dispatched operation on `main`. It requires
-successful exact-source main CI/CodeQL children, complete qualification/cleanup,
-fresh source/bundle checks and a complete installed submission package. The initial
-versions are `v1.0.0-rc.0` and `v1.0.0`. Exact version tags are creation-only.
-Source installation, builds and tests run in a separate read-only job. The
-publisher executes only trusted policy and accepts a bounded, digest-bound
-artifact from that exact build run/attempt. It treats archives as data, rejects
-unsafe entries and independently compares all package bytes with Git blobs at
-the qualified source SHA before generating the release manifest.
-Prereleases advance `v1-prerelease`; stable releases advance `v1`; aliases use
-forward API updates with `force: false`. A partial or ambiguous publication stops
-for maintainer inspection rather than overwriting a version or retrying blindly.
+`release.yml` takes a version and publishes the exact main commit selected by
+that workflow dispatch. It requires successful source CI/CodeQL jobs and a fresh
+bundle check. Builds run in a read-only job, and the publisher verifies the build
+artifact against that source before creating the release. There is no manual
+source-SHA input or required qualification-run receipt.
 
-First qualify the merged SHA and explicitly publish `v1.0.0-rc.0`. Run qualification
-again with `action-ref: v1-prerelease` and that exact SHA. In addition to the five
-source cases, this runs a fresh/manual-resume pair per runner family through
-literal published `uses:` steps. The two channel jobs are separately gated, so
-prerelease qualification does not download the not-yet-published stable alias.
-Promotion independently verifies their actual run/attempts, invocation provenance,
-artifact producers, frozen settings and native checkpoint/session lineage.
-Stable promotion requires this published prerelease smoke receipt.
-Publish `v1.0.0`, verify `v1` and `v1-prerelease` resolve to their exact
-releases, and smoke the published stable action before remote cutover. Source and
-bundle checks, qualification run URLs, release IDs, exact tags/commits and alias
-targets are recorded without credentials. Do not move this repository's subsequent
-tickets remotely until those cutover gates pass.
+Exact version tags are creation-only. Prereleases such as `v1.0.0-rc.0` advance
+`v1-prerelease`; stable releases such as `v1.0.0` advance `v1`. Later major versions
+use `vN-prerelease` / `vN`. Alias updates must move forward without force. A partial
+publication stops for maintainer inspection. This PR does not merge, run live
+qualification, publish releases, change aliases or provision secrets/runners.

@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { digest, instructionURL, invariant, runnerLabels, shaPattern } from './checkpoint-policy.mjs';
+import { digest, instructionURL, invariant, shaPattern } from './checkpoint-policy.mjs';
 import { fetchInstructions } from './instructions.mjs';
 import { resolveSkills } from './sources.mjs';
 
@@ -16,7 +16,7 @@ export function parseProjectConfig(text) {
   } catch { invariant(false, 'invalid_project_config'); }
   const object = input => input && typeof input === 'object' && !Array.isArray(input);
   invariant(object(value) && Object.keys(value).every(key => ['allowed-actors', 'skills', 'user-level-agents.md-url', 'git-author', 'budget-minutes',
-    'auto-continue', 'max-continuations', 'runner'].includes(key)), 'unknown_project_config_key');
+    'auto-continue', 'max-continuations'].includes(key)), 'unknown_project_config_key');
   invariant(Array.isArray(value['allowed-actors']) && value['allowed-actors'].length > 0 && value['allowed-actors'].length <= 100 &&
     value['allowed-actors'].every(actor => typeof actor === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(actor)), 'invalid_operator_configuration');
   const author = value['git-author'] ?? { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com' };
@@ -32,7 +32,7 @@ export function parseProjectConfig(text) {
   const budget = value['budget-minutes'] ?? 300, limit = value['max-continuations'] ?? 3, automatic = value['auto-continue'] ?? false;
   invariant(Number.isFinite(budget) && budget >= 3 && budget <= 300 && Number.isSafeInteger(limit) && limit >= 0 && limit <= 100 && typeof automatic === 'boolean', 'invalid_execution_settings');
   return { allowed_actors: value['allowed-actors'], skills, user_agents_url: url, git_author_name: author.name, git_author_email: author.email,
-    budget_minutes: budget, max_continuations: limit, auto_continue: automatic, runner: runnerLabels(value.runner) };
+    budget_minutes: budget, max_continuations: limit, auto_continue: automatic };
 }
 export async function readProjectConfig(api, repository, revision, expected) {
   invariant(shaPattern.test(revision), 'invalid_project_config_revision');

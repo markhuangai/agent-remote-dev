@@ -11,7 +11,6 @@ import { verifyResumeSettings } from '../.build/continuation.js';
 import { prepareInvocation } from '../.build/invocation.js';
 import { checkpointName, recordName, registrationKey, validateManifest, validateProducer } from '../src/platform/checkpoint-policy.mjs';
 import { authorizeActivation, childRunName, continuationDecision, prepareTaskRequest, resolveTaskRequest, runController, requireActive, cancelTaskRuns } from '../src/platform/continuation-policy.mjs';
-import { verifyProtocol } from '../src/platform/protocol-policy.mjs';
 import { parseProjectConfig } from '../src/platform/project-config.mjs';
 import { workflowCommand } from '../src/platform/control.mjs';
 import { exec, execution, fixture, lineage as fixtureLineage, repository, root } from './helpers.mjs';
@@ -81,30 +80,24 @@ async function protocolFixture(t, supplied) {
   const controller = { ...parent, id: 99, event: 'workflow_run', path: '.github/workflows/runner-continuation.yml' };
   const model = { manifest, parent, request, artifacts, payloads, children: [], dispatches: [], registration: 'normal', controller,
     runs: new Map([[13, parent], [99, controller]]), endedAt: new Date(Date.now() - 1000).toISOString(), observedHead: manifest.checkpoint_sha };
-  model.protocol = JSON.parse(await readFile(join(root, 'dist/protocol.json'), 'utf8'));
   model.sources = new Map();
-  for (const path of Object.keys(model.protocol.files)) model.sources.set(path, await readFile(join(root, path)));
   model.sources.set('remote-codex.yml', await readFile(join(root, 'remote-codex.yml')));
   model.jobs = new Map(); model.cancelled = [];
   const api = async (endpoint, options = {}) => {
     const method = options.method ?? 'GET';
-    if (endpoint.startsWith('/repos/markhuangai/agent-remote-dev-codex/contents/skills/remote-codex/assets/runner-task.yml?')) {
-      const bytes = await readFile(join(root, 'skills/remote-codex/assets/runner-task.yml'));
-      return { size: bytes.length, encoding: 'base64', content: bytes.toString('base64') };
-    }
     if (endpoint === `/repos/markhuangai/agent-remote-dev-codex/commits/${sourceSha}`) return { sha: sourceSha };
     if (endpoint.includes('/collaborators/')) return { permission: model.permissions?.[endpoint.split('/collaborators/')[1].split('/')[0]] ?? model.permission ?? 'write' };
     if (endpoint === `/repos/${repo}/git/ref/heads/main`) return { object: { sha: sourceSha } };
     if (endpoint.startsWith(`/repos/${repo}/contents/`)) {
       const path = endpoint.split('/contents/')[1].split('?')[0];
-      const bytes = path === 'dist/protocol.json' ? Buffer.from(json(model.protocol)) : model.sources.get(path);
+      const bytes = model.sources.get(path);
       return { size: bytes.length, encoding: 'base64', content: bytes.toString('base64') };
     }
     if (endpoint.match(/\/actions\/artifacts\/[0-9]+(?:\/zip)?$/)) {
       const id = Number(endpoint.match(/artifacts\/([0-9]+)/)[1]);
       return endpoint.endsWith('/zip') ? payloads.get(id) : artifacts.get(id);
     }
-    if (endpoint === `/repos/action/source/commits/${sourceSha}` || endpoint === `/repos/${repo}/commits/${sourceSha}`) return { sha: sourceSha };
+    if (endpoint === `/repos/action/source/commits/${sourceSha}` || endpoint === `/repos/${repo}/commits/${sourceSha}` || endpoint === `/repos/${repo}/commits/${model.manifest.checkpoint_sha}`) return { sha: endpoint.split('/').at(-1) };
     if (method === 'POST' && /\/actions\/runs\/[0-9]+\/cancel$/.test(endpoint)) { model.cancelled.push(Number(endpoint.match(/runs\/([0-9]+)/)[1])); return undefined; }
     if (/\/actions\/runs\/[0-9]+(?:\/attempts\/[0-9]+)?$/.test(endpoint)) return model.runs.get(Number(endpoint.match(/runs\/([0-9]+)/)[1]));
     if (endpoint === `/repos/${repo}/actions/workflows/7`) return { path: parent.path, state: 'active' };
@@ -120,7 +113,7 @@ async function protocolFixture(t, supplied) {
     if (/\/actions\/runs\/[0-9]+\/attempts\/[0-9]+\/jobs\?/.test(endpoint)) return { jobs: model.jobs.get(Number(endpoint.match(/runs\/([0-9]+)/)[1])) ?? [{ id: 70, name: 'execute', status: 'completed', completed_at: model.endedAt }] };
     if (endpoint.startsWith(`/repos/${repo}/actions/runs?`) || endpoint.startsWith(`/repos/${repo}/actions/workflows/runner-task.yml/runs?`)) return { workflow_runs: [model.parent, ...model.children] };
     if (method === 'POST' && endpoint.endsWith('/runner-task.yml/dispatches')) {
-      const submitted = JSON.parse(options.inputs.request); model.dispatches.push(submitted);
+      const submitted = JSON.parse(options.inputs.request); model.dispatches.push(submitted); model.lastDispatchInputs = options.inputs;
       if (model.registration !== 'absent') {
         const id = Math.max(...model.runs.keys(), ...model.children.map(child => child.id)) + 1;
         const child = { ...parent, id, status: 'queued', conclusion: null, html_url: `https://github.com/${repo}/actions/runs/${id}`,
@@ -158,44 +151,35 @@ test('schema-3 checkpoints bind selected inputs and native sessions without an S
     { ...f.model.parent, run_attempt: 2 }, { ...f.model.parent, actor: { login: 'other' } }]) assert.throws(() => validateProducer(artifact, run, m, repo));
 });
 
-test('trusted protocol verification rejects missing, changed and incompatible resources', async t => {
-  const f = await protocolFixture(t);
-  assert.equal((await verifyProtocol(f.api, repo)).protocol_version, 3);
-  f.model.protocol.protocol_version = 2;
-  await assert.rejects(verifyProtocol(f.api, repo), { reason: 'incompatible_runner_protocol' });
-  f.model.protocol.protocol_version = 3;
-  f.model.sources.set('src/platform/archive.py', Buffer.from('changed archive helper'));
-  await assert.rejects(verifyProtocol(f.api, repo), { reason: 'protocol_source_mismatch' });
-});
-
-test('real remote branch drift rejects native restore without changing the fresh checkout or session destination', async t => {
+test('real native restore returns to the pushed commit after main and the task branch advance', async t => {
   const f = await protocolFixture(t), r = await repository(f);
   await r.git('branch', '-m', branch); await r.git('push', 'origin', branch);
   const original = await r.git('rev-parse', 'HEAD');
-  await writeFile(join(r.cwd, 'drift.txt'), 'External branch advance');
-  await r.git('add', 'drift.txt'); await r.git('commit', '-m', 'Advance remote branch'); await r.git('push', 'origin', branch);
+  await writeFile(join(r.cwd, 'drift.txt'), 'Later main and task changes');
+  await r.git('add', 'drift.txt'); await r.git('commit', '-m', 'Advance source');
+  await r.git('push', 'origin', branch); await r.git('push', 'origin', 'HEAD:main');
   const advanced = await r.git('rev-parse', 'HEAD');
   const fresh = await fixture(t), cwd = join(fresh.temporary, 'fresh');
   await exec('git', ['clone', '--branch', 'main', r.remote, cwd], { env: fresh.job.env });
-  const git = new TaskGit(cwd, fresh.job.env, fresh.log), homeBefore = await readdir(fresh.job.codexHome);
+  const git = new TaskGit(cwd, fresh.job.env, fresh.log);
   const archive = join(fresh.temporary, 'checkpoint.zip'), snapshot = join(fresh.temporary, 'snapshot');
   await writeFile(archive, f.model.payloads.get(41));
   await unpackArchive(fresh.job, archive, snapshot, 'checkpoint', fresh.log);
-  const manifest = { ...f.model.manifest, base_sha: original, checkpoint_sha: original };
-  await assert.rejects(restoreCheckpoint(fresh.job, snapshot, manifest, git, fresh.log), { reason: 'resume_branch_drift' });
-  assert.equal(await git.head(), original); assert.equal((await git.run(['branch', '--show-current'])).trim(), 'main');
-  assert.equal(await git.changedPaths(), ''); assert.deepEqual(await readdir(fresh.job.codexHome), homeBefore);
+  const manifest = { ...f.model.manifest, branch: 'main', base_sha: original, checkpoint_sha: original };
+  await restoreCheckpoint(fresh.job, snapshot, manifest, git, fresh.log);
+  assert.equal(await git.head(), original); assert.equal(await git.currentBranch(), null);
+  assert.equal((await git.run(['rev-parse', 'main'])).trim(), advanced);
+  assert.equal(await git.remoteHead(advanced), advanced); assert.equal(await git.changedPaths(), '');
   await assert.rejects(readFile(join(cwd, 'drift.txt')), { code: 'ENOENT' });
-  await assert.rejects(readFile(join(fresh.job.codexHome, 'sessions/rollout.jsonl')), { code: 'ENOENT' });
-  const failure = fresh.records.find(record => record.event === 'resume.restore');
-  assert.equal(failure.reason, 'resume_branch_drift'); assert.equal(failure.level, 'ERROR');
-  assert.equal(failure.expected_sha, original); assert.equal(failure.observed_sha, advanced);
-  assert.equal(failure.session_id, manifest.session_id); process.stdout.write(json(failure) + '\n');
+  assert.ok(await readFile(join(fresh.job.codexHome, 'sessions/rollout.jsonl')));
+  const receipt = fresh.records.find(record => record.event === 'resume.restore' && record.outcome === 'complete');
+  assert.equal(receipt.expected_sha, original); assert.equal(receipt.observed_sha, original);
+  process.stdout.write(json(receipt) + '\n');
 });
 
 test('trusted fresh requests freeze selected setup and reject unlisted or read-only operators', async t => {
   const f = await protocolFixture(t), plan = 'Run an arbitrary selected workflow.';
-  const content = 'allowed-actors: [Z-M-Huang]\nrunner: [self-hosted, Linux, X64]\ngit-author: {name: Fixture Author, email: fixture@example.invalid}\n';
+  const content = 'allowed-actors: [Z-M-Huang]\ngit-author: {name: Fixture Author, email: fixture@example.invalid}\n';
   f.model.sources.set('remote-codex.yml', Buffer.from(content));
   const { allowed_actors, ...settings } = parseProjectConfig(content);
   const request = { request_id: 'new-request', source_repository: 'action/source', source_sha: sourceSha, plan, plan_sha256: hash(plan),
@@ -204,11 +188,11 @@ test('trusted fresh requests freeze selected setup and reject unlisted or read-o
   const context = { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' };
   const result = await prepareTaskRequest({ github: f.github, context, core: f.core, env });
   const fixed = JSON.parse(result.execution);
-  assert.deepEqual(fixed.runner, request.runner); assert.equal(fixed.source_repository, 'action/source'); assert.equal(fixed.budget_minutes, 300);
+  assert.equal(fixed.source_repository, 'action/source'); assert.equal(fixed.budget_minutes, 300);
   assert.equal(result.skills, '[]'); assert.equal(fixed.activation_run_id, '200'); assert.equal(result.task_id, '200');
   assert.equal(fixed.project_config.sha256, hash(content));
   const resolved = await resolveTaskRequest({ github: f.github, context, core: f.core, env });
-  assert.deepEqual(resolved.execution, fixed); assert.deepEqual(resolved.runner, request.runner);
+  assert.deepEqual(resolved.execution, fixed);
   assert.deepEqual(resolved.skills, []); assert.equal(resolved.authorization.request, plan);
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env: { ...env, TASK_REQUEST: json({ ...request, plan: 'Changed bytes', registration_key: registrationKey(request) }) } }), /request_registration_mismatch/);
   const changed = content + 'budget-minutes: 5\n';
@@ -287,14 +271,14 @@ test('qualification overrides require the actual trusted registry artifact and e
   f.addArtifact(180, 'linux-qualification-170-registry', await zipEntries(f, 'qualification-registry', [{ name: 'record.json', text: json(registry) }]), 170);
   const plan = 'Execute the supplied qualification scenario.';
   const request = { request_id: task.task_id, source_repository: repo, source_sha: sourceSha, plan, plan_sha256: hash(plan), qualification_artifact_id: 180,
-    project_config: { revision: sourceSha, content, sha256: hash(content) }, runner: task.labels, budget_minutes: 5, max_continuations: 3, auto_continue: false,
+    project_config: { revision: sourceSha, content, sha256: hash(content) }, budget_minutes: 5, max_continuations: 3, auto_continue: false,
     git_author_name: registry.author, git_author_email: registry.email, user_agents_url: null, user_agents_sha256: null,
     skills: [] };
   const context = { ...f.context, actor: 'Z-M-Huang', eventName: 'workflow_dispatch' };
   const env = { ...f.env, GITHUB_RUN_ID: '200', GITHUB_JOB: 'qualification', TRIGGERING_ACTOR: 'Z-M-Huang', TASK_REQUEST: registered(request) };
   assert.equal((await prepareTaskRequest({ github: f.github, context, core: f.core, env })).task_id, '200');
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
-    env: { ...env, GITHUB_JOB: 'altered-qualification', TASK_REQUEST: registered({ ...request, runner: ['self-hosted', 'Linux'] }) } }), /qualification_settings_mismatch/);
+    env: { ...env, GITHUB_JOB: 'altered-qualification', TASK_REQUEST: registered({ ...request, budget_minutes: 6 }) } }), /qualification_settings_mismatch/);
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core,
     env: { ...env, GITHUB_JOB: 'injected-skill', TASK_REQUEST: registered({ ...request, skills: [{ repository: repo, revision: sourceSha, names: ['injected'] }] }) } }), /qualification_settings_mismatch/);
   f.model.runs.get(170).path = '.github/workflows/unrelated.yml';
@@ -304,7 +288,6 @@ test('qualification overrides require the actual trusted registry artifact and e
 
 test('a single consumer caller handles continuation claims and native child preparation without copied helpers', async t => {
   const f = await protocolFixture(t);
-  f.model.sources.set('.github/workflows/runner-task.yml', Buffer.from((await readFile(join(root, 'skills/remote-codex/assets/runner-task.yml'), 'utf8')).replace('/remote-codex.yml@v1', `/remote-codex.yml@${sourceSha}`)));
   f.model.controller.path = '.github/workflows/runner-task.yml';
   assert.equal((await runController({ github: f.github, context: f.context, core: f.core, env: f.env })).eligible, true);
   const prepared = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
@@ -318,14 +301,13 @@ test('a single consumer caller handles continuation claims and native child prep
   assert.ok(f.records.some(record => record.event === 'continuation.dispatch' && record.outcome === 'registered'));
 });
 
-test('reusable authorization and preparation preserve an older frozen provider revision and reject unrelated history', async t => {
+test('reusable preparation restores the saved action revision without comparing it with current main history', async t => {
   const f = await protocolFixture(t), provider = 'markhuangai/agent-remote-dev-codex', currentSha = 'b'.repeat(40);
   f.model.manifest.execution.source_repository = provider;
   f.model.payloads.set(41, await replaceManifest(f, 'provider-resume', f.model.payloads.get(41), f.model.manifest));
   f.model.artifacts.get(41).size_in_bytes = f.model.payloads.get(41).length;
   f.model.payloads.set(40, await zipEntries(f, 'provider-root-record', [{ name: 'record.json', text: json(f.model.request) }]));
   f.model.artifacts.get(40).size_in_bytes = f.model.payloads.get(40).length;
-  f.model.sources.set('.github/workflows/runner-task.yml', Buffer.from((await readFile(join(root, 'skills/remote-codex/assets/runner-task.yml'), 'utf8')).replace('/remote-codex.yml@v1', `/remote-codex.yml@${currentSha}`)));
   const request = { task_id: taskId, source_repository: provider, source_sha: sourceSha, resume_artifact_id: 41, activation_key: 'a'.repeat(32) };
   const event = join(f.temporary, 'provider-event.json'); await writeFile(event, json({ inputs: { request: registered(request) } }));
   let history = 'ahead';
@@ -338,8 +320,7 @@ test('reusable authorization and preparation preserve an older frozen provider r
     assert.equal(result.source_sha, sourceSha); assert.equal(JSON.parse(result.execution).source_sha, sourceSha);
     assert.equal(result.resume_artifact_id, 41);
   }
-  for (history of ['behind', 'diverged']) await assert.rejects(workflowCommand('task', { api, sink: f.core,
-    env: { ...env, GITHUB_JOB: `rejected-${history}` } }), { reason: 'provider_resume_revision_unverified' });
+
 });
 
 test('controller claims reconcile an ambiguous dispatch and cannot blindly issue it twice', async t => {
@@ -398,7 +379,7 @@ test('a queued automatic child rechecks revoked authority before execution', asy
   f.model.permission = 'read';
   await assert.rejects(prepareTaskRequest({ github: f.github, context: { ...f.context, eventName: 'workflow_dispatch' }, core: f.core,
     env: { ...f.env, GITHUB_RUN_ID: String(child.child_run_id), GITHUB_JOB: 'revoked-child', TASK_REQUEST: json(f.model.dispatches[0]) } }), /operator_write_permission_required/);
-  assert.ok(f.records.some(record => record.event === 'submission.resolve' && record.activation_run_id === '13' && record.activation_run_attempt === '1' && record.reason === 'operator_write_permission_required'));
+  assert.ok(f.records.some(record => record.event === 'submission.resolve' && record.reason === 'operator_write_permission_required'));
 });
 
 test('authority revoked during registration reconciliation is checked again immediately before POST', async t => {
@@ -438,7 +419,7 @@ test('a stop during child reconciliation fences a prepared continuation claim be
   assert.equal(failure.expected, 13); assert.equal(failure.observed, 150); process.stdout.write(json(failure) + '\n');
 });
 
-test('authorized manual takeover replaces revoked original authority and binds its exact attempt', async t => {
+test('authorized manual takeover uses the latest allowlist without a historical approval snapshot', async t => {
   const f = await protocolFixture(t);
   f.model.sources.set('remote-codex.yml', Buffer.from('allowed-actors: [New-Operator]\nskills: []\n'));
   f.model.permissions = { 'Z-M-Huang': 'read', 'New-Operator': 'write' };
@@ -450,14 +431,14 @@ test('authorized manual takeover replaces revoked original authority and binds i
   f.model.runs.set(200, { ...f.model.parent, id: 200, run_attempt: 2, actor: { login: 'New-Operator' }, triggering_actor: { login: 'New-Operator' } });
   assert.equal(await authorizeActivation(f.api, repo, settings), sourceSha);
   f.model.runs.get(200).run_attempt = 3;
-  await assert.rejects(authorizeActivation(f.api, repo, settings), { reason: 'activation_attempt_changed' });
+  assert.equal(await authorizeActivation(f.api, repo, settings), sourceSha);
 });
 
-test('native failures, cancellation, drift and exhausted limits veto automatic continuation', async t => {
+test('native failures, cancellation and exhausted limits stop continuation while source advancement is independent', async t => {
   const f = await protocolFixture(t), io = async (id, kind) => ({ artifact: f.model.artifacts.get(id), value: kind === 'checkpoint' ? f.model.manifest : f.model.request });
   for (const conclusion of ['cancelled', 'failure', 'action_required']) assert.equal((await continuationDecision({ api: f.api, io, repository: repo, parent: { ...f.model.parent, conclusion } })).eligible, false);
   f.model.observedHead = 'c'.repeat(40);
-  await assert.rejects(continuationDecision({ api: f.api, io, repository: repo, parent: f.model.parent }), { reason: 'resume_branch_drift' });
+  assert.equal((await continuationDecision({ api: f.api, io, repository: repo, parent: f.model.parent })).eligible, true);
   f.model.observedHead = f.model.manifest.checkpoint_sha;
   const before = f.model.request.execution;
   f.model.request.execution = { ...before, continuation_count: 3, parent_run_id: '11', parent_run_attempt: '1' };
@@ -488,10 +469,10 @@ test('a native stop request fences existing claims and later queued execution; e
   await assert.rejects(prepareTaskRequest({ github: f.github, context, core: f.core, env: { ...env, TASK_REQUEST: registered({ ...request, runner: ['ubuntu-latest'] }) } }), /resume_settings_changed/);
 });
 
-test('resume setting comparison freezes runner, instruction and source identities', () => {
+test('resume settings preserve the original instructions and source without selecting a runner', () => {
   const recorded = execution(), resumed = { ...recorded, parent_run_id: '13', parent_run_attempt: '1', continuation_count: 1, activation_run_id: '15' };
   verifyResumeSettings(recorded, resumed);
-  for (const change of [{ runner: ['self-hosted', 'Linux'] }, { source_sha: 'f'.repeat(40) }, { project_config: { ...recorded.project_config, content: 'changed', sha256: hash('changed') } },
+  for (const change of [{ source_sha: 'f'.repeat(40) }, { project_config: { ...recorded.project_config, content: 'changed', sha256: hash('changed') } },
     { user_agents_sha256: 'b'.repeat(64), user_agents_url: 'https://example.invalid/AGENTS.md' }]) assert.throws(() => verifyResumeSettings(recorded, { ...resumed, ...change }), { reason: 'resume_settings_changed' });
 });
 
@@ -523,4 +504,56 @@ for (const variant of ['traversal', 'absolute', 'drive', 'symlink', 'duplicate',
     return true;
   });
   await assert.rejects(readFile(join(destination, 'manifest.json')), { code: 'ENOENT' });
+});
+
+test('the public resume-run-id input selects that run checkpoint after main configuration changes', async t => {
+  const f = await protocolFixture(t), content = 'allowed-actors: [Z-M-Huang]\nskills: []\nbudget-minutes: 5\n';
+  f.model.sources.set('remote-codex.yml', Buffer.from(content));
+  const env = { ...f.env, GITHUB_RUN_ID: '200', GITHUB_JOB: 'public-resume', GITHUB_ACTOR: 'Z-M-Huang', TRIGGERING_ACTOR: 'Z-M-Huang', GITHUB_EVENT_NAME: 'workflow_dispatch' };
+  const call = () => prepareInvocation({ api: f.api, plan: '', resumeRunId: '13', source: { repository: 'action/source', sha: 'f'.repeat(40) }, core: f.core, env });
+  const resumed = await call();
+  assert.equal(resumed.taskId, taskId); assert.equal(resumed.resumeArtifactId, 41);
+  assert.deepEqual(resumed.execution.project_config, f.model.manifest.execution.project_config);
+  assert.equal(resumed.execution.budget_minutes, f.model.manifest.execution.budget_minutes);
+  f.model.sources.set('remote-codex.yml', Buffer.from('allowed-actors: [Other-Operator]\nskills: []\n'));
+  await assert.rejects(call(), { reason: 'untrusted_task_actor' });
+});
+
+for (const variant of ['missing', 'expired', 'producer']) test(`public run-based resume rejects ${variant} artifacts before native execution`, async t => {
+  const f = await protocolFixture(t);
+  if (variant === 'missing') f.model.artifacts.delete(41);
+  if (variant === 'expired') f.model.artifacts.get(41).expired = true;
+  if (variant === 'producer') f.model.artifacts.get(41).workflow_run.id = 999;
+  await assert.rejects(prepareInvocation({ api: f.api, plan: '', resumeRunId: '13', source: { repository: 'action/source', sha: sourceSha }, core: f.core,
+    env: { ...f.env, GITHUB_RUN_ID: '200', GITHUB_JOB: variant, GITHUB_ACTOR: 'Z-M-Huang', TRIGGERING_ACTOR: 'Z-M-Huang', GITHUB_EVENT_NAME: 'workflow_dispatch' } }), error => {
+    assert.equal(error.reason, ({ missing: 'run_checkpoint_unavailable', expired: 'checkpoint_artifact_expired', producer: 'run_checkpoint_unavailable' })[variant]);
+    f.log.failure(error); return true;
+  });
+  assert.equal(f.model.dispatches.length, 0);
+  const record = f.runtimeRecords.findLast(record => record.event === 'runtime.failed');
+  assert.equal(record.resume_run_id, '13'); assert.equal(record.stage, 'resume'); process.stdout.write(json(record) + '\n');
+});
+
+test('a timed-out automatic child without a run record retains workflow-owned self-hosted labels', async t => {
+  const f = await protocolFixture(t), labels = ['self-hosted', 'Linux', 'ARM64'];
+  f.model.request.runner_labels = labels;
+  f.model.payloads.set(40, await zipEntries(f, 'runner-root-record', [{ name: 'record.json', text: json(f.model.request) }]));
+  f.model.artifacts.get(40).size_in_bytes = f.model.payloads.get(40).length;
+  const first = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'prepare' } });
+  f.addArtifact(43, first.claim_name, await zipEntries(f, 'runner-first-claim', [{ name: 'record.json', text: await readFile(first.claim_path, 'utf8') }]), 99);
+  const dispatched = await runController({ github: f.github, context: f.context, core: f.core, env: { ...f.env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '43', NEW_CLAIM: 'true' } });
+  const child = f.model.runs.get(dispatched.child_run_id);
+  child.status = 'completed'; child.conclusion = 'timed_out';
+  const controller = { ...f.model.controller, id: 300 };
+  f.model.runs.set(controller.id, controller);
+  const env = { ...f.env, GITHUB_RUN_ID: String(controller.id), CONTINUATION_MODE: 'prepare' };
+  const context = { ...f.context, payload: { workflow_run: { ...child } } };
+  const inherited = await runController({ github: f.github, context, core: f.core, env });
+  const claim = JSON.parse(await readFile(inherited.claim_path, 'utf8'));
+  assert.deepEqual(claim.runner_labels, labels);
+  f.addArtifact(44, inherited.claim_name, await zipEntries(f, 'runner-inherited-claim', [{ name: 'record.json', text: json(claim) }]), controller.id);
+  await runController({ github: f.github, context, core: f.core, env: { ...env, CONTINUATION_MODE: 'dispatch', CLAIM_ARTIFACT_ID: '44', NEW_CLAIM: 'true' } });
+  assert.deepEqual(JSON.parse(f.model.lastDispatchInputs['runs-on']), labels);
+  assert.equal(f.model.dispatches.length, 2);
+  assert.ok(!('runner' in f.model.manifest.execution));
 });

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Remote Codex"
-  short_description: "Submit and follow native Codex tasks on Linux"
-  default_prompt: "Use $remote-codex to submit my authorized task with the selected skills."

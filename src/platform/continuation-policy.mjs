@@ -1,10 +1,9 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { authorization, checkpointName, digest, executionSettings, frozenExecution, invariant, positiveId, recordName, repositoryPattern,
-  registrationKey, runnerLabels, runnerVersions, same, shaPattern, sources, taskPattern, validateManifest, validateProducer, validateFrozenRoot } from './checkpoint-policy.mjs';
+  registrationKey, runnerVersions, same, shaPattern, sources, taskPattern, validateManifest, validateProducer } from './checkpoint-policy.mjs';
 import { readArtifact } from './artifact-io.mjs';
 import { logEvent, safeError } from './runtime-log.mjs';
-import { verifyProtocol } from './protocol-policy.mjs';
 import { readProjectConfig } from './project-config.mjs';
 import { pages } from './sources.mjs';
 export { pages } from './sources.mjs';
@@ -16,13 +15,14 @@ export const dispatchKey = (repository, taskId, parent, artifactId, count) => di
 export const childRunName = (taskId, key) => `Codex task ${taskId} / ${key || 'manual'}`;
 export const manualRunName = (taskId, artifactId, source, key) => `Codex task ${taskId} / manual-resume-${artifactId}-${source}-${key}`;
 export const submissionRunName = (requestId, key) => `Codex request ${requestId} / request-${key}`;
-async function operators(api, repository, revision) {
-  return (await readProjectConfig(api, repository, revision)).settings.allowed_actors;
+async function operators(api, repository) {
+  const main = await api(`/repos/${repository}/git/ref/heads/main`);
+  return (await readProjectConfig(api, repository, main.object.sha)).settings.allowed_actors;
 }
 export async function authorizeActors(api, repository, actor, triggeringActor) {
   const main = await api(`/repos/${repository}/git/ref/heads/main`);
   invariant(shaPattern.test(main.object?.sha), 'invalid_protocol_revision');
-  const allowed = await operators(api, repository, main.object.sha);
+  const allowed = (await readProjectConfig(api, repository, main.object.sha)).settings.allowed_actors;
   invariant(allowed.includes(actor) && allowed.includes(triggeringActor), 'untrusted_task_actor');
   for (const login of new Set([actor, triggeringActor])) {
     const access = await api(`/repos/${repository}/collaborators/${login}/permission`);
@@ -35,23 +35,27 @@ function trustedRun(run, repository, paths = null) {
     run.head_branch === 'main' && (paths ? paths.includes(run.path) : /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(run.path)) && shaPattern.test(run.head_sha) && positiveId(run.id) && positiveId(run.run_attempt), 'untrusted_parent_run');
 }
 export async function authorizeActivation(api, repository, execution) {
-  let activation;
-  try {
-    const current = await api(`/repos/${repository}/actions/runs/${execution.activation_run_id}`);
-    invariant(String(current.id) === execution.activation_run_id && String(current.run_attempt) === execution.activation_run_attempt,
-      'activation_attempt_changed', execution.activation_run_attempt, current.run_attempt);
-    activation = await api(`/repos/${repository}/actions/runs/${execution.activation_run_id}/attempts/${execution.activation_run_attempt}`);
-    trustedRun(activation, repository);
-    invariant(String(activation.id) === execution.activation_run_id && String(activation.run_attempt) === execution.activation_run_attempt &&
-      activation.head_sha === current.head_sha && activation.actor?.login === current.actor?.login && activation.triggering_actor?.login === current.triggering_actor?.login &&
-      activation.actor?.login !== 'github-actions[bot]' && activation.triggering_actor?.login !== 'github-actions[bot]', 'untrusted_activation');
-    return await authorizeActors(api, repository, activation.actor?.login, activation.triggering_actor?.login);
-  } catch (error) {
-    error.details = { ...error.details, activation_run_id: execution.activation_run_id, activation_run_attempt: execution.activation_run_attempt,
-      activation_actor: /^[\w-]{1,39}$/.test(activation?.actor?.login ?? '') ? activation.actor.login : null,
-      activation_triggering_actor: /^[\w-]{1,39}$/.test(activation?.triggering_actor?.login ?? '') ? activation.triggering_actor.login : null };
-    throw error;
-  }
+  const run = await api(`/repos/${repository}/actions/runs/${execution.activation_run_id}`);
+  trustedRun(run, repository);
+  return authorizeActors(api, repository, run.actor?.login, run.triggering_actor?.login);
+}
+export async function requestForRun(api, repository, runId, root, activationId) {
+  invariant(positiveId(runId), 'invalid_resume_run_id');
+  const run = await api(`/repos/${repository}/actions/runs/${runId}`);
+  trustedRun(run, repository);
+  invariant(String(run.id) === String(runId) && run.status === 'completed', 'checkpoint_producer_active');
+  const artifacts = await pages(api, `/repos/${repository}/actions/runs/${runId}/artifacts`, 'artifacts');
+  const candidates = artifacts.filter(artifact => new RegExp(`^codex-[1-9][0-9]*-[1-9][0-9]*-r${runId}-a${run.run_attempt}$`).test(artifact.name));
+  candidates.sort((a, b) => Number(b.name.match(/-([0-9]+)-r/)[1]) - Number(a.name.match(/-([0-9]+)-r/)[1]));
+  invariant(candidates.length > 0, 'run_checkpoint_unavailable');
+  invariant(candidates.length < 2 || candidates[0].name !== candidates[1].name, 'ambiguous_latest_checkpoint');
+  const loaded = await readArtifact({ api, repository, id: candidates[0].id, root, kind: 'checkpoint' });
+  const manifest = validateManifest(loaded.value, { repository });
+  validateProducer(loaded.artifact, run, manifest, repository);
+  const request = { task_id: manifest.task_id, source_repository: manifest.execution.source_repository, source_sha: manifest.execution.source_sha,
+    resume_artifact_id: candidates[0].id, activation_key: digest(String(activationId)).slice(0, 32),
+    ...(manifest.execution.published_ref ? { published_ref: manifest.execution.published_ref } : {}) };
+  return { ...request, registration_key: registrationKey(request) };
 }
 function createIO(api, repository, root) {
   const cache = new Map();
@@ -71,7 +75,7 @@ export async function latestStop(api, repository, taskId) {
   let latest = 0;
   for (const run of runs.filter(run => run.display_title?.startsWith(`Codex stop ${taskId} / `))) {
     trustedRun(run, repository, [taskPath]);
-    const allowed = await operators(api, repository, run.head_sha);
+    const allowed = await operators(api, repository);
     if (allowed.includes(run.actor?.login) && allowed.includes(run.triggering_actor?.login)) latest = Math.max(latest, run.id);
   }
   return latest;
@@ -89,8 +93,6 @@ async function verifiedTaskRoot(api, io, repository, taskId) {
   const current = await api(`/repos/${repository}/actions/runs/${taskId}`);
   const root = current.run_attempt === 1 ? current : await api(`/repos/${repository}/actions/runs/${taskId}/attempts/1`);
   trustedRun(root, repository);
-  const allowed = await operators(api, repository, root.head_sha);
-  invariant(allowed.includes(root.actor?.login) && allowed.includes(root.triggering_actor?.login), 'untrusted_task_root');
   if (taskPaths.includes(root.path) && /^Codex request [a-z0-9][a-z0-9-]{0,63} \/ request-[a-f0-9]{64}$/.test(root.display_title ?? '')) return root;
   const artifacts = await pages(api, `/repos/${repository}/actions/runs/${root.id}/artifacts`, 'artifacts');
   const matches = artifacts.filter(artifact => artifact.name === recordName('run', taskId, root.id, 1));
@@ -112,12 +114,7 @@ export async function loadVerifiedCheckpoint({ api, io, repository, id, taskId }
     invariant(producer.status === 'completed', 'checkpoint_producer_active');
     const workflow = await api(`/repos/${repository}/actions/workflows/${producer.workflow_id}`);
     invariant(workflow.path === producer.path && workflow.state === 'active', 'checkpoint_workflow_mismatch');
-    const root = await api(`/repos/${repository}/actions/runs/${manifest.execution.root_run_id}/attempts/${manifest.execution.root_run_attempt}`);
-    trustedRun(root, repository);
-    const artifacts = await pages(api, `/repos/${repository}/actions/runs/${root.id}/artifacts`, 'artifacts');
-    const request = await uniqueRecord(io, artifacts, recordName('run', manifest.task_id, root.id, root.run_attempt));
-    validateFrozenRoot(manifest, request, root);
-    return { ...loaded, manifest, producer, root, request };
+    return { ...loaded, manifest, producer };
   } catch (error) {
     error.details = { ...error.details, artifact_id: positiveId(id) ? Number(id) : null, task_id: typeof taskId === 'string' && taskPattern.test(taskId) ? taskId : null };
     throw error;
@@ -157,13 +154,14 @@ async function manualCount(api, repository, manifest, excludedRun, excludedAttem
 async function inheritedRequest(api, io, repository, parent) {
   const manual = /^Codex task ([a-z0-9][a-z0-9-]{0,63}) \/ manual-resume-([1-9][0-9]*)-([a-f0-9]{40})-([a-f0-9]{64})$/.exec(parent.display_title ?? '');
   const automatic = /^Codex task ([a-z0-9][a-z0-9-]{0,63}) \/ ([a-f0-9]{64})$/.exec(parent.display_title ?? '');
-  let loaded, execution;
+  let loaded, execution, labels;
   if (manual) {
     await authorizeActors(api, repository, parent.actor?.login, parent.triggering_actor?.login);
     loaded = await loadVerifiedCheckpoint({ api, io, repository, id: Number(manual[2]), taskId: manual[1] });
     invariant(manual[3] === loaded.manifest.execution.source_sha, 'manual_resume_source_mismatch');
     execution = { ...loaded.manifest.execution, continuation_count: await manualCount(api, repository, loaded.manifest, String(parent.id), parent.run_attempt),
       activation_run_id: String(parent.id), activation_run_attempt: String(parent.run_attempt), parent_run_id: String(loaded.producer.id), parent_run_attempt: String(loaded.producer.run_attempt) };
+    labels = loaded.manifest.lineage.runner_labels;
   } else if (automatic) {
     invariant(parent.actor?.login === 'github-actions[bot]' && parent.triggering_actor?.login === 'github-actions[bot]' && parent.run_attempt === 1, 'untrusted_inherited_resume');
     const artifacts = await pages(api, `/repos/${repository}/actions/artifacts?name=codex-claim-${automatic[2]}`, 'artifacts');
@@ -174,11 +172,12 @@ async function inheritedRequest(api, io, repository, parent) {
     loaded = await loadVerifiedCheckpoint({ api, io, repository, id: claim.artifact_id, taskId: claim.task_id });
     execution = { ...loaded.manifest.execution, continuation_count: claim.continuation_count, activation_run_id: claim.activation_run_id, activation_run_attempt: claim.activation_run_attempt,
       parent_run_id: claim.parent_run_id, parent_run_attempt: claim.parent_run_attempt };
+    labels = claim.runner_labels;
   } else return null;
   executionSettings(execution);
   const manifest = loaded.manifest;
   return { schema_version: 3, repository, task_id: manifest.task_id, plan_sha256: manifest.plan_sha256, authorization: manifest.authorization, skills: manifest.skills,
-    plan_source: manifest.plan_source, execution, lineage: { repository, workflow_sha: parent.head_sha, run_id: String(parent.id), run_attempt: String(parent.run_attempt) },
+    plan_source: manifest.plan_source, execution, runner_labels: labels, lineage: { repository, workflow_sha: parent.head_sha, run_id: String(parent.id), run_attempt: String(parent.run_attempt) },
     resume_artifact_id: Number(manual?.[2] ?? loaded.artifact.id) };
 }
 export async function continuationDecision({ api, io, repository, parent }) {
@@ -210,10 +209,7 @@ export async function continuationDecision({ api, io, repository, parent }) {
   invariant(candidates.length ? same(execution, manifest.execution) : Number(request.resume_artifact_id) === Number(artifactId) && execution.continuation_count > manifest.execution.continuation_count, 'inherited_checkpoint_lineage_mismatch');
   if (outcome) invariant(outcome.repository === repository && outcome.task_id === request.task_id && String(outcome.lineage?.run_id) === String(parent.id) &&
     Number(outcome.lineage?.run_attempt) === Number(parent.run_attempt) && outcome.checkpoint?.artifact_id === Number(artifactId) && outcome.checkpoint?.checkpoint_sha === manifest.checkpoint_sha, 'outcome_checkpoint_mismatch');
-  if (manifest.branch !== null) {
-    const branch = await api(`/repos/${repository}/git/ref/heads/${manifest.branch}`);
-    invariant(branch.object?.sha === manifest.checkpoint_sha, 'resume_branch_drift', manifest.checkpoint_sha, branch.object?.sha);
-  } else invariant((await api(`/repos/${repository}/commits/${manifest.checkpoint_sha}`)).sha === manifest.checkpoint_sha, 'resume_source_missing');
+  invariant((await api(`/repos/${repository}/commits/${manifest.checkpoint_sha}`)).sha === manifest.checkpoint_sha, 'resume_source_missing');
   const count = execution.continuation_count + 1, key = dispatchKey(repository, request.task_id, parent, Number(artifactId), count);
   return { eligible: true, reason: parent.conclusion === 'timed_out' ? 'native_timeout' : 'action_budget', parent, request, manifest,
     artifact_id: Number(artifactId), continuation_count: count, dispatch_key: key, claim_name: `codex-claim-${key}` };
@@ -223,14 +219,13 @@ function fields(decision) {
     activation_run_id: decision.request?.execution?.activation_run_id, activation_run_attempt: decision.request?.execution?.activation_run_attempt,
     parent_run_attempt: decision.parent?.run_attempt, artifact_id: decision.artifact_id, continuation_count: decision.continuation_count,
     max_continuations: decision.request?.execution?.max_continuations, budget_minutes: decision.request?.execution?.budget_minutes,
-    runner: decision.request?.execution?.runner, checkpoint_sha: decision.manifest?.checkpoint_sha, session_id: decision.manifest?.session_id, reason: decision.reason, eligible: decision.eligible };
+    checkpoint_sha: decision.manifest?.checkpoint_sha, session_id: decision.manifest?.session_id, reason: decision.reason, eligible: decision.eligible };
 }
 export async function runController({ github, context, core, env = process.env, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const started = now(), repository = repositoryName(context), api = async (path, options) => (await github.request(`${options?.method ?? 'GET'} ${path}`, options)).data;
   let diagnostic = { parent_run_id: context.payload.workflow_run?.id ?? null };
   try {
     invariant(env.GITHUB_REF === 'refs/heads/main' && context.eventName === 'workflow_run' && env.CODEX_RUNNER_PROTOCOL === '3', 'untrusted_controller_context');
-    await verifyProtocol(api, repository);
     const trigger = context.payload.workflow_run;
     const parent = await taskRun(api, repository, trigger.id, trigger.run_attempt);
     invariant(parent.head_sha === trigger.head_sha && parent.workflow_id === trigger.workflow_id && parent.conclusion === trigger.conclusion, 'parent_event_drift');
@@ -245,7 +240,8 @@ export async function runController({ github, context, core, env = process.env, 
       const claim = { schema_version: 3, repository, task_id: decision.request.task_id, dispatch_key: decision.dispatch_key, parent_run_id: String(parent.id), parent_run_attempt: String(parent.run_attempt),
         artifact_id: decision.artifact_id, continuation_count: decision.continuation_count, source_repository: decision.request.execution.source_repository, source_sha: decision.request.execution.source_sha,
         activation_run_id: decision.request.execution.activation_run_id, activation_run_attempt: decision.request.execution.activation_run_attempt,
-        controller_run_id: env.GITHUB_RUN_ID, controller_run_attempt: env.GITHUB_RUN_ATTEMPT, controller_sha: env.GITHUB_WORKFLOW_SHA };
+        controller_run_id: env.GITHUB_RUN_ID, controller_run_attempt: env.GITHUB_RUN_ATTEMPT, controller_sha: env.GITHUB_WORKFLOW_SHA,
+        runner_labels: decision.request.runner_labels ?? ['ubuntu-latest'] };
       const claimRoot = join(root, 'claim');
       if (!claims.length) { await mkdir(claimRoot, { recursive: true, mode: 0o700 }); await writeFile(join(claimRoot, 'record.json'), JSON.stringify(claim), { mode: 0o600, flag: 'wx' }); }
       logEvent(core, 'continuation.dispatch', 'INFO', { ...diagnostic, outcome: claims.length ? 'reconcile_existing_claim' : 'claim_prepared' }, env);
@@ -255,7 +251,7 @@ export async function runController({ github, context, core, env = process.env, 
     const claim = await verifiedClaim(api, io, repository, claims[0].id);
     invariant(claim.task_id === decision.request.task_id && claim.dispatch_key === decision.dispatch_key && claim.artifact_id === decision.artifact_id && claim.continuation_count === decision.continuation_count &&
       claim.source_sha === decision.request.execution.source_sha && claim.source_repository === decision.request.execution.source_repository && claim.activation_run_id === decision.request.execution.activation_run_id &&
-      claim.activation_run_attempt === decision.request.execution.activation_run_attempt, 'dispatch_claim_mismatch');
+      claim.activation_run_attempt === decision.request.execution.activation_run_attempt && same(claim.runner_labels, decision.request.runner_labels ?? ['ubuntu-latest']), 'dispatch_claim_mismatch');
     const findChild = async () => {
       const runs = await pages(api, `/repos/${repository}/actions/workflows/runner-task.yml/runs?event=workflow_dispatch&branch=main`, 'workflow_runs');
       const matches = runs.filter(run => run.display_title === childRunName(claim.task_id, claim.dispatch_key));
@@ -270,7 +266,7 @@ export async function runController({ github, context, core, env = process.env, 
       await authorizeActivation(api, repository, decision.request.execution);
       const request = { task_id: claim.task_id, source_repository: claim.source_repository, source_sha: claim.source_sha, resume_artifact_id: claim.artifact_id,
         claim_artifact_id: claims[0].id, dispatch_key: claim.dispatch_key, parent_run_id: claim.parent_run_id, parent_run_attempt: claim.parent_run_attempt, continuation_count: claim.continuation_count };
-      try { await api(`/repos/${repository}/actions/workflows/runner-task.yml/dispatches`, { method: 'POST', ref: 'main', inputs: { request: JSON.stringify(request) } }); }
+      try { await api(`/repos/${repository}/actions/workflows/runner-task.yml/dispatches`, { method: 'POST', ref: 'main', inputs: { request: JSON.stringify(request), 'runs-on': JSON.stringify(claim.runner_labels) } }); }
       catch (error) { dispatchError = safeError(error); }
     }
     const deadline = now() + 300000;
@@ -310,7 +306,6 @@ export async function resolveTaskRequest({ github, context, core, env = process.
       invariant(request.source_sha === manifest.execution.source_sha && request.source_repository === manifest.execution.source_repository, 'manual_resume_source_mismatch');
       invariant((request.published_ref ?? null) === manifest.execution.published_ref, 'published_resume_reference_changed');
       invariant(!request.published_ref || env.GITHUB_WORKFLOW_REF === `${repository}/${publishedPath}@refs/heads/main`, 'published_workflow_required');
-      await verifyProtocol(api, repository, manifest.execution.auto_continue);
       let execution;
       if (bot) {
         invariant(Number(env.GITHUB_RUN_ATTEMPT) === 1 && positiveId(request.claim_artifact_id), 'automatic_rerun_refused');
@@ -334,12 +329,12 @@ export async function resolveTaskRequest({ github, context, core, env = process.
       await requireActive(api, repository, manifest.task_id, execution.activation_run_id, execution.request_id);
       parameters = { operation: 'execute', task_id: manifest.task_id, source_repository: execution.source_repository, source_sha: execution.source_sha, resume_artifact_id: request.resume_artifact_id,
         published_ref: execution.published_ref ?? '',
-        authorization: manifest.authorization, plan: '', skills: manifest.skills, execution, runner: execution.runner,
+        authorization: manifest.authorization, plan: '', skills: manifest.skills, execution,
         git_author_name: execution.git_author_name, git_author_email: execution.git_author_email, user_agents_url: execution.user_agents_url ?? '', user_agents_sha256: execution.user_agents_sha256 ?? '' };
     } else {
       await authorizeActors(api, repository, context.actor, env.TRIGGERING_ACTOR);
       invariant(Number(env.GITHUB_RUN_ATTEMPT) === 1, 'initial_rerun_requires_explicit_resume');
-      invariant(Object.keys(request).every(key => ['request_id', 'source_repository', 'source_sha', 'plan', 'plan_sha256', 'skills', 'runner', 'git_author_name', 'git_author_email',
+      invariant(Object.keys(request).every(key => ['request_id', 'source_repository', 'source_sha', 'plan', 'plan_sha256', 'skills', 'git_author_name', 'git_author_email',
         'budget_minutes', 'max_continuations', 'auto_continue', 'user_agents_url', 'user_agents_sha256', 'project_config', 'qualification_artifact_id', 'published_ref', 'registration_key'].includes(key)), 'unsupported_task_input');
       const prior = await pages(api, `/repos/${repository}/actions/runs?event=workflow_dispatch&branch=main`, 'workflow_runs');
       invariant(!prior.some(run => String(run.id) !== env.GITHUB_RUN_ID && run.display_title?.startsWith(`Codex request ${request.request_id} / `)), 'request_already_registered');
@@ -356,12 +351,12 @@ export async function resolveTaskRequest({ github, context, core, env = process.
         const registry = await io(request.qualification_artifact_id, 'record');
         const run = await api(`/repos/${repository}/actions/runs/${registry.artifact.workflow_run.id}`);
         trustedRun(run, repository, ['.github/workflows/runner-acceptance.yml']);
-        const allowed = await operators(api, repository, run.head_sha);
+        const allowed = await operators(api, repository);
         invariant(registry.value.repository === repository && String(run.id) === registry.value.run_id && run.head_sha === request.project_config.revision &&
           registry.artifact.name === `linux-qualification-${run.id}-registry` && registry.value.source_sha === request.source_sha &&
           allowed.includes(run.actor?.login) && allowed.includes(run.triggering_actor?.login), 'untrusted_qualification_request');
         const task = [...(registry.value.tasks ?? []), ...(registry.value.published_tasks ?? [])].find(task => task.task_id === request.request_id);
-        invariant(task && same(request.runner, task.labels) && request.budget_minutes === 5 && request.max_continuations === 3 &&
+        invariant(task && request.budget_minutes === 5 && request.max_continuations === 3 &&
           (request.published_ref ?? null) === (task.published_ref ?? null) && (!request.published_ref || ['v1-prerelease', 'v1'].includes(request.published_ref) &&
             request.source_repository === repository && registry.value.action?.requested_ref === request.published_ref && registry.value.action?.sha === request.source_sha &&
             positiveId(registry.value.action?.release_id) && env.GITHUB_WORKFLOW_REF === `${repository}/${publishedPath}@refs/heads/main`) &&
@@ -369,7 +364,7 @@ export async function resolveTaskRequest({ github, context, core, env = process.
           selected.length === 0 && request.user_agents_url === null, 'qualification_settings_mismatch');
       } else {
         invariant(!request.published_ref, 'published_qualification_required');
-        for (const key of ['runner', 'budget_minutes', 'max_continuations', 'auto_continue', 'git_author_name', 'git_author_email', 'user_agents_url'])
+        for (const key of ['budget_minutes', 'max_continuations', 'auto_continue', 'git_author_name', 'git_author_email', 'user_agents_url'])
           invariant(same(request[key], settings[key]), 'project_settings_mismatch');
         invariant(selected.length === settings.skills.length && selected.every((source, index) => {
           const configured = settings.skills[index], original = typeof configured === 'string' ? configured : configured.repository;
@@ -378,24 +373,23 @@ export async function resolveTaskRequest({ github, context, core, env = process.
             (!configured.names || same(source.names, configured.names)) && (!shaPattern.test(configured.ref) || configured.ref === source.revision));
         }), 'project_skills_mismatch');
       }
-      await verifyProtocol(api, repository, request.auto_continue);
       invariant(!request.auto_continue || env.GITHUB_WORKFLOW_REF === `${repository}/${taskPath}@refs/heads/main`, 'continuation_workflow_required');
       const taskId = env.GITHUB_RUN_ID;
       invariant(positiveId(taskId), 'invalid_task_identity');
       const auth = authorization({ repository, plan_sha256: request.plan_sha256, request: request.plan }, repository, request.plan);
-      const execution = executionSettings({ source_repository: request.source_repository, source_sha: request.source_sha, runner: runnerLabels(request.runner), auto_continue: request.auto_continue,
+      const execution = executionSettings({ source_repository: request.source_repository, source_sha: request.source_sha, auto_continue: request.auto_continue,
         max_continuations: request.max_continuations, continuation_count: 0, budget_minutes: request.budget_minutes, root_run_id: taskId, root_run_attempt: env.GITHUB_RUN_ATTEMPT,
         activation_run_id: taskId, activation_run_attempt: env.GITHUB_RUN_ATTEMPT, parent_run_id: null, parent_run_attempt: null, git_author_name: request.git_author_name, git_author_email: request.git_author_email,
         user_agents_url: request.user_agents_url, user_agents_sha256: request.user_agents_sha256, project_config: request.project_config, request_id: request.request_id, published_ref: request.published_ref ?? null });
       await requireActive(api, repository, taskId, execution.activation_run_id, execution.request_id);
       parameters = { operation: 'execute', task_id: taskId, source_repository: request.source_repository, source_sha: request.source_sha, resume_artifact_id: '', authorization: auth,
         published_ref: execution.published_ref ?? '',
-        plan: request.plan, skills: selected, execution, runner: execution.runner,
+        plan: request.plan, skills: selected, execution,
         git_author_name: execution.git_author_name, git_author_email: execution.git_author_email, user_agents_url: execution.user_agents_url ?? '', user_agents_sha256: execution.user_agents_sha256 ?? '' };
     }
     invariant(env.GITHUB_WORKFLOW_REF !== `${repository}/${publishedPath}@refs/heads/main` || parameters.published_ref, 'published_qualification_required');
     logEvent(core, 'submission.resolve', 'INFO', { outcome: 'verified', operation: parameters.operation, task_id: parameters.task_id, source_sha: parameters.source_sha,
-      source_repository: parameters.source_repository, artifact_id: parameters.resume_artifact_id || null, actor: context.actor, runner: parameters.runner ?? null, elapsed_ms: Date.now() - started }, env);
+      source_repository: parameters.source_repository, artifact_id: parameters.resume_artifact_id || null, actor: context.actor, elapsed_ms: Date.now() - started }, env);
     return parameters;
   } catch (error) {
     logEvent(core, 'submission.resolve', 'ERROR', { outcome: 'rejected',
@@ -410,7 +404,7 @@ export async function prepareTaskRequest(args) {
   const resolved = await resolveTaskRequest(args);
   if (resolved.operation === 'stop') return resolved;
   return { ...resolved, authorization: JSON.stringify(resolved.authorization), skills: JSON.stringify(resolved.skills),
-    execution: JSON.stringify(resolved.execution), runner: JSON.stringify(resolved.runner) };
+    execution: JSON.stringify(resolved.execution) };
 }
 export async function stopTask({ github, context, core, env = process.env }) {
   const repository = repositoryName(context), api = async (path, options) => (await github.request(`${options?.method ?? 'GET'} ${path}`, options)).data;

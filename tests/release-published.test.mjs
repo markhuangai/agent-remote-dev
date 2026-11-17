@@ -8,7 +8,7 @@ import { parse } from 'yaml';
 import { exportCheckpoint } from '../.build/checkpoint.js';
 import { checkpointName, digest, recordName } from '../src/platform/checkpoint-policy.mjs';
 import { registryFor, taskRequest } from '../.github/scripts/qualification.mjs';
-import { qualificationCases, qualificationReceipt } from '../.github/scripts/release-policy.mjs';
+import { qualificationCases, qualificationReceipt } from '../.github/scripts/qualification.mjs';
 import { exec, execution, fixture, projectConfig, root } from './helpers.mjs';
 
 async function publishedFixture(t) {
@@ -53,7 +53,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
       const run = { ...qualificationRun, id, workflow_id: 7, path: '.github/workflows/runner-published.yml', conclusion: index === 0 ? 'failure' : 'success' };
       runs.set(id, run);
       const lineage = { repository, workflow_ref: `${repository}/${run.path}@refs/heads/main`, workflow_sha: workflowSha, run_id: String(id), run_attempt: '1', actor: 'Z-M-Huang', triggering_actor: 'Z-M-Huang' };
-      const settings = execution({ request_id: task.task_id, project_config: registry.project_config, source_repository: repository, source_sha: sourceSha, runner: target.labels, auto_continue: false,
+      const settings = execution({ request_id: task.task_id, project_config: registry.project_config, source_repository: repository, source_sha: sourceSha, auto_continue: false,
         root_run_id: String(initialId), activation_run_id: String(id), continuation_count: index, parent_run_id: index === 0 ? null : String(initialId), parent_run_attempt: index === 0 ? null : '1', published_ref: 'v1-prerelease' });
       const request = { schema_version: 3, repository, task_id: String(initialId), plan_sha256: digest(plan), authorization: { repository, plan_sha256: digest(plan), request: plan },
         execution: settings, lineage, plan_source: 'inline', skills: prepared.skills, invocation: { ...registry.action, kind: 'published' }, resume_artifact_id: previous?.artifact_id ?? null };
@@ -95,7 +95,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
     verify: () => qualificationReceipt(api, repository, 100, sourceSha, join(f.temporary, 'verification'), true) };
 }
 
-test('promotion verifies actual published fresh/resume runs, record producers and native checkpoints for both runner families', async t => {
+test('live qualification verifies actual published fresh/resume runs, record producers and native checkpoints for both runner families', async t => {
   const f = await publishedFixture(t), receipt = await f.verify();
   assert.equal(receipt.published_smoke.length, 2); assert.deepEqual(receipt.published_smoke[0].run_ids, [201, 202]);
   assert.deepEqual(f.records.get(1201).skills, []);
@@ -105,7 +105,7 @@ test('promotion verifies actual published fresh/resume runs, record producers an
 });
 
 for (const variant of ['registry_only', 'checkout', 'release', 'outcome', 'producer', 'attempt', 'workflow', 'parent', 'config', 'skills', 'session'])
-  test(`published promotion rejects ${variant} evidence from actual runs and archives`, async t => {
+  test(`published qualification rejects ${variant} evidence from actual runs and archives`, async t => {
     const f = await publishedFixture(t);
     if (variant === 'registry_only') { delete f.records.get(2).published_smoke; await f.replaceRecord(2); }
     if (variant === 'checkout') { f.records.get(1201).invocation.kind = 'checkout'; await f.replaceRecord(1201); }
@@ -133,16 +133,16 @@ test('published aliases are invoked by separate gated jobs without a source-chec
   }
 });
 
-for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_mismatch', 'qualification_mismatch',
+for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_mismatch',
   'missing_workflow', 'workflow_failed', 'workflow_running', 'missing_job', 'job_failed', 'job_running'])
-  test(`actual release authorization script ${variant} emits only a qualified build source`, async t => {
+  test(`actual release authorization script ${variant} emits a validated build source without qualification receipts`, async t => {
     const f = await publishedFixture(t), workflow = parse(await readFile(join(root, '.github/workflows/release.yml'), 'utf8'));
     const gate = workflow.jobs.authorize.steps.find(step => step.id === 'gate');
-    assert.equal(workflow.jobs.authorize.outputs.qualified_source, '${{ steps.gate.outputs.source }}');
+    assert.equal(workflow.jobs.authorize.outputs.source_sha, '${{ steps.gate.outputs.source }}');
     assert.equal(workflow.jobs.build.needs, 'authorize');
-    assert.equal(workflow.jobs.build.steps.find(step => step.name === 'Checkout exact qualified source').with.ref, '${{ needs.authorize.outputs.qualified_source }}');
-    assert.equal(workflow.jobs.build.env.SOURCE_SHA, '${{ needs.authorize.outputs.qualified_source }}');
-    if (variant === 'qualification_mismatch') { f.registry.source_sha = 'e'.repeat(40); await f.replaceRecord(1); }
+    assert.equal(workflow.jobs.build.steps.find(step => step.name === 'Checkout exact source').with.ref, '${{ needs.authorize.outputs.source_sha }}');
+    assert.equal(workflow.jobs.build.env.SOURCE_SHA, '${{ needs.authorize.outputs.source_sha }}');
+    f.registry.source_sha = 'e'.repeat(40); await f.replaceRecord(1);
     const sourceRuns = [
       { id: 801, path: '.github/workflows/ci.yml', names: ['CI', 'Runtime (linux-arm64)'] },
       { id: 802, path: '.github/workflows/codeql.yml', names: ['Analyze (actions)', 'Analyze (javascript-typescript)', 'CodeQL analysis'] },
@@ -154,6 +154,7 @@ for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_m
     }
     const api = async (path, options = {}) => {
       assert.equal(options.method ?? 'GET', 'GET', 'Authorization must never mutate release state');
+      assert.ok(!path.includes('/actions/artifacts/'), 'Release authorization must not require live-test artifacts');
       if (path.includes('/collaborators/')) return { permission: variant === 'maintainer' ? 'write' : 'admin' };
       if (path.endsWith(`/commits/${f.sourceSha}`)) return { sha: variant === 'source_mismatch' ? 'e'.repeat(40) : f.sourceSha };
       if (path.includes('/compare/')) return { status: variant === 'unmerged' ? 'diverged' : 'ahead' };
@@ -185,7 +186,7 @@ for (const variant of ['qualified', 'actor', 'maintainer', 'unmerged', 'source_m
       const invoke = () => new (Object.getPrototypeOf(async function () {}).constructor)('require', 'github', 'context', 'core', gate.with.script)(createRequire(import.meta.url), github, context, core);
       if (variant === 'qualified') {
         await invoke(); assert.deepEqual([...outputs], [['source', f.sourceSha]]);
-        assert.ok(records.some(record => record.event === 'release.verify' && record.outcome === 'qualified' && record.source_sha === f.sourceSha));
+        assert.ok(records.some(record => record.event === 'release.verify' && record.outcome === 'verified' && record.source_sha === f.sourceSha));
       } else {
         const reason = ({ actor: 'untrusted_task_actor', maintainer: 'release_maintainer_required', unmerged: 'release_source_not_merged', source_mismatch: 'invalid_release_source',
           qualification_mismatch: 'qualification_matrix_incomplete' })[variant] ?? (variant.startsWith('job_') || variant === 'missing_job' ? 'release_source_check_failed' : 'release_source_workflow_incomplete');

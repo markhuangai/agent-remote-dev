@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { digest, invariant, registrationKey, repositoryPattern, shaPattern } from './checkpoint-policy.mjs';
-import { authorizeActors, cancelTaskRuns, prepareTaskRequest, runController, stopTask } from './continuation-policy.mjs';
+import { authorizeActors, cancelTaskRuns, prepareTaskRequest, requestForRun, runController, stopTask } from './continuation-policy.mjs';
 import { freezeProjectConfig } from './project-config.mjs';
 import { githubAPI } from './submission.mjs';
 import { logEvent, safeError } from './runtime-log.mjs';
@@ -26,6 +26,10 @@ export async function workflowCommand(mode, { api = githubAPI, env = process.env
     return { operation: 'execute' };
   }
   let request = env.TASK_REQUEST;
+  if (!request && env.TASK_RESUME_RUN_ID) {
+    await authorizeActors(api, repository, context.actor, env.TRIGGERING_ACTOR);
+    request = JSON.stringify(await requestForRun(api, repository, env.TASK_RESUME_RUN_ID, join(env.RUNNER_TEMP, `resume-request-${mode}`), `${env.GITHUB_RUN_ID}-${env.GITHUB_RUN_ATTEMPT}`));
+  }
   if (!request) {
     invariant(mode === 'prepare' && repositoryPattern.test(env.PROVIDER_REPOSITORY) && shaPattern.test(env.PROVIDER_SHA), 'unknown_action_source');
     await authorizeActors(api, repository, context.actor, env.TRIGGERING_ACTOR);
@@ -38,11 +42,7 @@ export async function workflowCommand(mode, { api = githubAPI, env = process.env
   const result = await prepareTaskRequest({ ...input, env: { ...env, RUNNER_TEMP: join(env.RUNNER_TEMP, `workflow-${mode}`), TASK_REQUEST: request } });
   if (result.operation === 'execute') {
     invariant(result.source_repository === env.PROVIDER_REPOSITORY, 'provider_runtime_repository_mismatch', env.PROVIDER_REPOSITORY, result.source_repository);
-    if (result.source_sha !== env.PROVIDER_SHA) {
-      invariant(Boolean(result.resume_artifact_id), 'provider_runtime_revision_mismatch', env.PROVIDER_SHA, result.source_sha);
-      const history = await api(`/repos/${env.PROVIDER_REPOSITORY}/compare/${result.source_sha}...${env.PROVIDER_SHA}`);
-      invariant(['ahead', 'identical'].includes(history.status), 'provider_resume_revision_unverified', env.PROVIDER_SHA, result.source_sha);
-    }
+    if (!result.resume_artifact_id) invariant(result.source_sha === env.PROVIDER_SHA, 'provider_runtime_revision_mismatch');
   }
   return { ...result, request };
 }

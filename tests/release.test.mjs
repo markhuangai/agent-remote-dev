@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { registryFor } from '../.github/scripts/qualification.mjs';
-import { latestJobs, publishRelease, qualificationCases, releaseVersion, validateQualification } from '../.github/scripts/release-policy.mjs';
+import { registryFor, qualificationCases, validateQualification } from '../.github/scripts/qualification.mjs';
+import { latestJobs, publishRelease, releaseVersion } from '../.github/scripts/release-policy.mjs';
 import { digest } from '../src/platform/checkpoint-policy.mjs';
 
 function qualification() {
@@ -39,9 +39,10 @@ test('qualification requires both Linux runner families, all scenarios, matching
     assert.throws(() => validateQualification(bad.registry, bad.proofs, bad.cleanup, bad.repository, bad.sourceSha, bad.runId, true));
   }
 });
-test('release channels accept immutable v1 versions and inspect latest child attempts including partial reruns', () => {
+test('release channels accept immutable versions and major channels and inspect latest child attempts including partial reruns', () => {
   assert.equal(releaseVersion('v1.0.0-rc.0').alias, 'v1-prerelease'); assert.equal(releaseVersion('v1.0.0').alias, 'v1');
-  for (const version of ['v1', 'v2.0.0', 'main', 'v1.0.0;echo injected', 'v1.00.0']) assert.throws(() => releaseVersion(version));
+  assert.equal(releaseVersion('v2.3.4').alias, 'v2'); assert.equal(releaseVersion('v3.0.0-rc.1').alias, 'v3-prerelease');
+  for (const version of ['v1', 'v0.0.0', 'main', 'v1.0.0;echo injected', 'v1.00.0']) assert.throws(() => releaseVersion(version));
   const jobs = [{ id: 1, name: 'Analyze (actions)', run_attempt: 1, status: 'completed', conclusion: 'success' }, { id: 2, name: 'Analyze (javascript-typescript)', run_attempt: 1, status: 'completed', conclusion: 'success' },
     { id: 3, name: 'Analyze (actions)', run_attempt: 2, status: 'completed', conclusion: 'success' }];
   assert.deepEqual(latestJobs(jobs, ['Analyze (actions)', 'Analyze (javascript-typescript)'], 2).map(result => result.job_id), [3, 2]);
@@ -50,7 +51,7 @@ test('release channels accept immutable v1 versions and inspect latest child att
 });
 function publication() {
   const source = 'b'.repeat(40), old = 'a'.repeat(40), refs = new Map([['v1', old]]), calls = [], uploads = [];
-  const plan = { ...releaseVersion('v1.0.0'), repository: 'fixture/repo', source_sha: source, alias_previous_sha: old, qualification: { run_id: 100 } };
+  const plan = { ...releaseVersion('v1.0.0'), repository: 'fixture/repo', source_sha: source, alias_previous_sha: old };
   const api = async (path, options = {}) => {
     calls.push({ path, ...options });
     if (path.endsWith('/git/refs') && options.method === 'POST') { refs.set(options.ref.slice('refs/tags/'.length), options.sha); return {}; }

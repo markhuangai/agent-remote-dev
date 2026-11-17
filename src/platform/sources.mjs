@@ -20,10 +20,10 @@ async function commitForTag(api, repository, tag) {
 }
 export async function resolveSource(api, repository, ref) {
   invariant(repositoryPattern.test(repository) && typeof ref === 'string' && ref.length > 0 && ref.length <= 200, 'invalid_action_source');
-  if (['v1', 'v1-prerelease'].includes(ref)) {
+  if (/^v[1-9][0-9]*(?:-prerelease)?$/.test(ref)) {
     const sha = await commitForTag(api, repository, ref), releases = await pages(api, `/repos/${repository}/releases`, null);
     const matching = [];
-    for (const release of releases.filter(release => !release.draft && release.published_at && release.prerelease === (ref === 'v1-prerelease') && /^v1\.\d+\.\d+(?:-rc\.\d+)?$/.test(release.tag_name))) {
+    for (const release of releases.filter(release => !release.draft && release.published_at && release.prerelease === ref.endsWith('-prerelease') && new RegExp(`^${ref.replace('-prerelease', '')}\\.\\d+\\.\\d+(?:-rc\\.\\d+)?$`).test(release.tag_name))) {
       if (await commitForTag(api, repository, release.tag_name) === sha) matching.push(release);
     }
     invariant(matching.length > 0, 'alias_release_missing');

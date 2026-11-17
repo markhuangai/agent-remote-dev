@@ -70,7 +70,7 @@ test('unpublished changes and skill-reported blockers stay opaque and never trig
   assert.equal(observed.result.status, 'completed'); assert.equal(observed.result.nativeOutcome, 'succeeded'); assert.equal(observed.result.checkpoint, null);
   assert.equal(observed.results[0].response.trim(), response); assert.equal(await r.git('rev-parse', 'HEAD'), r.base);
   assert.equal(await r.git('diff', '--cached', '--name-only'), ''); assert.equal(await readFile(join(r.cwd, 'draft.txt'), 'utf8'), 'unpublished skill state\n');
-  assert.ok(f.records.some(record => record.event === 'checkpoint.unavailable' && record.reason === 'checkpoint_head_mismatch'));
+  assert.ok(f.records.some(record => record.event === 'checkpoint.unavailable' && record.reason === 'unpublished_changes'));
 });
 test('a real rejected skill push leaves the native response intact and cannot produce a resumable checkpoint', async t => {
   const f = await fixture(t), r = await repository(f), hook = join(r.remote, 'hooks/pre-receive');
@@ -100,6 +100,10 @@ test('real cold restore preserves the session and frozen user instructions while
   assert.deepEqual(await readFile(join(f.job.codexHome, 'AGENTS.md')), bytes);
   const first = await driver(f, r, { userAgents, execution: execution({ user_agents_url: userAgents.url, user_agents_sha256: userAgents.sha256 }) });
   const manifest = validateCheckpoint(JSON.parse(await readFile(join(first.exports[0].root, 'manifest.json'), 'utf8')), 'fixture/repo');
+  const other = join(f.temporary, 'other-checkout');
+  await exec('git', ['clone', '--branch', 'main', r.remote, other], { env: f.job.env });
+  await writeFile(join(other, 'later-main.txt'), 'Newer main must not enter the resumed task');
+  for (const args of [['add', 'later-main.txt'], ['commit', '-m', 'Advance main independently'], ['push', 'origin', 'main']]) await exec('git', args, { cwd: other, env: f.job.env });
   const fresh = await fixture(t), cwd = join(fresh.temporary, 'relocated-repository');
   await exec('git', ['clone', '--branch', 'main', r.remote, cwd], { env: fresh.job.env });
   const secondProvider = await provider(t, [[tool("printf second > state.txt && git add state.txt && git commit -m 'Second skill turn' && git push origin HEAD")], [message('Resumed skill completed.')]]);
@@ -109,6 +113,7 @@ test('real cold restore preserves the session and frozen user instructions while
   assert.equal(manifest.user_agents.sha256, hash(bytes)); assert.deepEqual(await readFile(join(fresh.job.codexHome, 'AGENTS.md')), bytes);
   const git = new TaskGit(cwd, fresh.job.env, fresh.log);
   await restoreCheckpoint(fresh.job, first.exports[0].root, manifest, git, fresh.log);
+  await assert.rejects(readFile(join(cwd, 'later-main.txt')), { code: 'ENOENT' });
   const second = await driver(fresh, { cwd, base: r.base }, { git, userAgents: manifest.user_agents, execution: execution({ ...manifest.execution, continuation_count: 1,
     parent_run_id: '13', parent_run_attempt: '1', activation_run_id: '15' }), resume: { session: manifest.session_id, checkpoint: first.result.checkpoint } });
   assert.equal(second.result.session, first.result.session); assert.equal(second.result.status, 'completed');
@@ -141,4 +146,16 @@ for (const interruption of ['budget', 'SIGTERM', 'SIGINT']) test(`native ${inter
   assert.equal(record.session_id, observed.result.session); assert.equal(record.cause_reason, interruption === 'budget' ? 'command_timeout' : 'command_cancelled');
   assert.ok(Object.hasOwn(record, 'exit_code')); assert.ok(Object.hasOwn(record, 'signal')); assert.equal(typeof record.native_cause, 'string');
   assert.ok(record.native_elapsed_ms > 0); assert.ok(record.timeout_ms > 0); assert.ok(Number.isFinite(record.deadline_ms)); assert.ok(record.action_deadline_ms > record.deadline_ms);
+});
+
+test('native PostToolUse hooks can commit and push progress under repository policy', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, [[tool("printf progress > hook-progress.txt")], [message('Hook-managed progress saved.')]]);
+  const hook = "git add -- hook-progress.txt && git commit -m 'Save progress through native hook' && git push origin HEAD";
+  await configure(f.job, api.config + '\n[[hooks.PostToolUse]]\nmatcher = "Bash"\n[[hooks.PostToolUse.hooks]]\ntype = "command"\ncommand = ' + JSON.stringify(hook) + '\ntimeout = 30\n', f.log);
+  const observed = await driver(f, r);
+  assert.equal(await r.git('log', '-1', '--format=%s'), 'Save progress through native hook');
+  assert.equal(await observed.git.remoteHead(), await observed.git.head());
+  assert.equal(observed.result.status, 'completed'); assert.ok(observed.result.checkpoint);
+  assert.equal(await r.git('status', '--porcelain'), '');
 });

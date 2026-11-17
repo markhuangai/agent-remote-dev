@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parseProjectConfig } from '../src/platform/project-config.mjs';
-import { actionResources, invocationSource, prepareInvocation } from '../.build/invocation.js';
+import { invocationSource, prepareInvocation } from '../.build/invocation.js';
 import { hash } from '../.build/contracts.js';
 import { exec, fixture } from './helpers.mjs';
 
@@ -29,12 +29,12 @@ function transport() {
 test('project YAML supports the exact user-level AGENTS.md key and validated defaults', () => {
   const value = parseProjectConfig(content + 'user-level-agents.md-url: https://example.invalid/AGENTS.md\n');
   assert.equal(value.user_agents_url, 'https://example.invalid/AGENTS.md');
-  assert.deepEqual(value.skills, []); assert.deepEqual(value.runner, ['ubuntu-latest']); assert.equal(value.auto_continue, false);
+  assert.deepEqual(value.skills, []); assert.equal(value.auto_continue, false);
   assert.equal(value.git_author_name, 'github-actions[bot]'); assert.equal(value.budget_minutes, 300);
   for (const invalid of [
     content + 'user-agents-url: https://example.invalid/AGENTS.md\n', content + 'skills: []\n',
     'allowed-actors: &actors [Z-M-Huang]\nskills: *actors\n', 'allowed-actors: !custom [Z-M-Huang]\n',
-    content + 'skills: [', content + 'github-token: secret\n', content + 'runner: [windows-latest]\n',
+    content + 'skills: [', content + 'github-token: secret\n', content + 'runner: [windows-latest]\n', content + 'runner: [ubuntu-latest]\n',
     content + 'git-author: {name: "bad\\nname", email: fixture@example.invalid}\n', content + 'budget-minutes: 1\n',
   ]) assert.throws(() => parseProjectConfig(invalid));
 });
@@ -60,34 +60,18 @@ test('a standalone action prepares native execution with only a plan and reposit
   await assert.rejects(call(), /untrusted_task_actor/);
   state.missing = true; await assert.rejects(call(), /project_config_unavailable/);
 });
-test('published and local action invocations derive provenance and verify actual executable resource bytes', async t => {
+test('action source metadata does not download or reverify the installed package inventory', async t => {
   const f = await fixture(t), root = join(f.temporary, 'action');
   await mkdir(root);
   const git = async args => (await exec('git', args, { cwd: root, env: f.job.env })).stdout;
   await git(['init', '--initial-branch=main']);
   await git(['remote', 'add', 'origin', 'https://github.com/fixture/action.git']);
-  const tree = [];
-  for (const path of actionResources) {
-    const file = join(root, path), bytes = Buffer.from(`Actual fixture resource ${path}\n`);
-    await mkdir(join(file, '..'), { recursive: true }); await writeFile(file, bytes);
-    tree.push({ type: 'blob', path, sha: createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') });
-  }
+  await writeFile(join(root, 'README.md'), 'Fixture source');
   await git(['add', '.']); await git(['commit', '-m', 'Action fixture']);
-  const sha = (await git(['rev-parse', 'HEAD'])).trim();
-  const api = async path => path.includes('/commits/') ? { sha } : { tree, truncated: false };
+  const sha = (await git(['rev-parse', 'HEAD'])).trim(), calls = [];
+  const api = async path => { calls.push(path); assert.ok(path.includes('/commits/')); return { sha }; };
   const published = await invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action', GITHUB_ACTION_REF: 'main' }, git);
-  assert.equal(published.sha, sha); assert.equal(published.repository, 'fixture/action'); assert.equal(published.kind, 'published');
+  assert.equal(published.sha, sha); assert.equal(published.kind, 'published');
   assert.equal((await invocationSource(api, root, {}, git)).kind, 'checkout');
-  await assert.rejects(invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action' }, git), { reason: 'unknown_action_source' });
-  await writeFile(join(root, 'dist/index.js'), 'Changed downloaded executable');
-  await assert.rejects(invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action', GITHUB_ACTION_REF: 'main' }, git), error => {
-    assert.equal(error.reason, 'action_source_resource_mismatch'); assert.equal(error.details.resource_path, 'dist/index.js');
-    assert.equal(error.details.source_sha, sha); assert.notEqual(error.details.expected, error.details.observed); return true;
-  });
-  assert.equal(await readFile(join(root, 'dist/index.js'), 'utf8'), 'Changed downloaded executable');
-  await writeFile(join(root, 'dist/index.js'), 'Actual fixture resource dist/index.js\n');
-  await rename(join(root, 'dist/supervise.py'), join(root, 'held-supervise.py'));
-  await assert.rejects(invocationSource(api, root, { GITHUB_ACTION_REPOSITORY: 'fixture/action', GITHUB_ACTION_REF: 'main' }, git), error => {
-    assert.equal(error.reason, 'action_source_resource_missing'); assert.equal(error.details.resource_path, 'dist/supervise.py'); return true;
-  });
+  assert.equal(calls.length, 2);
 });

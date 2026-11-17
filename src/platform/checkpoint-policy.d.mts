@@ -1,7 +1,5 @@
 export const checkpointSchema: number;
 export const runnerVersions: Record<string,string>;
-export const protocolContract: Record<string,string|number>;
-export const protocolFiles: string[];
 export const checkpointBytes: number;
 export const instructionBytes: number;
 export const databases: string[];
@@ -26,4 +24,3 @@ export function checkpointName(manifest: any): string;
 export function recordName(kind: string, taskId: string, runId: string, attempt: string): string;
 export function validateProducer(artifact: any, run: any, manifest: any, repository: string): any;
 export function frozenExecution(value: any): any;
-export function validateFrozenRoot(manifest: any, request: any, root: any): void;

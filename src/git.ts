@@ -15,7 +15,7 @@ export class TaskGit {
   async remoteHead(detachedSha?: string) {
     if (this.branch === null) {
       const sha = detachedSha ?? await this.head();
-      await this.run(["fetch", "--no-tags", "origin", sha]);
+      await this.run(["fetch", "--refetch", "--no-tags", "origin", sha]);
       const observed = (await this.run(["rev-parse", "FETCH_HEAD"])).trim();
       return observed === sha ? observed : null;
     }
@@ -32,7 +32,16 @@ export class TaskGit {
   async verify(expected: string) {
     requireValue(shaPattern.test(expected), "invalid_checkpoint_revision", "checkpoint");
     const local = await this.head(), actual = await this.remoteHead(expected), branch = await this.currentBranch();
-    if (actual !== expected || local !== expected || branch !== this.branch) throw new RunnerError("checkpoint_head_mismatch", "checkpoint", "The source does not match a remote revision.",
+    let published = actual === expected;
+    if (!published) {
+      try {
+        await this.run(["fetch", "--refetch", "--no-tags", "origin", expected]);
+        published = (await this.run(["rev-parse", "FETCH_HEAD"])).trim() === expected;
+      } catch (error) {
+        if (!(error instanceof RunnerError) || error.reason !== "command_failed") throw error;
+      }
+    }
+    if (!published || local !== expected || branch !== this.branch) throw new RunnerError("checkpoint_head_mismatch", "checkpoint", "The source does not match a published revision.",
       { expected_sha: expected, observed_sha: actual, local_sha: local, branch: this.branch, observed_branch: branch });
     const changes = await this.changedPaths();
     if (changes) throw new RunnerError("unpublished_changes", "checkpoint", "The checkout contains source that has not been published.",

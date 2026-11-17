@@ -6,6 +6,8 @@ inputs:
     default: .
   plan:
     description: Prompt passed verbatim to Codex, including any issue references; continuation restores the frozen prompt
+  resume-run-id:
+    description: Prior workflow run whose latest saved Codex session and pushed source revision should be restored
   codex-config:
     description: Secret-backed Codex TOML configuration
     required: true

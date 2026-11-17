@@ -4,6 +4,10 @@ run-name: ${{ fromJSON(inputs.request).operation == 'stop' && format('Codex stop
 on:
   workflow_dispatch:
     inputs:
+      runs-on:
+        description: Linux runner labels selected by this workflow's caller
+        type: string
+        default: '["ubuntu-latest"]'
       request:
         description: Internal submission, resume, or stop envelope prepared by the optional client
         required: true
@@ -26,7 +30,6 @@ jobs:
     outputs:
       operation: ${{ steps.request.outputs.operation }}
       task_id: ${{ steps.request.outputs.task_id }}
-      runner: ${{ steps.request.outputs.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -46,12 +49,12 @@ jobs:
             const { prepareTaskRequest } = await import(pathToFileURL(
               process.env.GITHUB_WORKSPACE + '/src/platform/continuation-policy.mjs').href);
             const request = await prepareTaskRequest({ github, context, core });
-            for (const name of ['operation', 'task_id', 'runner']) core.setOutput(name, request[name] || '');
+            for (const name of ['operation', 'task_id']) core.setOutput(name, request[name] || '');
 
   execute:
     needs: resolve
     if: needs.resolve.outputs.operation == 'execute'
-    runs-on: ${{ fromJSON(needs.resolve.outputs.runner) }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 360
     concurrency:
       group: codex-task-${{ github.repository_id }}-${{ needs.resolve.outputs.task_id }}
@@ -97,6 +100,8 @@ jobs:
         run: test "$(git -C action-source rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Execute native Codex with selected skills
         id: native
+        env:
+          CODEX_RUNNER_LABELS: ${{ inputs.runs-on }}
         uses: ./action-source
         with:
           working-directory: target
