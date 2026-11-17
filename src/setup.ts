@@ -66,7 +66,9 @@ export async function installTools(job: Job, providerRoot: string, log: Diagnost
 export async function installUserAgents(job: Job, value: UserAgents, log: Diagnostics) {
   try { instructions(value); }
   catch (error: any) { throw new RunnerError(error.reason ?? "invalid_user_agents", "instructions", "Frozen user instructions were rejected.", error.details); }
-  if (value) await writeFile(join(job.codexHome, "AGENTS.md"), value.content, { mode: 0o600, flag: "wx" });
+  const attribution = "For every Git commit you create, include this trailer exactly once after a blank line:\n\n" +
+    "Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>\n";
+  await writeFile(join(job.codexHome, "AGENTS.md"), attribution + (value ? "\n" + value.content : ""), { mode: 0o600, flag: "wx" });
   log.event("runtime.setup", "INFO", { stage: "user_instructions", configured: value !== null, source_url: value?.url ?? null,
     sha256: value?.sha256 ?? null, bytes: value ? Buffer.byteLength(value.content) : 0, outcome: "success" });
 }

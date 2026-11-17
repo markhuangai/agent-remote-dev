@@ -248,6 +248,17 @@ the current default branch; omitted `names` installs every discovered skill.
 Settings, selected skill revisions, instructions and secret configuration are
 resolved anew on each run. Repository skills and `AGENTS.md` use native discovery.
 
+The runner's native instructions ask Codex to include this trailer exactly once
+in each Git commit, including resumed conversations and runs without downloaded
+user instructions:
+
+```text
+Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>
+```
+
+This is project attribution in the commit message. Git author identity and token
+authentication are configured separately.
+
 On GitHub.com, the executing job's `workflow_repository`, `workflow_file_path`,
 `workflow_ref` and `workflow_sha` identify the reusable provider, independently of
 other declared calls or the caller's revision. These job context fields are not

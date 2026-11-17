@@ -85,7 +85,7 @@ async function driver(f, r, overrides = {}) {
   if (state.session) await save(state.session, undefined, state.outcome);
   return { result: { ...result, checkpoint: last }, git, exports };
 }
-test('real Codex discovers selected user skills, repository skills and both instruction scopes', async t => {
+for (const downloaded of [false, true]) test(`real Codex discovers skills and attribution with ${downloaded ? 'downloaded' : 'default'} user instructions`, async t => {
   const f = await fixture(t), r = await repository(f), source = join(f.temporary, 'skills');
   await mkdir(join(source, 'skills/fixture-selected/references'), { recursive: true });
   await writeFile(join(source, 'skills/fixture-selected/SKILL.md'), '---\nname: fixture-selected\ndescription: selected-user-catalog-3719\n---\nRead references/detail.txt when needed.\n');
@@ -94,14 +94,17 @@ test('real Codex discovers selected user skills, repository skills and both inst
   await mkdir(join(r.cwd, '.agents/skills/repo-native'), { recursive: true });
   await writeFile(join(r.cwd, '.agents/skills/repo-native/SKILL.md'), '---\nname: repo-native\ndescription: repository-catalog-5931\n---\nUse native repository behavior.\n');
   await writeFile(join(r.cwd, 'AGENTS.md'), 'repository-instructions-7751\n');
-  await installUserAgents(f.job, { url: 'https://example.invalid/AGENTS.md', sha256: (await import('../.build/contracts.js')).hash('user-instructions-8654\n'), content: 'user-instructions-8654\n' }, f.log);
+  await installUserAgents(f.job, downloaded ? { url: 'https://example.invalid/AGENTS.md', sha256: (await import('../.build/contracts.js')).hash('user-instructions-8654\n'), content: 'user-instructions-8654\n' } : null, f.log);
   const api = await provider(t, [[message('An ordinary native result.')], [message('Still the same conversation.')]]);
   await configure(f.job, api.config, f.log);
   const first = await runCodex(f.job, r.cwd, 'Use $fixture-selected and $repo-native.', f.log, 60000, 'one');
   const second = await runCodex(f.job, r.cwd, 'Continue this native conversation.', f.log, 60000, 'two', first.session);
   assert.equal(second.session, first.session);
   const captured = JSON.stringify(api.requests);
-  for (const marker of ['selected-user-catalog-3719', 'repository-catalog-5931', 'repository-instructions-7751', 'user-instructions-8654']) assert.ok(captured.includes(marker));
+  for (const marker of ['selected-user-catalog-3719', 'repository-catalog-5931', 'repository-instructions-7751']) assert.ok(captured.includes(marker));
+  assert.equal(captured.includes('user-instructions-8654'), downloaded);
+  assert.equal(api.requests.length, 2);
+  for (const request of api.requests) assert.ok(JSON.stringify(request).includes('Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>'));
   assert.doesNotMatch(captured, /unwanted-host-sentinel|unwanted-host-instructions|host-config-sentinel/);
   for (const [name, value] of Object.entries(f.hostFiles)) assert.equal(await readFile(join(f.host, name), 'utf8'), value);
 });
