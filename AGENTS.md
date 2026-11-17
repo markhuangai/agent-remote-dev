@@ -26,8 +26,8 @@ Full CI runs automatically. The workflow supports full-access/YOLO execution onl
 with no mode selector. CI requires successful real YOLO execution on both
 architectures. There is
 no review-first controller, validation label, container image, shared database,
-or pre-PR remote development-test route. The manual acceptance entrypoint is
-reserved for explicitly authorized live qualification after its prerequisites land.
+or pre-PR remote development-test route. Published-version maintainer tests use
+`runner-published.yml` after both declared release references exist.
 
 ## Review policy
 

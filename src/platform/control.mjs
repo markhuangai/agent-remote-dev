@@ -7,8 +7,7 @@ export async function workflowCommand(mode, { github, core, env = process.env })
   try {
     const common = { api, repository, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT,
       root: join(env.RUNNER_TEMP, `codex-${mode}-${env.GITHUB_RUN_ID}-${env.GITHUB_RUN_ATTEMPT}`) };
-    if (mode === 'recover') return await recoverExecution({ ...common, core,
-      inputs: { 'runs-on': env.CODEX_RUNS_ON, 'timeout-minutes': env.CODEX_TIMEOUT_MINUTES } });
+    if (mode === 'recover') return await recoverExecution({ ...common, core });
     const prepared = await prepareExecution({ ...common, actor: env.GITHUB_ACTOR, triggeringActor: env.TRIGGERING_ACTOR, ref: env.GITHUB_REF,
       resumeRunId: env.CODEX_RESUME_RUN_ID ?? '', plan: env.CODEX_PLAN ?? '' });
     for (const [name, value] of Object.entries({ root_run_id: prepared.root_run_id, source_sha: prepared.source_sha })) core.setOutput(name, value);

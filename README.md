@@ -46,9 +46,9 @@ resume starts a new allowance.
 
 ## Workflow interface
 
-The reusable workflow is `.github/workflows/remote-codex.yml`. Callers provide a
-`plan`, an optional `resume-run-id`, Linux `runs-on` labels and a
-`timeout-minutes` value. Defaults are `ubuntu-latest` and 360 minutes.
+The normal task form has two fields: `plan` (or new context) and an optional
+`resume-run-id`. Repository owners configure Linux runner labels and job timeout
+in the caller's YAML. This repository uses `ubuntu-latest` and 360 minutes.
 
 The [setup guide](docs/setup.md) covers the caller workflow, optional skills,
 resuming, cancellation and runtime diagnostics. Repository development, checks

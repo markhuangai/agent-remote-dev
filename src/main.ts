@@ -68,7 +68,7 @@ export async function main({ github }: { github: any }) {
     };
     const logs = setInterval(() => { void flushLogs(); }, 1000); logs.unref();
     log.fields = { ...log.fields, session_id: metadata.session_id, root_run_id: metadata.root_run_id, continuation_count: metadata.auto_count,
-      job_timeout_minutes: Number(process.env.CODEX_TIMEOUT_MINUTES), project_config_sha256: prepared.config_sha256, skills, user_agents_sha256: userAgents?.sha256 ?? null };
+      project_config_sha256: prepared.config_sha256, skills, user_agents_sha256: userAgents?.sha256 ?? null };
     let prompt = process.env.CODEX_PLAN ?? '';
     if (restored) prompt = `Continue this conversation using the current repository configuration. The checkout is the published revision ${restored.manifest.checkpoint_sha}. ` +
       (restored.manifest.omitted_work ? 'Uncommitted or unpushed work from the previous runner was not restored; inspect the checkout and recreate missing work as needed. ' : '') +

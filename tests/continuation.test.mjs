@@ -6,6 +6,7 @@ import { exportCheckpoint } from '../.build/checkpoint.js';
 import { unpackArchive, validateCheckpoint } from '../.build/resume.js';
 import { checkpointName, validateManifest, validateProducer } from '../src/platform/checkpoint-policy.mjs';
 import { loadRunCheckpoint, nativeTimedOut, prepareExecution, pruneSnapshots, recoverExecution } from '../src/platform/continuation-policy.mjs';
+import { workflowCommand } from '../src/platform/control.mjs';
 import { exec, checkpoint, fixture, sessionId } from './helpers.mjs';
 
 const repository = 'fixture/repo';
@@ -56,8 +57,7 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
   };
   const root = () => mkdtemp(join(f.temporary, 'download-'));
   const core = { info: () => {}, warning: () => {}, error: () => {} };
-  const recover = async () => recoverExecution({ api, repository, runId: '13', attempt: '1', root: await root(), core,
-    inputs: { 'runs-on': '["self-hosted","Linux","ARM64"]', 'timeout-minutes': '90' } });
+  const recover = async () => recoverExecution({ api, repository, runId: '13', attempt: '1', root: await root(), core });
   const prepare = async (extra = {}) => prepareExecution({ api, repository, runId: '20', attempt: '1', actor: 'Z-M-Huang', triggeringActor: 'Z-M-Huang',
     ref: 'refs/heads/main', resumeRunId: '13', plan: 'New context', root: await root(), ...extra });
   return { f, api, state, root, recover, prepare, exported };
@@ -84,14 +84,24 @@ for (const failure of ['expired', 'missing', 'unrelated', 'version', 'active', '
   await assert.rejects(x.prepare(extra));
   assert.ok(!x.state.calls.some(call => call.options?.method === 'POST'));
 });
-test('timeout recovery dispatches the actual consumer workflow with preserved runner and timeout inputs', async t => {
+test('timeout recovery dispatches the actual consumer workflow with only plan/resume inputs', async t => {
   const x = await transport(t); assert.equal((await x.recover()).dispatched, true);
   const dispatch = x.state.calls.find(call => call.options?.method === 'POST');
   assert.equal(dispatch.path, '/repos/fixture/repo/actions/workflows/7/dispatches');
-  assert.deepEqual(dispatch.options.inputs, { 'resume-run-id': '13', plan: '', 'runs-on': '["self-hosted","Linux","ARM64"]', 'timeout-minutes': '90' });
+  assert.deepEqual(dispatch.options, { method: 'POST', ref: 'main', inputs: { 'resume-run-id': '13', plan: '' } });
   x.state.parent.status = 'in_progress';
   const child = await x.prepare({ actor: 'github-actions[bot]', triggeringActor: 'github-actions[bot]', plan: '' });
   assert.equal(child.auto_count, 1); assert.equal(child.activation_run_id, '13');
+});
+test('workflow recovery adapter needs no scheduling environment or arguments', async context => {
+  const recovery = await transport(context);
+  const github = { request: async (route, data) => {
+    const [method, path] = route.split(' '); return { data: await recovery.api(path, { ...data, method }) };
+  } };
+  const result = await workflowCommand('recover', { github, core: { info() {}, setFailed(text) { assert.fail(text); } },
+    env: { GITHUB_REPOSITORY: repository, GITHUB_RUN_ID: '13', GITHUB_RUN_ATTEMPT: '1', RUNNER_TEMP: recovery.f.temporary } });
+  assert.equal(result.dispatched, true);
+  assert.deepEqual(recovery.state.calls.find(call => call.options?.method === 'POST').options.inputs, { 'resume-run-id': '13', plan: '' });
 });
 for (const scenario of ['error', 'clarification', 'cancelled', 'setup-timeout', 'upload-timeout', 'disabled', 'limit']) test(`automatic continuation stops for ${scenario}`, async t => {
   const x = await transport(t);
@@ -107,14 +117,14 @@ for (const scenario of ['error', 'clarification', 'cancelled', 'setup-timeout', 
 test('an ambiguous dispatch response is attempted once and reruns cannot dispatch again', async t => {
   const x = await transport(t); let dispatches = 0;
   const api = async (path, options) => { if (options?.method === 'POST') { dispatches++; throw new Error('uncertain response'); } return x.api(path, options); };
-  await assert.rejects(recoverExecution({ api, repository, runId: '13', attempt: '1', root: await x.root(), core: { info() {} }, inputs: { 'runs-on': '["ubuntu-latest"]', 'timeout-minutes': '360' } }));
+  await assert.rejects(recoverExecution({ api, repository, runId: '13', attempt: '1', root: await x.root(), core: { info() {} } }));
   assert.equal(dispatches, 1);
   assert.equal((await recoverExecution({ api, repository, runId: '13', attempt: '2', core: { info() {} } })).dispatched, false); assert.equal(dispatches, 1);
 });
 test('snapshot retention removes only old snapshots of this run and attempt after replacement', async t => {
   const x = await transport(t);
   x.state.artifacts = [1, 2, 3, 4].map(id => ({ ...x.state.artifact, id, name: `codex-session-r13-a1-${id}` }));
-  x.state.artifacts.push({ id: 9, name: 'codex-session-r13-a2-1' }, { id: 10, name: 'linux-qualification-evidence' });
+  x.state.artifacts.push({ id: 9, name: 'codex-session-r13-a2-1' }, { id: 10, name: 'unrelated-evidence' });
   await pruneSnapshots(x.api, repository, '13', '1');
   assert.deepEqual(x.state.calls.filter(call => call.options?.method === 'DELETE').map(call => call.path), ['/repos/fixture/repo/actions/artifacts/2', '/repos/fixture/repo/actions/artifacts/1']);
 });

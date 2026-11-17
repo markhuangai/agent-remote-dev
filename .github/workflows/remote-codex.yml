@@ -46,18 +46,24 @@ jobs:
       - name: Resolve the reusable workflow's immutable provider source
         id: source
         uses: actions/github-script@v9
+        env:
+          CODEX_JOB_CONTEXT: ${{ toJSON(job) }}
         with:
           retries: 0
           script: |
             const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId });
+            const job = JSON.parse(process.env.CODEX_JOB_CONTEXT);
             const prefix = 'markhuangai/agent-remote-dev-codex/.github/workflows/remote-codex.yml@';
-            const references = (run.referenced_workflows || []).filter(item => item.path?.startsWith(prefix));
             if (run.id !== context.runId || run.run_attempt !== Number(process.env.GITHUB_RUN_ATTEMPT) ||
                 run.repository?.full_name !== `${context.repo.owner}/${context.repo.repo}` || run.event !== 'workflow_dispatch' ||
-                run.head_sha !== process.env.GITHUB_WORKFLOW_SHA || references.length !== 1 || !/^[a-f0-9]{40}$/.test(references[0].sha)) {
+                run.head_sha !== process.env.GITHUB_WORKFLOW_SHA ||
+                job.workflow_repository !== 'markhuangai/agent-remote-dev-codex' ||
+                job.workflow_file_path !== '.github/workflows/remote-codex.yml' ||
+                typeof job.workflow_ref !== 'string' || !job.workflow_ref.startsWith(prefix) ||
+                !/^\S+$/.test(job.workflow_ref.slice(prefix.length)) || !/^[a-f0-9]{40}$/.test(job.workflow_sha)) {
               throw new Error('provider_workflow_identity_unavailable');
             }
-            core.setOutput('sha', references[0].sha);
+            core.setOutput('sha', job.workflow_sha);
       - uses: actions/checkout@v7
         with:
           repository: markhuangai/agent-remote-dev-codex
@@ -119,7 +125,6 @@ jobs:
         env:
           CODEX_PLAN: ${{ inputs.plan }}
           CODEX_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
-          CODEX_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
           CODEX_PLATFORM_TOKEN: ${{ github.token }}
           CODEX_PROVIDER_SHA: ${{ needs.resolve.outputs.provider_sha }}
           CODEX_CONFIG_TOML: ${{ secrets.codex-config }}
@@ -163,9 +168,6 @@ jobs:
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Continue after timeout
         uses: actions/github-script@v9
-        env:
-          CODEX_RUNS_ON: ${{ inputs.runs-on }}
-          CODEX_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
         with:
           retries: 0
           script: |

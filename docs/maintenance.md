@@ -110,20 +110,35 @@ retains logs under its existing policy; records include `GITHUB_RETENTION_DAYS`.
 No additional log sink or payload artifact is created. Temporary tools live
 outside the checkout; preserve workflow logs and CodeQL results as evidence.
 
-## Live platform tests and releases
+## Task workflows and published-version tests
 
-The acceptance harness and published workflow callers remain maintainer tests.
-After merge and explicit live-qualification authorization, they exercise fresh
-execution, manual cold resume, GitHub's actual job timeout and automatic recovery,
-cancellation and rejected pushes on hosted and self-hosted Linux. Their registry
-records owned test resources, and cleanup only touches proven task branches/PRs.
-Live preflight requires the exact current merged source, provisioned runners and
-secrets, and reviewed configuration enabling at least one automatic continuation.
-Optional `v1`/`v1-prerelease` smoke pairs exercise the published reusable workflow.
+`runner-task.yml` is the normal development entrypoint and keeps its filename for
+run history and resume. Its form contains only `plan` (or new context) and
+`resume-run-id`. Repository owners configure runner labels and job timeout in
+`jobs.run.with`; this repository fixes them to `ubuntu-latest` and 360 minutes.
+Recovery sends only plan/resume and reapplies the current caller YAML settings.
+The native CLI, Git, SQLite, snapshot, resume, cancellation, credential-exclusion
+and continuation regressions remain in the local and CI suites.
 
-`release.yml` verifies the dispatched main source, locked build/tests and required
-CI/CodeQL results, then publishes an immutable version tag and GitHub release.
-There are no custom runtime archives or mandatory qualification receipts. Stable
-versions advance `vN`; prereleases advance `vN-prerelease`. Aliases move forward
-without force; partial publication requires maintainer inspection. Release
-publication and live qualification require their own explicit authorization.
+`runner-published.yml`, named **Test published Codex workflow**, is the single
+maintainer test entrypoint. Its form offers `channel` (`stable` or `prerelease`),
+plan, resume ID, runner labels and timeout. Mutually exclusive jobs call literal
+`@v1` and `@v1-prerelease` references. Provider checkout uses the executing job's
+workflow identity, not the run's list of all declared reusable calls.
+
+No release tags or channel aliases exist yet, so published-version smoke execution
+is deferred until both declared channel references exist. Do not create placeholder tags.
+Once published and explicitly authorized, select the channel and supply a test
+plan; for manual resume select the same channel and prior run ID. Recovery sends
+no channel or scheduling overrides, so this maintainer form's YAML defaults apply
+to automatic children. Automatic continuation remains disabled in this repository.
+
+## Publish release
+
+`release.yml`, named **Publish release**, is the sole release publisher. It
+verifies the dispatched main source, locked build/tests and required CI/CodeQL
+results, then publishes an immutable version tag and GitHub release record.
+Stable versions advance `vN`; prereleases advance `vN-prerelease`. Aliases move
+forward without force; partial publication requires maintainer inspection.
+It does not execute development tasks or publish custom runtime archives.
+Release publication requires its own explicit authorization.

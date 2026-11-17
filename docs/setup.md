@@ -154,8 +154,9 @@ branch, required validation, commits and a push, then a pull request and the
 review loop. Avoid asking the runner to merge.
 
 In [Actions → Codex task runner](https://github.com/markhuangai/agent-remote-dev-codex/actions/workflows/runner-task.yml),
-select **Run workflow**, choose `main`, and paste the plan. Leave
-`resume-run-id` empty for a fresh task. Alternatively:
+select **Run workflow**, choose `main`, and paste the plan. The form contains only
+`plan` (or new context) and `resume-run-id`; leave the latter empty for a fresh
+task. Alternatively:
 
 ```bash
 gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev-codex --ref main -F plan=@plan.md
@@ -163,8 +164,10 @@ gh run list --repo markhuangai/agent-remote-dev-codex --workflow runner-task.yml
 gh run view RUN_ID --repo markhuangai/agent-remote-dev-codex --log
 ```
 
-The defaults select `ubuntu-latest` and a 360-minute job timeout. Read the
-`codex-result-*` artifact to confirm what Codex completed.
+The caller's YAML fixes `runs-on: '["ubuntu-latest"]'` and `timeout-minutes: 360`
+under `jobs.run.with`. Repository owners change scheduling there, not in the
+task form or `.remote-codex.yml`. Read the `codex-result-*` artifact to confirm
+what Codex completed.
 
 To answer a clarification or continue saved work, run the same caller with the
 previous run ID and a file containing the additional context:
@@ -202,14 +205,6 @@ on:
       resume-run-id:
         description: Prior workflow run containing the conversation
         type: string
-      runs-on:
-        description: JSON array of Linux runner labels
-        type: string
-        default: '["ubuntu-latest"]'
-      timeout-minutes:
-        description: GitHub job timeout in minutes
-        type: number
-        default: 360
 permissions:
   contents: read
   actions: write
@@ -219,8 +214,8 @@ jobs:
     with:
       plan: ${{ inputs.plan }}
       resume-run-id: ${{ inputs.resume-run-id }}
-      runs-on: ${{ inputs.runs-on }}
-      timeout-minutes: ${{ inputs.timeout-minutes }}
+      runs-on: '["ubuntu-latest"]'
+      timeout-minutes: 360
     secrets:
       codex-config: ${{ secrets.CODEX_CONFIG_TOML }}
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
@@ -228,9 +223,13 @@ jobs:
 ```
 
 Invoke the caller workflow from the repository's default branch. Consumers choose
-its filename and Linux runner labels; forward the four inputs shown above so
-automatic continuation can redispatch that workflow. Use one remote Codex call
-per caller workflow run. GitHub enforces the selected job timeout and runner limits.
+its filename and configure `runs-on` and `timeout-minutes` once under the reusable
+call's `with:` block. The reusable workflow keeps those optional scheduling inputs
+(defaulting to `ubuntu-latest` and 360 minutes) solely for its execution job.
+Only `plan` and `resume-run-id` are task inputs. Automatic recovery dispatches
+only those two fields, so the consumer's current YAML supplies scheduling again.
+Use one executing remote Codex call per caller workflow run; mutually exclusive
+declared calls are supported. GitHub enforces job timeout and runner limits.
 
 Configure the three Actions secrets using the steps above, with your consumer
 repository as the target.
@@ -249,8 +248,12 @@ the current default branch; omitted `names` installs every discovered skill.
 Settings, selected skill revisions, instructions and secret configuration are
 resolved anew on each run. Repository skills and `AGENTS.md` use native discovery.
 
-The provider source is checked out at the reusable workflow's resolved commit,
-installed through locked `package.json` dependencies, and compiled on the runner.
+On GitHub.com, the executing job's `workflow_repository`, `workflow_file_path`,
+`workflow_ref` and `workflow_sha` identify the reusable provider, independently of
+other declared calls or the caller's revision. These job context fields are not
+available on GitHub Enterprise Server. The workflow validates provider and caller
+identity, checks out the immutable provider SHA, installs locked `package.json`
+dependencies, and compiles on the runner.
 There is no root Action, committed distribution bundle, custom binary downloader,
 local application or copied consumer helper directory. Node 24, npm, Git 2.36+,
 GitHub CLI and Python 3.12+ are required on self-hosted Linux x64/arm64 runners.
@@ -335,4 +338,14 @@ snapshots and retention problems while preserving the prior artifact. ERROR
 records identify native failures, rejected archives and required operations.
 Commands emit a 60-second heartbeat. Credentials, raw prompts, secret configuration
 and provider response bodies are excluded from logs; truncation is marked.
+During execution, `runtime.tool` INFO records show command starts/completions,
+allowlisted command names such as `cat`, `git` and `npm`, and changed file paths
+with add/update/delete status. Unrecognized commands appear as `shell`; argument
+values and command bodies are omitted. MCP calls, agent delegation and web activity
+include their tool/action names;
+failed or declined tools produce WARN records with available exit codes. Records
+include session, item and run identity. Strings use the existing 512-character
+limit; file-change lists keep up to 100 paths and report the omitted count.
+Tool output, patch bodies, MCP arguments/results, assistant messages and reasoning
+are not printed. Use the saved conversation for the full interaction history.
 Preserve Actions logs, snapshot/result artifacts and CodeQL evidence.
