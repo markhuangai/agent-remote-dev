@@ -45,7 +45,7 @@ jobs:
     steps:
       - name: Resolve the reusable workflow's immutable provider source
         id: source
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@v9
         with:
           retries: 0
           script: |
@@ -58,13 +58,13 @@ jobs:
               throw new Error('provider_workflow_identity_unavailable');
             }
             core.setOutput('sha', references[0].sha);
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
         with:
           repository: markhuangai/agent-remote-dev-codex
           ref: ${{ steps.source.outputs.sha }}
           path: provider
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install locked provider dependencies
@@ -72,7 +72,7 @@ jobs:
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Authorize and resolve the conversation
         id: prepare
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@v9
         env:
           CODEX_PLAN: ${{ inputs.plan }}
           CODEX_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
@@ -92,13 +92,13 @@ jobs:
       group: codex-session-${{ github.repository_id }}-${{ needs.resolve.outputs.root_run_id }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
         with:
           repository: markhuangai/agent-remote-dev-codex
           ref: ${{ needs.resolve.outputs.provider_sha }}
           path: provider
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install and compile locked provider source
@@ -107,7 +107,7 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund
           npm run build
       - name: Checkout the consumer repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           path: target
@@ -115,7 +115,7 @@ jobs:
           persist-credentials: false
       - name: Execute Codex
         id: native
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@v9
         env:
           CODEX_PLAN: ${{ inputs.plan }}
           CODEX_RESUME_RUN_ID: ${{ inputs.resume-run-id }}
@@ -133,7 +133,7 @@ jobs:
             await main({ github });
       - name: Save final session
         if: always() && steps.native.outputs.state-path != ''
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@v9
         env:
           CODEX_STATE_PATH: ${{ steps.native.outputs.state-path }}
         with:
@@ -149,20 +149,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
         with:
           repository: markhuangai/agent-remote-dev-codex
           ref: ${{ needs.resolve.outputs.provider_sha }}
           path: provider
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install locked recovery dependencies
         working-directory: provider
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Continue after timeout
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@v9
         env:
           CODEX_RUNS_ON: ${{ inputs.runs-on }}
           CODEX_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
