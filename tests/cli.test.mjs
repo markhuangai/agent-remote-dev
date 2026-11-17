@@ -18,7 +18,7 @@ test('real Codex streams reads, edits and command failures without logging their
   const patch = '*** Begin Patch\n*** Update File: README.md\n@@\n-Fixture repository\n+private-patch-content-7281\n*** End Patch';
   const api = await provider(t, [[tool('cat README.md', 'read')],
     [tool(`apply_patch <<'PATCH'\n${patch}\nPATCH`, 'edit')],
-    [tool("printf '%s' 'fixture-api-credential-9374'; cat private-output.txt; exit 7", 'failure')],
+    [tool("printf '%s' 'fixture-api-credential-9374'; printf '%s' 'private-inline-task-content-3982'; cat private-output.txt; exit 7", 'failure')],
     [message('private-agent-message-1682')]]);
   await configure(f.job, api.config, f.log);
   const result = await runCodex(f.job, r.cwd, 'private-task-prompt-4197', f.log, 60000, 'activity');
@@ -28,7 +28,7 @@ test('real Codex streams reads, edits and command failures without logging their
   assert.deepEqual(commands.map(record => record.phase), ['started', 'completed', 'started', 'completed']);
   assert.equal(commands[0].item_id, commands[1].item_id);
   assert.equal(commands[2].item_id, commands[3].item_id);
-  assert.match(commands[0].command, /cat README\.md/);
+  assert.equal(commands[0].command_name, 'cat'); assert.equal(commands[2].command_name, 'printf');
   assert.equal(commands[1].exit_code, 0);
   assert.equal(commands[3].exit_code, 7); assert.equal(commands[3].level, 'WARN');
   const edits = records.filter(record => record.item_type === 'file_change');
@@ -42,29 +42,32 @@ test('real Codex streams reads, edits and command failures without logging their
     assert.equal(record.run_id, '13'); assert.equal(record.run_attempt, '1');
   }
   const logged = JSON.stringify(records);
-  assert.match(logged, /\[redacted\]/);
-  assert.doesNotMatch(logged, /Fixture repository|private-tool-output-9158|private-patch-content-7281|private-agent-message-1682|private-task-prompt-4197|fixture-api-credential-9374/);
+  assert.doesNotMatch(logged, /Fixture repository|private-tool-output-9158|private-patch-content-7281|private-agent-message-1682|private-task-prompt-4197|private-inline-task-content-3982|fixture-api-credential-9374/);
 });
 test('native activity logs allowlisted metadata with bounded changes and no argument bodies', () => {
   const { log, records } = logger();
+  log.protect('private-path-fragment');
   const item = (type, fields = {}) => ({ type: 'item.completed', item: { id: 'item-1', type, ...fields } });
   for (const event of [
     item('mcp_tool_call', { server: 'github', tool: 'get_issue', status: 'failed', arguments: { private: 'private-arguments' }, result: { text: 'private-result' }, error: { message: 'private-error' } }),
     item('collab_tool_call', { tool: 'spawn_agent', receiver_thread_ids: ['child-session'], status: 'completed', prompt: 'private-delegation', agents_states: { child: { message: 'private-agent-result' } } }),
     item('web_search', { query: 'private-query', action: { type: 'search' }, results: ['private-search-result'] }),
     item('command_execution', { command: 'cat README.md\nprivate-command-body', aggregated_output: 'private-command-output', exit_code: 0, status: 'completed' }),
-    item('command_execution', { command: 'x'.repeat(1000), exit_code: 0, status: 'completed' }),
+    item('command_execution', { command: `/bin/bash -c "printf '%s' 'private-inline-pr-body' > /tmp/pr-body.md"`, exit_code: 0, status: 'completed' }),
+    item('command_execution', { command: 'private-command-name-' + 'x'.repeat(1000), exit_code: 0, status: 'completed' }),
+    item('file_change', { changes: [{ path: 'repo/private-path-fragment/' + 'x'.repeat(1000), kind: 'update' }], status: 'completed' }),
     item('file_change', { changes: Array.from({ length: 105 }, (_, index) => ({ path: `file-${index}`, kind: 'update', diff: 'private-diff' })), status: 'completed' }),
   ]) logCodexActivity(log, event, 'session-1');
-  assert.equal(records.length, 6); assert.equal(records[0].level, 'WARN');
+  assert.equal(records.length, 8); assert.equal(records[0].level, 'WARN');
   assert.equal(records[0].server, 'github'); assert.equal(records[0].tool, 'get_issue');
   assert.deepEqual(records[1].receiver_thread_ids, ['child-session']); assert.equal(records[1].tool, 'spawn_agent');
-  assert.equal(records[2].action, 'search'); assert.equal(records[3].command, 'cat README.md');
-  assert.equal(records[4].truncated, true); assert.match(records[4].command, /truncated/);
-  assert.equal(records[5].changes.length, 100); assert.equal(records[5].omitted_changes, 5);
+  assert.equal(records[2].action, 'search'); assert.equal(records[3].command_name, 'cat');
+  assert.equal(records[4].command_name, 'printf'); assert.equal(records[5].command_name, 'shell');
+  assert.equal(records[6].truncated, true); assert.match(records[6].changes[0].path, /\[redacted\].*truncated/);
+  assert.equal(records[7].changes.length, 100); assert.equal(records[7].omitted_changes, 5);
   for (const type of ['agent_message', 'reasoning', 'todo_list', 'error', 'unknown']) logCodexActivity(log, item(type, { text: 'private-text' }), 'session-1');
   logCodexActivity(log, { type: 'item.updated', item: { id: 'item-1', type: 'command_execution', command: 'private-update' } }, 'session-1');
-  assert.equal(records.length, 6); assert.doesNotMatch(JSON.stringify(records), /private-/);
+  assert.equal(records.length, 8); assert.doesNotMatch(JSON.stringify(records), /private-/);
 });
 async function driver(f, r, overrides = {}) {
   const git = new TaskGit(r.cwd, f.job.env, f.log), exports = []; let last = null, state;

@@ -6,6 +6,10 @@ import { Diagnostics } from "./diagnostics.js";
 import type { ProcessControl } from "./process.js";
 import { RunnerError } from "./contracts.js";
 
+// Command arguments can contain unpublished task content even after credential redaction.
+const commandNames = new Set(["cat", "head", "tail", "sed", "rg", "ls", "find", "pwd", "git", "gh", "npm", "npx", "node",
+  "python", "python3", "apply_patch", "make", "cargo", "go", "cd", "set", "printf", "echo", "test", "sleep", "curl", "wget"]);
+
 export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
     "-c", `sqlite_home=${JSON.stringify(job.codexHome)}`, "-c", `log_dir=${JSON.stringify(join(job.root, "logs"))}`];
@@ -19,10 +23,13 @@ export function logCodexActivity(log: Diagnostics, event: any, session: string) 
   const fields: Record<string, unknown> = { session_id: session, item_id: item.id, item_type: item.type,
     phase: event.type.slice(5), status: item.status };
   switch (item.type) {
-    case "command_execution":
-      fields.command = typeof item.command === "string" ? log.sanitize(item.command).split("\n")[0] : undefined;
+    case "command_execution": {
+      const name = typeof item.command === "string"
+        ? /^(?:\/(?:usr\/)?bin\/(?:bash|sh|zsh) -[a-z]*c ['"]?)?([a-z_][a-z0-9_-]*)(?=[\s'";]|$)/.exec(item.command)?.[1] : undefined;
+      fields.command_name = name && commandNames.has(name) ? name : "shell";
       fields.exit_code = item.exit_code;
       break;
+    }
     case "file_change": {
       const changes = Array.isArray(item.changes) ? item.changes : [];
       fields.changes = changes.slice(0, 100).map((change: any) => ({ path: change.path, kind: change.kind }));
