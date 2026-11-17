@@ -338,4 +338,12 @@ snapshots and retention problems while preserving the prior artifact. ERROR
 records identify native failures, rejected archives and required operations.
 Commands emit a 60-second heartbeat. Credentials, raw prompts, secret configuration
 and provider response bodies are excluded from logs; truncation is marked.
+During execution, `runtime.tool` INFO records show command starts/completions,
+the first line of each redacted command, and changed file paths with add/update/delete
+status. MCP calls, agent delegation and web activity include their tool/action names;
+failed or declined tools produce WARN records with available exit codes. Records
+include session, item and run identity. Command previews use the existing 512-character
+limit; file-change lists keep up to 100 paths and report the omitted count.
+Tool output, patch bodies, MCP arguments/results, assistant messages and reasoning
+are not printed. Use the saved conversation for the full interaction history.
 Preserve Actions logs, snapshot/result artifacts and CodeQL evidence.

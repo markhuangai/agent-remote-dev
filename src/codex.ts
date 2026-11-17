@@ -12,6 +12,37 @@ export function codexArgs(job: Job, cwd: string, output: string, session?: strin
   const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--trust", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-last-message", output];
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
+export function logCodexActivity(log: Diagnostics, event: any, session: string) {
+  if (!["item.started", "item.completed"].includes(event?.type)) return;
+  const item = event.item;
+  if (!item || typeof item.id !== "string") return;
+  const fields: Record<string, unknown> = { session_id: session, item_id: item.id, item_type: item.type,
+    phase: event.type.slice(5), status: item.status };
+  switch (item.type) {
+    case "command_execution":
+      fields.command = typeof item.command === "string" ? log.sanitize(item.command).split("\n")[0] : undefined;
+      fields.exit_code = item.exit_code;
+      break;
+    case "file_change": {
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      fields.changes = changes.slice(0, 100).map((change: any) => ({ path: change.path, kind: change.kind }));
+      fields.omitted_changes = Math.max(0, changes.length - 100);
+      break;
+    }
+    case "mcp_tool_call":
+      fields.server = item.server; fields.tool = item.tool;
+      break;
+    case "collab_tool_call":
+      fields.tool = item.tool;
+      fields.receiver_thread_ids = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids.slice(0, 100) : [];
+      break;
+    case "web_search":
+      fields.action = item.action?.type;
+      break;
+    default: return;
+  }
+  log.event("runtime.tool", item.status === "failed" || item.status === "declined" || typeof item.exit_code === "number" && item.exit_code !== 0 ? "WARN" : "INFO", fields);
+}
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
@@ -27,6 +58,7 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
         onSession?.(observed!);
         log.event("runtime.session", "INFO", { session_id: observed, outcome: session ? "resumed" : "created" });
       }
+      if (observed && !identityChanged) logCodexActivity(log, value, observed);
     },
   });
   if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "codex", "Codex did not return the expected conversation identity.",
