@@ -1,41 +1,35 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { command } from "./process.js";
 import { Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
-import { RunnerError, turnSchema } from "./contracts.js";
+import type { ProcessControl } from "./process.js";
+import { RunnerError } from "./contracts.js";
 
-export function codexArgs(job: Job, cwd: string, schemaPath: string, output: string, session?: string) {
+export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
     "-c", `sqlite_home=${JSON.stringify(job.codexHome)}`, "-c", `log_dir=${JSON.stringify(join(job.root, "logs"))}`];
-  const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-schema", schemaPath, "--output-last-message", output];
+  const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--trust", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-last-message", output];
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
-export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics,
-  timeoutMs: number, ordinal: string, session?: string, schema: unknown = turnSchema) {
-  const schemaPath = join(job.root, `schema-${ordinal}.json`), output = join(job.root, `result-${ordinal}.json`);
-  await writeFile(schemaPath, JSON.stringify(schema), { mode: 0o600 });
-  let observed: string | undefined;
-  const stage = ordinal.startsWith("audit-") ? "audit" : "worker";
-  await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, schemaPath, output, session), {
-    cwd, env: job.env, stage, log, timeoutMs, stdin: prompt, collect: false,
+export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
+  onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
+  const output = join(job.root, `result-${ordinal}.txt`);
+  let observed: string | undefined, identityChanged = false;
+  await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, output, session), {
+    cwd, env: job.env, stage: "codex", onControl, log, timeoutMs, stdin: prompt, collect: false,
     onLine(line) {
       let value: any;
       try { value = JSON.parse(line); } catch { return; }
-      if (value.type === "thread.started" && typeof value.thread_id === "string") observed = value.thread_id;
+      if (value.type === "thread.started" && typeof value.thread_id === "string") {
+        if (session && value.thread_id !== session || observed && value.thread_id !== observed) { identityChanged = true; return; }
+        observed = value.thread_id;
+        onSession?.(observed!);
+        log.event("runtime.session", "INFO", { session_id: observed, outcome: session ? "resumed" : "created" });
+      }
     },
   });
-  if (!observed || (session && observed !== session)) throw new RunnerError("conversation_identity_changed", stage,
-    "Codex did not return the expected conversation identity.", { expected_session: session ?? null, observed_session: observed ?? null, ordinal });
+  if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "codex", "Codex did not return the expected conversation identity.",
+    { expected_session: session ?? null, observed_session: observed ?? null });
   return { session: observed, result: await readFile(output, "utf8") };
 }
-export const auditSchema = { type: "object", additionalProperties: false, properties: {
-  auditor: { type: "object", additionalProperties: false, properties: { session: { type: "string" }, model: { type: "string" } }, required: ["session", "model"] },
-  base_sha: { type: "string" }, audited_state: { type: "string" },
-  verdict: { type: "string", enum: ["conformant", "nonconformant", "blocked"] },
-  findings: { type: "array", items: { type: "object", additionalProperties: false, properties: {
-    plan_item: { type: "string" }, category: { type: "string", enum: ["missing_behavior", "contradiction", "unapproved_scope", "planned_test_gap"] },
-    evidence: { type: "string" }, gap: { type: "string" }, required_outcome: { type: "string" }, guidance: { type: "string" },
-  }, required: ["plan_item", "category", "evidence", "gap", "required_outcome", "guidance"] } },
-  summary: { type: "string" },
-}, required: ["verdict", "auditor", "base_sha", "audited_state", "findings", "summary"] };

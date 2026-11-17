@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { Diagnostics } from "../.build/diagnostics.js";
 import { createJob, removeJob } from "../.build/setup.js";
-import { versions } from "../.build/contracts.js";
+import { hash, versions } from "../.build/contracts.js";
 
 export const root = resolve(import.meta.dirname, "..");
 export const exec = promisify(execFile);
@@ -23,6 +23,7 @@ export async function fixture(t) {
   await mkdir(join(host, ".codex"), { recursive: true });
   await mkdir(join(host, ".agents/skills/unwanted"), { recursive: true });
   const hostFiles = {
+    ".codex/AGENTS.md": "unwanted-host-instructions-3819\n",
     ".codex/config.toml": 'model="host-config-sentinel-6158"\n',
     ".codex/auth.json": '{"OPENAI_API_KEY":"host-auth-sentinel-9482"}\n',
     ".agents/skills/unwanted/SKILL.md": "---\nname: unwanted-host-sentinel-3719\ndescription: Host sentinel\n---\nNever load this host skill.\n",
@@ -88,7 +89,7 @@ let portable;
 export async function portableSource(f) {
   if (!portable) {
     portable = (async () => {
-      const response = await fetch(`https://codeload.github.com/markhuangai/agent-remote-dev-skills/tar.gz/${versions.execution_skills}`);
+      const response = await fetch(`https://codeload.github.com/markhuangai/agent-remote-dev-skills/tar.gz/${"224a5be4ddf40c6cf0a50b97885cb353e8522e2e"}`);
       assert.equal(response.status, 200);
       return Buffer.from(await response.arrayBuffer());
     })();
@@ -97,40 +98,6 @@ export async function portableSource(f) {
   await writeFile(archive, await portable); await mkdir(directory);
   await exec("tar", ["-xzf", archive, "--strip-components=1", "-C", directory]);
   return directory;
-}
-export async function githubFixture(f, repo, overrides = {}) {
-  const bin = join(f.job.root, "api-bin"); await mkdir(bin);
-  const transport = join(bin, "gh");
-  const data = { repository: "fixture/repo", ...overrides };
-  await writeFile(join(f.job.root, "api-state.json"), JSON.stringify(data));
-  await writeFile(transport, `#!/usr/bin/env node
-const fs = require('node:fs');
-const cp = require('node:child_process');
-const path = require('node:path');
-const args = process.argv.slice(2);
-const state = JSON.parse(fs.readFileSync(${JSON.stringify(join(f.job.root, "api-state.json"))}));
-const sha = cp.execFileSync('git', ['rev-parse', 'HEAD'], {cwd:${JSON.stringify(repo.cwd)}, encoding:'utf8'}).trim();
-const branch = ${JSON.stringify(repo.branch)};
-const pr = {number:9,title:'Fixture PR',url:'https://github.com/fixture/repo/pull/9',state:state.closed?'CLOSED':'OPEN',isDraft:false,
- author:{login:'fixture-actor'},headRefOid:sha,headRefName:branch,baseRefName:'main'};
-const endpoint = args.find(x=>x.startsWith('repos/'));
-let result;
-if (args[0]==='auth') { process.stdout.write('Fixture authentication'); process.exit(0); }
-if (args[0]==='pr' && args[1]==='create') { fs.writeFileSync(${JSON.stringify(join(f.job.root, "pr-created"))},'yes'); process.stdout.write(pr.url); process.exit(0); }
-if (args[0]==='pr' && args[1]==='view') result=pr;
-else if (args[0]==='pr' && args[1]==='checks') result=[{name:'CI',state:'SUCCESS',bucket:'pass',link:'https://example.invalid/validation',startedAt:'2020-01-01T00:00:00Z',completedAt:'2020-01-01T00:01:00Z',workflow:'',event:''}];
-else if (args.includes('graphql')) {
- const connection={nodes:[],pageInfo:{hasNextPage:false,endCursor:null}};
- result={data:{repository:{pullRequest:{comments:connection,reviews:connection,reactions:connection,reviewThreads:connection}}}};
-} else if (args.includes('user')) { if(args.includes('--jq')) {process.stdout.write('fixture-actor');process.exit(0);} result={login:'fixture-actor'}; }
-else if(endpoint?.includes('/pulls/')) result={state:state.closed?'closed':'open',draft:false,body:state.body||'',user:{login:'fixture-actor'},head:{sha:state.stale?'b'.repeat(40):sha,ref:branch,repo:{full_name:'fixture/repo'}},base:{ref:'main',repo:{full_name:'fixture/repo'}}};
-else if(endpoint?.includes('/actions/runs')) result={workflow_runs:[]};
-else if(endpoint?.includes('/statuses')) result=[];
-else { process.stderr.write('Unexpected fixture GitHub request'); process.exit(1); }
-if(args.includes('--slurp')) result=[result];
-process.stdout.write(JSON.stringify(result));
-`, { mode: 0o700 });
-  f.job.env.PATH = `${bin}:${f.job.env.PATH}`;
 }
 export async function skillTransport(f, revision, archive) {
   const bin=join(f.job.root,"skill-api-bin");await mkdir(bin);
@@ -143,3 +110,10 @@ else{process.stderr.write('Unexpected skill transport endpoint');process.exitCod
 `,{mode:0o700});
   f.job.env.PATH=`${bin}:${f.job.env.PATH}`;
 }
+
+export const executionSource = { repository: 'markhuangai/agent-remote-dev-skills', revision: '224a5be4ddf40c6cf0a50b97885cb353e8522e2e', names: ['sdlc-plan-implementation', 'plan-audit', 'pr-review-loop'] };
+export const sessionId = '11111111-1111-4111-8111-111111111111';
+export const lineage = { run_id: '13', run_attempt: '1', workflow_id: 7, workflow_path: '.github/workflows/custom.yml', workflow_sha: 'a'.repeat(40), branch: 'main' };
+export const checkpoint = (extra = {}) => ({ repository: 'fixture/repo', branch: 'codex/fixture-task', checkpoint_sha: 'a'.repeat(40), omitted_work: false,
+  session_id: sessionId, root_run_id: '13', activation_run_id: '13', operator: 'Z-M-Huang', auto_count: 0, lineage,
+  outcome: 'running', workspace: '/fixture/workspace', previous: null, ...extra });

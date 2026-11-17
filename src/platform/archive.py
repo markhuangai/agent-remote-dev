@@ -47,7 +47,7 @@ def unpack(archive, destination, kind):
         expected = {record: None}
         if kind == "checkpoint":
             schema = payload.get("schema_version")
-            require(schema == 2, "unsupported_checkpoint_schema", expected=2, observed=schema if type(schema) is int else None)
+            require(schema == 4, "unsupported_checkpoint_schema", expected=4, observed=schema if type(schema) is int else None)
             inventory = payload.get("files")
             require(isinstance(inventory, list) and len(inventory) <= 10000, "invalid_checkpoint_inventory")
             databases = {"state_5.sqlite", "thread_history_1.sqlite", "goals_1.sqlite", "queue_1.sqlite", "memories_1.sqlite", "memories_v2_1.sqlite"}

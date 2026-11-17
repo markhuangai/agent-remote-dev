@@ -1,0 +1,9 @@
+export function githubAPI(github: any): (path: string, options?: any) => Promise<any>;
+export function executionJob(api: any, repository: string, run: any): Promise<any>;
+export function nativeTimedOut(job: any): boolean;
+export function loadRunCheckpoint(api: any, repository: string, runId: string, root: string, codexVersion?: string): Promise<any>;
+export function pruneSnapshots(api: any, repository: string, runId: string, attempt: string, keep?: number): Promise<void>;
+export function prepareExecution(input: any): Promise<any>;
+export function recoverExecution(input: any): Promise<any>;
+export { authorizeActors } from './project-config.mjs';
+export { pages } from './sources.mjs';

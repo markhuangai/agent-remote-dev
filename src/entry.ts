@@ -1,5 +1,3 @@
-import { main } from "./main.js";
-import { checkpointWorker } from "./checkpoint-worker.js";
-
-if (process.argv[2] === "--checkpoint-worker") void checkpointWorker(process.argv[3]);
-else void main();
+import { checkpointWorker, watchSnapshots } from "./checkpoint-worker.js";
+const operation = process.argv[2] === "--watch" ? watchSnapshots : checkpointWorker;
+operation(process.argv[3]).catch(() => { process.stderr.write("Snapshot worker failed.\n"); process.exitCode = 1; });

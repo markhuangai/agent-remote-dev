@@ -1,0 +1,101 @@
+name: Publish workflow release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New version such as v1.0.0-rc.0 or v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  SOURCE_SHA: ${{ github.workflow_sha }}
+
+jobs:
+  authorize:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install locked helper dependencies
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - id: gate
+        uses: actions/github-script@v9
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { releasePreflight } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
+            await releasePreflight({ github, context, core });
+
+  build:
+    name: Verify source
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Verify source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm run test:skill-install
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: linux-release-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout trusted release policy
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install locked helper dependencies
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Publish immutable version and forward-only alias
+        uses: actions/github-script@v9
+        with:
+          retries: 0
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { releasePreflight, publishRelease } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
+            const plan = await releasePreflight({ github, context, core });
+            const api = async (path, options = {}) => {
+              const { method = 'GET', ...data } = options;
+              return (await github.request(`${method} ${path}`, data)).data;
+            };
+            await publishRelease({ api, plan });

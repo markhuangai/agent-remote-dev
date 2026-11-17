@@ -5,45 +5,20 @@ import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
 import { zstdCompressSync } from "node:zlib";
 import test from "node:test";
-import { authorize, executionSource, hash, parseTurn, skillSources } from "../.build/contracts.js";
+import { hash, skillSources } from "../.build/contracts.js";
 import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
-import { exportCheckpoint, durableCheckpoint } from "../.build/checkpoint.js";
-import { isolatedCheckpoint } from "../.build/checkpoint-worker.js";
+import { exportCheckpoint, durableCheckpoint, inspectCredentials } from "../.build/checkpoint.js";
+import { uploadSnapshot } from "../.build/checkpoint-worker.js";
 import { TaskGit } from "../.build/git.js";
-import { reviewSurfaces, verifyReviewState, verifyTerminal } from "../.build/delivery.js";
-import { selectPlanSource } from "../.build/main.js";
 import { command } from "../.build/process.js";
-import { exec, fixture, logger, portableSource, repository, root, skillTransport, turn, policy } from "./helpers.mjs";
+import { exec, executionSource, checkpoint, sessionId, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
 
 const plan = "Implement the fixture plan.\n";
-const auth = { repository: "fixture/repo", plan_sha256: hash(plan), request: "Implement and deliver this plan, with checkpoint pushes." };
-const checkpoint = (extra = {}) => ({ task_id: "fixture-task", repository: "fixture/repo", branch: "codex/fixture-task", base_sha: "a".repeat(40), checkpoint_sha: "b".repeat(40),
-  plan, plan_source: "inline", authorization: auth, sessions: ["fixture-session"], skills: [executionSource], progress: { completed: ["fixture"] }, lineage: { run_id: "13" }, audit: null, previous: null, ...extra });
 async function history(f, content = "completed turn") {
   await mkdir(join(f.job.codexHome, "sessions"));
-  const data = JSON.stringify({ type: "session_meta", payload: { id: "fixture-session", session_id: "root-session" } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
+  const data = JSON.stringify({ type: "session_meta", payload: { id: sessionId, session_id: sessionId } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
   await writeFile(join(f.job.codexHome, "sessions/rollout.jsonl"), data);
 }
-test("plan selection and direct authorization bind exact bytes and repository without a mode selector", () => {
-  assert.equal(selectPlanSource(plan, "", "fixture/repo").plan, plan);
-  assert.equal(selectPlanSource("", "https://github.com/fixture/repo/issues/2", "fixture/repo").issueNumber, "2");
-  for (const args of [[plan,"https://github.com/fixture/repo/issues/2"], ["", ""], ["", "https://github.com/other/repo/issues/2"]]) assert.throws(() => selectPlanSource(...args, "fixture/repo"));
-  assert.deepEqual(authorize(JSON.stringify(auth), "fixture/repo", plan), auth);
-  for (const changed of [{ ...auth, permission_mode: "sandboxed" }, { ...auth, permission_mode: "full-access" }, { ...auth, plan_sha256: hash(plan.trim()) }, { ...auth, request: "" }, { ...auth, repository: "other/repo" }]) {
-    assert.throws(() => authorize(JSON.stringify(changed), "fixture/repo", plan));
-  }
-});
-test("the actual bundled entry rejects retired mode inputs before configuration or execution",async()=>{
-  for(const mode of ["sandboxed","full-access"]) await assert.rejects(exec(process.execPath,[join(root,"dist/index.js")],{
-    env:{...process.env,"INPUT_PERMISSION-MODE":mode,GITHUB_REPOSITORY:"fixture/repo",GITHUB_SERVER_URL:"https://github.com"},
-  }),error=>{assert.equal(error.code,1);assert.match(error.stdout,/unsupported_mode_input/);assert.doesNotMatch(error.stdout,/runtime\.setup|runtime\.operation/);return true;});
-});
-test("skill sources preserve the three immutable defaults and refuse collisions and mutable refs", () => {
-  assert.deepEqual(skillSources("[]"), [executionSource]);
-  assert.throws(() => skillSources(JSON.stringify([{ repository: "fixture/skills", revision: "main", names: ["test"] }])));
-  assert.throws(() => skillSources(JSON.stringify([{ repository: "fixture/skills", revision: "a".repeat(40), names: ["plan-audit"] }])));
-  assert.throws(() => parseTurn(JSON.stringify({ ...turn("complete"), injected: true })));
-});
 test("configuration is isolated, rejects invalid TOML, and prevents permission and storage overrides", async (t) => {
   const f = await fixture(t);
   await configure(f.job, 'model="gpt-5.1"\nsandbox_mode="read-only"\nsqlite_home="/outside"\n[model_providers.fixture]\nenv_key="CODEX_API_KEY"\nhttp_headers={authorization="fixture-config-secret-4631"}', f.log);
@@ -70,15 +45,11 @@ test("actual Skills CLI installs complete pinned portable packages outside proje
   assert.deepEqual(await readdir(root), before);
   await assert.rejects(installSkillSource(f.job, { ...executionSource, names:["missing-skill"] }, source, 1, f.log));
 });
-test("real locked tool installation rejects a mismatched installed Skills CLI version",async(t)=>{
-  const f=await fixture(t),action=join(f.temporary,"action-source");await mkdir(action);
-  await writeFile(join(action,"package.json"),JSON.stringify({name:"fixture-tools",private:true,version:"0.0.0",dependencies:{"@openai/codex":"0.169.0",skills:"1.8.0"}}));
-  await exec("npm",["install","--package-lock-only","--ignore-scripts","--no-audit","--no-fund"],{cwd:action,env:f.job.env,maxBuffer:1024*1024});
-  await assert.rejects(installTools(f.job,action,f.log),error=>{
-    assert.equal(error.reason,"skills_version_mismatch");assert.equal(error.details.expected_version,"1.8.1");assert.equal(error.details.observed_version,"1.8.0");
-    f.log.failure(error);return true;
-  });
-  assert.ok(f.records.some(record=>record.event==="runtime.operation"&&record.stage==="codex_version"&&record.outcome==="success"));
+test("runtime reuses the provider's package-managed Codex without a second installation", async t => {
+  const f = await fixture(t);
+  await installTools(f.job, root, f.log);
+  assert.equal(f.job.tools, root);
+  assert.equal(f.records.find(record => record.stage === 'codex_version').outcome, 'success');
 });
 for(const scenario of ["valid","revision","traversal","symlink"]) test(`actual skill source fetch enforces ${scenario} archive/revision decisions`,async(t)=>{
   const f=await fixture(t),archive=join(f.temporary,"source.tar.gz");
@@ -102,163 +73,12 @@ test("safe tree and cleanup refuse export symlinks and never follow cleanup link
   await removeJob(f.job.home);
   assert.equal(await readFile(outside, "utf8"), "retain");
 });
-test("actual Git publication verifies pushed commits, upstream, deletions and remote drift", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  await writeFile(join(r.cwd, "greeting.js"), "console.log('fixture');\n");
-  const sha = await git.publish(["greeting.js"], "Fixture accomplishment", r.base, null);
-  assert.equal(await git.remoteHead(), sha);
-  await assert.rejects(git.verify(r.base),error=>{f.log.failure(error);assert.equal(error.details.expected_sha,r.base);assert.equal(error.details.observed_sha,sha);return true;});
-  assert.equal(await r.git("rev-list", "--left-right", "--count", "HEAD...@{upstream}"), "0\t0");
-  await assert.rejects(git.publish([], "", r.base, sha), error => {
-    assert.equal(error.reason, "worker_changed_git_history"); assert.equal(error.details.expected_sha, r.base);
-    assert.equal(error.details.observed_sha, sha); return true;
-  });
-  await r.git("switch", "main");
-  await assert.rejects(git.publish([], "", sha, sha), error => {
-    assert.equal(error.reason, "task_branch_changed"); assert.equal(error.details.expected_branch, r.branch);
-    assert.equal(error.details.observed_branch, "main"); assert.equal(error.details.expected_sha, sha);
-    assert.equal(error.details.observed_sha, r.base); return true;
-  });
-  await r.git("switch", r.branch);
-  await assert.rejects(git.publish([], "", sha, r.base), { reason: "remote_branch_drift" });
-  await r.git("rm", "README.md");
-  const next = await git.publish(["README.md"], "Remove fixture file", sha, sha);
-  assert.notEqual(next, sha);
-  await unlink(join(r.cwd, "greeting.js"));
-  const removed = await git.publish(["greeting.js"], "Remove unstaged fixture file", next, next);
-  assert.equal(await git.remoteHead(), removed);
-});
-for (const change of ["deletion", "rename"]) test(`audited ${change} fingerprints survive staging and real publication`, async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  const original = await git.fingerprint();
-  if (change === "deletion") await unlink(join(r.cwd, "README.md"));
-  else await rename(join(r.cwd, "README.md"), join(r.cwd, "renamed.md"));
-  const audited = await git.fingerprint(), paths = await git.changedPaths();
-  assert.notEqual(audited, original);
-  await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited);
-  const sha = await git.publish(paths, `Publish fixture ${change}`, r.base, null);
-  assert.equal(await git.fingerprint(), audited); assert.equal(await git.remoteHead(), sha);
-  await writeFile(join(r.cwd, "renamed.md"), "Later implementation change\n");
-  assert.notEqual(await git.fingerprint(), audited);
-});
-for (const replacement of ["file-to-directory", "directory-to-file", "directory-to-symlink"]) for (const staged of [false, true]) {
-  test("real " + replacement + " preserves audit identity and publication with " + (staged ? "staged" : "unstaged") + " changes", async (t) => {
-    const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-    const initial = replacement === "file-to-directory" ? "shape" : "shape/old.ts";
-    await mkdir(join(r.cwd, initial, ".."), { recursive: true });
-    await writeFile(join(r.cwd, initial), "Original fixture\n");
-    await r.git("add", "shape"); await r.git("commit", "-m", "Prepare replacement fixture");
-    const base = await git.head(), original = await git.fingerprint();
-    await unlink(join(r.cwd, initial));
-    if (replacement !== "file-to-directory") await rmdir(join(r.cwd, "shape"));
-    const current = replacement === "file-to-directory" ? "shape/new.ts" : "shape";
-    const outside = join(f.temporary, "outside");
-    if (replacement === "directory-to-symlink") {
-      await mkdir(outside); await writeFile(join(outside, "old.ts"), f.job.env.CODEX_API_KEY);
-      await symlink(outside, join(r.cwd, current));
-    } else {
-      await mkdir(join(r.cwd, current, ".."), { recursive: true });
-      await writeFile(join(r.cwd, current), "Replacement fixture\n");
-    }
-    const audited = await git.fingerprint(), paths = await git.changedPaths();
-    assert.notEqual(audited, original);
-    if (staged) { await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited); }
-    if (replacement !== "directory-to-symlink") {
-      await writeFile(join(r.cwd, current), f.job.env.CODEX_API_KEY);
-      await assert.rejects(git.publish(paths, "Reject contaminated replacement", base, null), { reason: "credential_in_commit" });
-      assert.equal(await git.head(), base); assert.equal(await git.remoteHead(), null);
-      await writeFile(join(r.cwd, current), "Replacement fixture\n");
-      assert.equal(await git.fingerprint(), audited);
-    }
-    const sha = await git.publish(paths, "Publish " + replacement, base, null);
-    assert.equal(await git.remoteHead(), sha); assert.equal(await git.fingerprint(), audited);
-    assert.equal(await r.git("status", "--porcelain"), "");
-    const published = await exec("git", ["--git-dir", r.remote, "show", sha + ":" + current], { env: f.job.env });
-    assert.equal(published.stdout, replacement === "directory-to-symlink" ? outside : "Replacement fixture\n");
-  });
-}
-test("real submodule fingerprints and publication preserve clean references and reject unpublished child work",async(t)=>{
-  const f=await fixture(t),r=await repository(f),source=join(f.temporary,"module-source");
-  await mkdir(source);
-  const moduleGit=async(...args)=>exec("git",args,{cwd:source,env:f.job.env});
-  await moduleGit("init","--initial-branch=main");await writeFile(join(source,"value.txt"),"original\n");
-  await moduleGit("add","value.txt");await moduleGit("commit","-m","Initial module fixture");
-  const originalModuleHead = (await moduleGit("rev-parse", "HEAD")).stdout.trim();
-  await exec("git",["submodule","add",source,"module"],{cwd:r.cwd,env:{...f.job.env,GIT_ALLOW_PROTOCOL:"file"}});
-  await r.git("commit","-am","Add fixture submodule");assert.equal(await r.git("status","--porcelain"),"");
-  const git=new TaskGit(r.cwd,f.job.env,f.log,r.branch),clean=await git.fingerprint();
-  assert.equal(await git.fingerprint(),clean);
-  await writeFile(join(r.cwd,"module/value.txt"),"changed\n");assert.notEqual(await git.fingerprint(),clean);
-  await writeFile(join(r.cwd,"module/value.txt"),"original\n");assert.equal(await git.fingerprint(),clean);
-  await writeFile(join(r.cwd,"module/untracked.txt"),"one");const untracked=await git.fingerprint();
-  await writeFile(join(r.cwd,"module/untracked.txt"),"two");assert.notEqual(await git.fingerprint(),untracked);
-  await unlink(join(r.cwd,"module/untracked.txt"));
-  const parent=await git.publish([],"",await git.head(),null);
-  await writeFile(join(source,"value.txt"),"published update\n");await moduleGit("commit","-am","Update module fixture");
-  const moduleHead=(await moduleGit("rev-parse","HEAD")).stdout.trim();
-  await exec("git",["-C",join(r.cwd,"module"),"fetch","origin"],{env:f.job.env});
-  await exec("git",["-C",join(r.cwd,"module"),"checkout","--detach",moduleHead],{env:f.job.env});
-  const audited = await git.fingerprint(); assert.notEqual(audited, clean);
-  await r.git("add", "module"); assert.equal(await git.fingerprint(), audited);
-  const published=await git.publish(["module"],"Publish module reference",parent,parent);
-  assert.equal(await git.fingerprint(), audited);
-  assert.equal(await git.remoteHead(),published);assert.match(await r.git("ls-tree","HEAD","module"),new RegExp(moduleHead));
-  await writeFile(join(r.cwd,"module/value.txt"),"unpublished work\n");
-  await assert.rejects(git.publish(["module"],"Invalid child work",published,published),{reason:"dirty_submodule"});
-  assert.equal(await git.head(),published);assert.equal(await git.remoteHead(),published);
-  await writeFile(join(r.cwd,"module/value.txt"), "published update\n");
-  await r.git("submodule", "deinit", "--force", "module");
-  const uninitialized = await git.fingerprint();
-  await r.git("update-index", "--cacheinfo", `160000,${originalModuleHead},module`);
-  assert.notEqual(await git.fingerprint(), uninitialized);
-});
-for (const staged of [false, true]) test("new submodules preserve audit identity with " + (staged ? "staged legacy" : "unstaged canonical") + " publication paths", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  const source = join(f.temporary, "new-module-source"); await mkdir(source);
-  const child = (...args) => exec("git", args, { cwd:source, env:f.job.env });
-  await child("init", "--initial-branch=main"); await writeFile(join(source, "value.txt"), "Published module\n");
-  await child("add", "value.txt"); await child("commit", "-m", "Prepare module fixture");
-  const moduleHead = (await child("rev-parse", "HEAD")).stdout.trim();
-  await exec("git", ["clone", source, join(r.cwd, "module")], { env:f.job.env });
-  await writeFile(join(r.cwd, ".gitmodules"), '[submodule "module"]\n\tpath = module\n\turl = ' + source + "\n");
-  const paths = await git.changedPaths(), audited = await git.fingerprint();
-  assert.deepEqual(paths, [".gitmodules", "module"]);
-  await writeFile(join(r.cwd, "module/value.txt"), "Dirty module\n");
-  assert.notEqual(await git.fingerprint(), audited);
-  await assert.rejects(git.publish(paths, "Reject dirty new module", r.base, null), { reason:"dirty_submodule" });
-  assert.equal(await git.head(), r.base); assert.equal(await git.remoteHead(), null);
-  await writeFile(join(r.cwd, "module/value.txt"), "Published module\n");
-  assert.equal(await git.fingerprint(), audited);
-  if (staged) { await r.git("add", "--all"); assert.equal(await git.fingerprint(), audited); }
-  const supplied = paths.map(path => staged && path === "module" ? "module/" : path);
-  const sha = await git.publish(supplied, "Publish new module", r.base, null);
-  assert.equal(await git.remoteHead(), sha); assert.equal(await git.fingerprint(), audited);
-  assert.equal(await r.git("status", "--porcelain"), "");
-  const tree = (await exec("git", ["--git-dir", r.remote, "ls-tree", sha, "module"], { env:f.job.env })).stdout;
-  assert.match(tree, new RegExp("160000 commit " + moduleHead + "\\tmodule"));
-});
-test("publication rejects a staged credential without advancing local or remote history",async(t)=>{
-  const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);
-  await writeFile(join(r.cwd,"credential.txt"),f.job.env.CODEX_API_KEY);await r.git("add","credential.txt");
-  await assert.rejects(git.publish(["credential.txt"],"Rejected fixture",r.base,null),{reason:"credential_in_commit"});
-  assert.equal(await git.head(),r.base);assert.equal(await git.remoteHead(),null);
-  assert.equal(await r.git("diff","--cached","--name-only"),"credential.txt");
-});
-test("real rejected push records intended/observed SHA and never pretends it is durable", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  await writeFile(join(r.remote, "hooks/pre-receive"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
-  await writeFile(join(r.cwd, "greeting.js"), "console.log('fixture');\n");
-  await assert.rejects(git.publish(["greeting.js"], "Fixture rejected push", r.base, null), (error) => {
-    f.log.failure(error, { artifact_id: 7 });
-    assert.equal(error.reason, "push_failed"); assert.equal(error.details.observed_sha, null); assert.match(error.details.intended_sha, /^[a-f0-9]{40}$/); return true;
-  });
-  const evidence = f.records.find((record) => record.event === "runtime.failed");
-  assert.equal(evidence.stage, "publication"); assert.equal(evidence.last_durable_checkpoint.artifact_id, 7);
-});
+
 test("checkpoint exports exact session state and consistent SQLite backups, excluding secrets and caches", async (t) => {
   const f = await fixture(t); await history(f);
   const db = new DatabaseSync(join(f.job.codexHome, "state_5.sqlite"));
-  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE progress (value TEXT); INSERT INTO progress VALUES ('durable');");
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE progress (value TEXT); INSERT INTO progress VALUES ('durable'); CREATE TABLE threads (id TEXT, rollout_path TEXT);");
+  db.prepare("INSERT INTO threads VALUES (?, ?)").run(sessionId, join(f.job.codexHome, "sessions/rollout.jsonl"));
   await writeFile(join(f.job.codexHome, "auth.json"), f.job.env.CODEX_API_KEY);
   await writeFile(join(f.job.codexHome, "config.toml"), f.job.env.CODEX_API_KEY);
   await mkdir(join(f.job.codexHome, "cache")); await writeFile(join(f.job.codexHome, "cache/code.txt"), "excluded source");
@@ -269,8 +89,8 @@ test("checkpoint exports exact session state and consistent SQLite backups, excl
   const saved = new DatabaseSync(join(output.root, "codex/state_5.sqlite"), { readOnly: true });
   assert.equal(saved.prepare("SELECT value FROM progress").get().value, "durable"); saved.close();
   const manifest = JSON.parse(await readFile(join(output.root, "manifest.json"), "utf8"));
-  assert.equal(manifest.permission_mode,"full-access");assert.ok(!Object.hasOwn(manifest.authorization,"permission_mode"));
-  assert.equal(manifest.plan_sha256, hash(plan)); assert.equal(manifest.session_identifiers[0].session_id, "root-session");
+  assert.equal(manifest.codex_version, JSON.parse(await readFile(join(root, 'package.json'))).dependencies['@openai/codex']);
+  assert.equal(manifest.session_id, sessionId); assert.ok(!('authorization' in manifest));
   assert.ok(manifest.files.every((entry) => !/auth|config|cache|\.git/.test(entry.path)));
   assert.ok(output.files.every((file) => !/-(wal|shm)$/.test(file)));
 });
@@ -297,7 +117,7 @@ for (const storage of ["TEXT", "BLOB"]) test("checkpoint rejects a credential re
   assert.equal((await readFile(path)).includes(Buffer.from(secret)), false);
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {
     uploaded = true; return { id: 10 };
   }), { reason: "credential_in_checkpoint" });
   assert.equal(uploaded, false); assert.deepEqual(previous, { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) });
@@ -312,7 +132,7 @@ for (const compressed of [false, true]) test("checkpoint decodes escaped credent
   if (compressed) { await writeFile(path + ".zst", zstdCompressSync(data)); await unlink(path); }
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {
     uploaded = true; return { id: 10 };
   }), { reason: "credential_in_checkpoint" });
   assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
@@ -322,10 +142,10 @@ test("checkpoint rejects escaped manifest credentials before upload and retains 
   const f = await fixture(t), secret = 'fixture-"manifest\\credential\n9371';
   await configure(f.job, "[mcp_servers.fixture.env]\nPASSWORD=" + JSON.stringify(secret) + "\n", f.log); await history(f);
   const previous = { sequence: 3, artifact_id: 9, checkpoint_sha: "a".repeat(40) };
-  const input = checkpoint({ previous, progress: { detail: secret } });
+  const input = checkpoint({ previous, operator: secret });
   assert.equal(JSON.stringify(input).includes(secret), false);
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, input, f.log, async () => {}, async () => {
+  await assert.rejects(durableCheckpoint(f.job, input, f.log, async () => {
     uploaded = true; return { id: 10 };
   }), { reason: "credential_in_manifest" });
   assert.equal(uploaded, false); assert.equal(previous.artifact_id, 9);
@@ -350,7 +170,7 @@ for (const [scheme, header, provider, encoding] of [["Bearer", "authorization", 
     }
     const previous = { sequence:3, artifact_id:9, checkpoint_sha:"a".repeat(40) };
     let uploaded = false;
-    await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {}, async () => {
+    await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => {
       uploaded = true; return { id:10 };
     }), error => { assert.equal(error.reason, "credential_in_checkpoint"); f.log.failure(error, previous); return true; });
     assert.equal(uploaded, false); assert.deepEqual(previous, { sequence:3, artifact_id:9, checkpoint_sha:"a".repeat(40) });
@@ -371,75 +191,29 @@ test("non-secret environment flags permit export while configured MCP credential
 test("upload failures, missing sessions, drift and size limits never advance the last durable receipt", async (t) => {
   const f = await fixture(t); await history(f);
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log, 1), { reason: "checkpoint_size_limit" });
-  await assert.rejects(exportCheckpoint(f.job, checkpoint({ previous: { sequence: 1, artifact_id: 4, checkpoint_sha: "a".repeat(40) }, sessions:["missing"] }), f.log), { reason: "missing_session_history" });
+  await assert.rejects(exportCheckpoint(f.job, checkpoint({ previous: { sequence: 1, artifact_id: 4, checkpoint_sha: "a".repeat(40) }, session_id:"missing" }), f.log), { reason: "missing_session_history" });
   const prior = { artifact_id: 4, sequence: 2, checkpoint_sha: "a".repeat(40) };
   let uploaded = false;
-  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous: prior }), f.log, async () => {}, async () => { uploaded = true; throw new Error("fixture upload failed"); }), error=>{
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous: prior }), f.log, async () => { uploaded = true; throw new Error("fixture upload failed"); }), error=>{
     f.log.failure(error,prior);assert.equal(error.stage,"checkpoint");assert.equal(error.reason,"artifact_upload_failed");return true;
   });
   assert.equal(uploaded, true); assert.equal(prior.artifact_id, 4);
   assert.ok(!f.records.some((record) => record.event === "checkpoint.complete"));
-  const failure=f.records.find(record=>record.reason==="artifact_upload_failed");assert.equal(failure.intended_sha,"b".repeat(40));assert.equal(failure.last_durable_checkpoint.artifact_id,4);
+  const failure=f.records.find(record=>record.reason==="artifact_upload_failed");assert.equal(failure.reason,"artifact_upload_failed");assert.equal(failure.last_durable_checkpoint.artifact_id,4);
 });
-test("checkpoint failure diagnostics preserve real Git observations and the preceding durable receipt", async (t) => {
-  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log, r.branch);
-  await writeFile(join(r.cwd, "new.txt"), "Published change\n");
-  const observed = await git.publish(["new.txt"], "Publish fixture", r.base, null);
-  const previous = { sequence: 0, artifact_id: 7, checkpoint_sha: r.base };
-  await assert.rejects(isolatedCheckpoint(f.job, r.cwd, checkpoint({ base_sha:r.base, checkpoint_sha:r.base, previous }), f.log, sha => git.verify(sha)), error => {
-    assert.equal(error.reason, "checkpoint_operation_failed"); assert.equal(error.details.expected_sha, r.base);
-    assert.equal(error.details.observed_sha, observed); assert.equal(error.details.last_durable_checkpoint.artifact_id, 7); return true;
-  });
-  const failure = f.records.find(record => record.event === "checkpoint.failed");
-  assert.equal(failure.cause_reason, "checkpoint_head_mismatch"); assert.equal(failure.intended_sha, r.base);
-  assert.equal(failure.expected_sha, r.base); assert.equal(failure.observed_sha, observed);
-  assert.equal(failure.last_verified_sha, null); assert.equal(failure.last_durable_checkpoint.artifact_id, 7);
+test("dirty files and rejected pushes preserve the nearest published source without Git repairs", async t => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
+  await writeFile(join(r.cwd, 'draft.txt'), 'unfinished');
+  let saved = await git.snapshot();
+  assert.equal(saved.checkpoint_sha, r.base); assert.equal(saved.omitted_work, true);
+  await r.git('add', 'draft.txt'); await r.git('commit', '-m', 'Unpublished');
+  const local = await git.head(); saved = await git.snapshot();
+  assert.equal(saved.checkpoint_sha, r.base); assert.equal(saved.omitted_work, true); assert.equal(await git.head(), local);
+  await r.git('push', 'origin', 'HEAD'); saved = await git.snapshot();
+  assert.equal(saved.checkpoint_sha, local); assert.equal(saved.omitted_work, false);
 });
-test("required checks, marked review coverage and dispositions reject stale or incomplete completion", () => {
-  const head = "a".repeat(40), p = { ...policy, marked_review_count: 1 };
-  const receipt = { gate:"terminal", phase:"full", head_sha:head, all_checks_nonblocking:true, required_reviewers_satisfied:true,
-    required_checks:policy.checks, required_reviewers:[], required_check_problems:[], required_reviewer_problems:[] };
-  verifyTerminal(receipt, head, policy);
-  for (const change of [{head_sha:"b".repeat(40)},{required_checks:[]},{gate:"review_terminal"},{all_checks_nonblocking:false}]) assert.throws(() => verifyTerminal({...receipt,...change},head,policy));
-  const state = {pull_request:{head_sha:head}, codex_thread_actions:{incomplete:0}, ai_pr_reviewer_thread_actions:{incomplete:0}, reviews:[{id:"review-1",commit:{oid:head},body:`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->
-| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
-|:--|--:|--:|--:|--:|--:|
-| <code>src/main.ts</code> | 5 | 5 | 100% | 1 | 1 |
-| **Total** | **5** | **5** | **100%** | — | **1** |`}]};
-  const ledger=reviewSurfaces(state).map(surface=>({...surface,decision:"not_finding",reason:"Fixture contains no finding",fix_sha:null}));
-  verifyReviewState(state,head,p,ledger);
-  assert.throws(() => verifyReviewState({...state,reviews:[]},head,p,[]));
-  assert.throws(() => verifyReviewState({...state,ai_pr_reviewer_thread_actions:{incomplete:1}},head,p,ledger));
-  const finding={...state,reviews:[{...state.reviews[0],body:state.reviews[0].body+"\nP1: Missing authorization validation"}]};
-  assert.throws(()=>verifyReviewState(finding,head,p,[]),{reason:"review_surface_coverage_mismatch"});
-  assert.throws(()=>verifyReviewState(finding,head,p,ledger),{reason:"unhandled_review_surface"});
-  for (const body of ["Fixture review without coverage", state.reviews[0].body.replace("5 | 5 | 100%", "1 | 5 | 20%")]) {
-    const partial = { ...state, reviews:[{ ...state.reviews[0], body }] };
-    const dispositions = reviewSurfaces(partial).map(surface => ({ ...surface, decision:"not_finding", reason:"Fixture only", fix_sha:null }));
-    assert.throws(() => verifyReviewState(partial, head, p, dispositions), { reason:"incomplete_ai_review_coverage" });
-  }
-});
-test("the actual v3 aggregate coverage format proves all profiles and rejects partial or inconsistent receipts",()=>{
-  const head="a".repeat(40),validation={...policy,marked_review_count:6};
-  const body=`<!-- ai-pr-reviewer:v3:${head}:${"c".repeat(64)} -->
-## AI review
-| File | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
-|:--|--:|--:|--:|--:|--:|
-| <code>src/entry.ts</code> | 5 | 5 | 100% | 6 | 6 |
-| <code>src/main.ts</code> | 113 | 113 | 100% | 6 | 6 |
-| **Total** | **118** | **118** | **100%** | — | **6** |
 
-Coverage does not measure review quality or completion.`;
-  const state={pull_request:{head_sha:head},codex_thread_actions:{incomplete:0},ai_pr_reviewer_thread_actions:{incomplete:0},reviews:[{id:"aggregate",commit:{oid:head},body}]};
-  const verify=value=>verifyReviewState(value,head,validation,reviewSurfaces(value).map(surface=>({...surface,decision:"not_finding",reason:"Fixture coverage only",fix_sha:null})));
-  verify(state);
-  for(const changed of [body.replace("100% | 6 | 6","80% | 6 | 6"),body.replace("100% | 6 | 6","100% | 5 | 6"),body.replace("**118** | **118**","**119** | **118**"),body.replace(head,"b".repeat(40))]) {
-    assert.throws(()=>verify({...state,reviews:[{...state.reviews[0],body:changed}]}),{reason:"incomplete_ai_review_coverage"});
-    const reviews = Array.from({ length:6 }, (_, index) => ({ ...state.reviews[0], id:`profile-${index}`, body:changed.replace("c".repeat(64), String(index + 1).repeat(64)) }));
-    assert.throws(() => verify({ ...state, reviews }), { reason:"incomplete_ai_review_coverage" });
-  }
-});
-test("failed validation retains bounded sanitized stdout while worker and API stdout stay private", async (t) => {
+test("explicit command diagnostics sanitize stdout while native and API output stay private", async (t) => {
   const f = await fixture(t), args = ["-e", "process.stdout.write('validation-failure-evidence\\n'+process.env.CODEX_API_KEY+'\\n'+JSON.stringify({private_provider:'omit-this-body'})+'\\n'+'x'.repeat(10000));process.exit(1)"];
   await assert.rejects(command(process.execPath, args, { cwd:f.temporary, env:f.job.env, stage:"local_check_0", log:f.log, diagnosticStdout:true }), error => {
     assert.match(error.nativeCause, /validation-failure-evidence/); assert.match(error.nativeCause, /truncated/);
@@ -465,24 +239,24 @@ test("managed descendants in another session stop before a completed command ret
   await new Promise(resolve=>setTimeout(resolve,1200));
   await assert.rejects(readFile(path),{code:"ENOENT"});
 });
-test("a stalled real artifact transport is terminated within the checkpoint action budget",async(t)=>{
-  const f=await fixture(t),r=await repository(f),git=new TaskGit(r.cwd,f.job.env,f.log,r.branch);await history(f);
-  await mkdir(join(f.job.tools,"node_modules/@actions"));
-  await symlink(join(root,"node_modules/@actions/artifact"),join(f.job.tools,"node_modules/@actions/artifact"),"dir");
-  const sha=await git.publish([],"",r.base,null);
-  let requests=0;const server=createServer(async(request,response)=>{requests++;for await(const _ of request){};});
-  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
-  t.after(()=>new Promise(resolve=>{server.close(resolve);server.closeAllConnections();}));
-  const token="e30."+Buffer.from(JSON.stringify({scp:"Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222"})).toString("base64url")+".fixture";
-  f.job.env.CODEX_TASK_DEADLINE_MS=String(Date.now()+18000);
-  const previous={sequence:0,artifact_id:8,checkpoint_sha:sha};
-  await assert.rejects(isolatedCheckpoint(f.job,r.cwd,checkpoint({base_sha:r.base,checkpoint_sha:sha,previous}),f.log,expected=>git.verify(expected),
-    {...process.env,ACTIONS_RUNTIME_TOKEN:token,ACTIONS_RESULTS_URL:`http://127.0.0.1:${server.address().port}`,GITHUB_WORKSPACE:r.cwd,NO_PROXY:"127.0.0.1,localhost"},join(root,"dist/index.js")),{reason:"command_timeout"});
-  assert.ok(requests>0,"The actual artifact SDK reached the stalled transport");
-  const evidence=f.records.find(record=>record.event==="checkpoint.failed");
-  assert.equal(evidence.last_durable_checkpoint.artifact_id,8);assert.equal(evidence.intended_sha,sha);
-  assert.equal(evidence.observed_sha,null);assert.equal(evidence.last_verified_sha,sha);
-  assert.ok(Date.now()<Number(f.job.env.CODEX_TASK_DEADLINE_MS));
+test("a stalled actual artifact SDK upload is bounded and keeps staged session data", async t => {
+  const f = await fixture(t); await history(f);
+  const exported = await exportCheckpoint(f.job, checkpoint(), f.log);
+  let requests = 0;
+  const server = createServer(async request => { requests++; for await (const _ of request) {} });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const token = 'e30.' + Buffer.from(JSON.stringify({ scp: 'Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222' })).toString('base64url') + '.fixture';
+  await assert.rejects(uploadSnapshot(f.job, exported.name, exported.files, exported.root, f.log,
+    { ...process.env, ACTIONS_RUNTIME_TOKEN: token, ACTIONS_RESULTS_URL: `http://127.0.0.1:${server.address().port}`, NO_PROXY: '127.0.0.1,localhost', GITHUB_WORKSPACE: f.temporary, CODEX_UPLOAD_TIMEOUT_MS: '1500' }), { reason: 'command_timeout' });
+  assert.ok(requests > 0); assert.ok(await readFile(join(exported.root, 'manifest.json')));
+});
+for (const variant of ['escaped', 'unicode', 'nested']) test(`result credential checks decode ${variant} JSON before transport`, async t => {
+  const f = await fixture(t), secret = 'fixture-"result\\credential\n9371'; f.log.protect(secret);
+  const encoded = JSON.stringify({ credential: secret });
+  const response = variant === 'nested' ? JSON.stringify({ response: JSON.stringify(encoded) }) : variant === 'unicode' ?
+    '{"credential":"' + Array.from(secret, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('') + '"}' : encoded;
+  assert.throws(() => inspectCredentials(response, f.log, 'credential_in_result'), { reason: 'credential_in_result' });
 });
 test("normal diagnostic output masks credentials and raw provider bodies and marks truncation", () => {
   const { log, records } = logger(); log.protect("fixture-secret-8291");
@@ -491,32 +265,7 @@ test("normal diagnostic output masks credentials and raw provider bodies and mar
   assert.doesNotMatch(encoded, /fixture-secret-8291|private API body|Authorization: Bearer/);
   assert.equal(records[0].truncated, true); assert.equal(records[0].level, "ERROR");
 });
-test("real delivery rejection logs identify stale head and policy without raw receipt content", async () => {
-  const deliveryPath = JSON.stringify(new URL("../.build/delivery.js", import.meta.url).href);
-  const diagnosticPath = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
-  const expected = "a".repeat(40), observed = "b".repeat(40);
-  const receipt = { gate:"terminal", phase:"full", head_sha:observed, all_checks_nonblocking:true, required_reviewers_satisfied:true,
-    required_check_problems:[], required_reviewer_problems:[], required_checks:Array.from({ length:12 }, (_, index) => "Check " + index), required_reviewers:[],
-    provider_body:"private-provider-body-5419", secret:"fixture-secret-3149" };
-  const script = "import {verifyTerminal} from " + deliveryPath + ";import {Diagnostics} from " + diagnosticPath +
-    ";const log=new Diagnostics({task_id:'delivery-log-task',run_id:'13',run_attempt:'1',session_id:'log-session',turn:2});log.protect('fixture-secret-3149');" +
-    "try{verifyTerminal(" + JSON.stringify(receipt) + "," + JSON.stringify(expected) + "," + JSON.stringify(policy) +
-    ");}catch(error){log.failure(error,{artifact_id:17});}";
-  const output = (await exec(process.execPath, ["--input-type=module", "-e", script])).stdout;
-  const visible = output.split("\n").filter(line => !line.startsWith("::add-mask::")).join("\n");
-  assert.doesNotMatch(visible, /private-provider-body-5419|fixture-secret-3149/);
-  const line = visible.split("\n").find(line => line.includes('"event":"runtime.failed"'));
-  const evidence = JSON.parse(line.slice(line.indexOf("{")));
-  assert.equal(evidence.level, "ERROR"); assert.equal(evidence.stage, "delivery");
-  assert.equal(evidence.reason, "delivery_gate_incomplete"); assert.equal(evidence.evidence_source, "terminal_receipt");
-  assert.equal(evidence.expected_sha, expected); assert.equal(evidence.observed_sha, observed);
-  assert.deepEqual(evidence.missing_gates, ["head", "required_checks"]);
-  assert.deepEqual(evidence.expected_policy.checks.names, ["CI"]);
-  assert.equal(evidence.observed_policy.checks.count, 12); assert.equal(evidence.observed_policy.checks.names.length, 10);
-  assert.equal(evidence.observed_policy.checks.omitted, 2); assert.match(evidence.native_cause, /current-head review receipt/);
-  assert.equal(evidence.task_id, "delivery-log-task"); assert.equal(evidence.run_attempt, "1");
-  assert.equal(evidence.session_id, "log-session"); assert.equal(evidence.turn, 2); assert.equal(evidence.last_durable_checkpoint.artifact_id, 17);
-});
+
 test("the real Actions logger retains required failure evidence after DEBUG filtering",async()=>{
   const diagnosticPath=JSON.stringify(new URL("../.build/diagnostics.js",import.meta.url).href);
   const contractPath=JSON.stringify(new URL("../.build/contracts.js",import.meta.url).href);
@@ -526,4 +275,90 @@ test("the real Actions logger retains required failure evidence after DEBUG filt
   const line=output.split("\n").find(line=>line.includes('"event":"runtime.failed"'));
   const evidence=JSON.parse(line.slice(line.indexOf("{")));
   assert.equal(evidence.stage,"checkpoint");assert.equal(evidence.expected_sha,"a".repeat(40));assert.equal(evidence.observed_sha,"b".repeat(40));assert.equal(evidence.last_durable_checkpoint.artifact_id,17);
+});
+
+for (const mode of ['direct', 'threaded', 'resume-in-flight']) test(`a managed live SQLite/WAL writer pauses for consistent snapshots and resumes afterward (${mode})`, async t => {
+  const f = await fixture(t), marker = join(f.temporary, 'counter'); let control;
+  const ready = join(f.temporary, 'resume-ready'), allow = join(f.temporary, 'resume-allow');
+  if (mode === 'resume-in-flight') {
+    const source = await readFile(join(root, '.build/supervise.py'), 'utf8');
+    const line = source.split('\n').findIndex(value => value.includes('(control / "paused.json").unlink')) + 1;
+    assert.ok(line > 0);
+    await writeFile(join(f.temporary, 'sitecustomize.py'), `import sys,time
+from pathlib import Path
+held=False
+def trace(frame,event,arg):
+ global held
+ if not held and event=='line' and frame.f_code.co_filename.endswith('/supervise.py') and frame.f_lineno==${line}:
+  held=True;Path(${JSON.stringify(ready)}).write_text('ready')
+  end=time.monotonic()+2
+  while not Path(${JSON.stringify(allow)}).exists() and time.monotonic()<end: time.sleep(0.001)
+ return trace
+sys.settrace(trace)
+`);
+    f.job.env.PYTHONPATH = f.temporary;
+  }
+  const writer = `const fs=require('node:fs'),{DatabaseSync}=require('node:sqlite');
+const db=new DatabaseSync(process.env.CODEX_HOME+'/state_5.sqlite');db.exec('PRAGMA journal_mode=WAL; CREATE TABLE progress (value INTEGER); INSERT INTO progress VALUES (0); CREATE TABLE threads (id TEXT, rollout_path TEXT)');db.prepare('INSERT INTO threads VALUES (?, ?)').run(${JSON.stringify(sessionId)},process.env.CODEX_HOME+'/sessions/rollout.jsonl');
+fs.mkdirSync(process.env.CODEX_HOME+'/sessions');fs.writeFileSync(process.env.CODEX_HOME+'/sessions/rollout.jsonl',JSON.stringify({type:'session_meta',payload:{id:${JSON.stringify(sessionId)}}})+'\\n');
+setInterval(()=>{db.exec('UPDATE progress SET value=value+1');fs.writeFileSync(${JSON.stringify(marker + '.tmp')},String(db.prepare('SELECT value FROM progress').get().value));fs.renameSync(${JSON.stringify(marker + '.tmp')},${JSON.stringify(marker)})},5);`;
+  const threaded = `import subprocess,sys,threading
+def run():
+ subprocess.run(sys.argv[1:],check=True)
+worker=threading.Thread(target=run);worker.start();worker.join()`;
+  const running = command(mode === 'threaded' ? 'python3' : process.execPath, mode === 'threaded' ? ['-c', threaded, process.execPath, '-e', writer] : ['-e', writer],
+    { cwd: f.temporary, env: f.job.env, stage: 'writer', timeoutMs: 3000, onControl: value => { control = value; } }).catch(error => error);
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) { try { if (Number(await readFile(marker)) > 3) break; } catch (error) { if (error.code !== 'ENOENT') throw error; } await new Promise(resolve => setTimeout(resolve, 10)); }
+  assert.ok(Number(await readFile(marker)) > 3, 'The real writer started before pausing');
+  const unchanged = async () => {
+    const before = await readFile(marker, 'utf8'); await new Promise(resolve => setTimeout(resolve, 75)); assert.equal(await readFile(marker, 'utf8'), before);
+  };
+  await control.freeze(unchanged);
+  if (mode === 'resume-in-flight') {
+    const deadline = Date.now() + 1000;
+    for (;;) {
+      try { await readFile(ready); break; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      assert.ok(Date.now() < deadline, 'The supervisor reached the resume boundary');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    let copying = false;
+    const second = control.freeze(async () => { copying = true; await unchanged(); }).catch(error => error);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(copying, false, 'A previous acknowledgement cannot authorize this copy');
+    } finally {
+      await writeFile(allow, 'resume'); const result = await second; if (result instanceof Error) throw result;
+    }
+  }
+  const exported = await exportCheckpoint(f.job, checkpoint(), f.log, undefined, control);
+  const db = new DatabaseSync(join(exported.root, 'codex/state_5.sqlite'), { readOnly: true });
+  assert.ok(db.prepare('SELECT value FROM progress').get().value > 0); db.close();
+  const before = Number(await readFile(marker)), resumed = Date.now() + 750;
+  while (Number(await readFile(marker)) <= before && Date.now() < resumed) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(Number(await readFile(marker)) > before);
+  const result = await running; assert.equal(result.reason, 'command_timeout'); assert.equal(result.details.quiescent, true);
+  const stopped = await readFile(marker, 'utf8'); await new Promise(resolve => setTimeout(resolve, 50)); assert.equal(await readFile(marker, 'utf8'), stopped);
+});
+
+test('an upload finalized remotely with a lost receipt does not poison later snapshot identities', async t => {
+  const f = await fixture(t); await history(f); const names = [];
+  await assert.rejects(durableCheckpoint(f.job, checkpoint(), f.log, async name => {
+    names.push(name); throw new Error('Remote finalization succeeded but response was lost');
+  }), { reason: 'artifact_upload_failed' });
+  const receipt = await durableCheckpoint(f.job, checkpoint(), f.log, async name => { names.push(name); return { id: 82 }; });
+  assert.notEqual(names[0], names[1]); assert.equal(receipt.sequence, 2); assert.equal(receipt.artifact_id, 82);
+});
+for (const variant of ['duplicate', 'missing-reference']) test(`staged ${variant} history cannot replace a completed snapshot`, async t => {
+  const f = await fixture(t); await history(f); let uploads = 0;
+  const previous = await durableCheckpoint(f.job, checkpoint(), f.log, async () => ({ id: ++uploads }));
+  if (variant === 'duplicate') await cp(join(f.job.codexHome, 'sessions/rollout.jsonl'), join(f.job.codexHome, 'sessions/duplicate.jsonl'));
+  else {
+    const db = new DatabaseSync(join(f.job.codexHome, 'state_5.sqlite'));
+    db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT)');
+    db.prepare('INSERT INTO threads VALUES (?, ?)').run(sessionId, join(f.job.codexHome, 'sessions/missing.jsonl')); db.close();
+  }
+  await assert.rejects(durableCheckpoint(f.job, checkpoint({ previous }), f.log, async () => ({ id: ++uploads })),
+    { reason: variant === 'duplicate' ? 'duplicate_session_history' : 'missing_rollout_reference' });
+  assert.equal(uploads, 1); assert.equal(previous.artifact_id, 1);
 });

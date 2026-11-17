@@ -1,18 +1,19 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
-import { mkdtemp, readFile, rmdir, unlink } from "node:fs/promises";
+import { mkdtemp, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RunnerError } from "./contracts.js";
 import { Diagnostics } from "./diagnostics.js";
 
+export type ProcessControl = { directory: string; nonce: string; freeze<T>(copy: () => Promise<T>): Promise<T> };
 export type CommandOptions = { cwd: string; env: NodeJS.ProcessEnv; stage: string; log?: Diagnostics; timeoutMs?: number;
-  stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown> };
+  onControl?: (control: ProcessControl) => void; stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown> };
 export async function command(executable: string, args: string[], options: CommandOptions) {
   if (options.env.CODEX_TASK_CANCELLED === "1") throw new RunnerError("command_cancelled", options.stage, "Task cancellation is latched; no new operation was started.");
   const started = Date.now();
-  const timeoutMs = Math.min(options.timeoutMs ?? 180000, Number(options.env.CODEX_TASK_DEADLINE_MS ?? Infinity) - started - 11000);
+  const timeoutMs = options.timeoutMs ?? 180000;
   if (timeoutMs <= 0) throw new RunnerError("command_timeout", options.stage, "Task budget exhausted before command startup.");
   const control = await mkdtemp(join(options.env.TMPDIR ?? tmpdir(), "codex-process-"));
   const receiptPath = join(control, "quiescent.json"), nonce = randomUUID();
@@ -27,8 +28,9 @@ export async function command(executable: string, args: string[], options: Comma
   const heartbeat = setInterval(() => options.log?.event("runtime.heartbeat", "INFO", {
     stage: options.stage, ...options.context, elapsed_ms: Date.now() - started, timeout_ms: timeoutMs,
   }), 60000);
-  const timer = setTimeout(() => { timeout = true; signal("SIGTERM"); }, timeoutMs);
-  const hardTimer = setTimeout(() => signal("SIGKILL"), timeoutMs + 5000);
+  const timer = Number.isFinite(timeoutMs) ? setTimeout(() => { timeout = true; signal("SIGTERM"); }, timeoutMs) : undefined;
+  const hardTimer = Number.isFinite(timeoutMs) ? setTimeout(() => signal("SIGKILL"), timeoutMs + 5000) : undefined;
+  options.onControl?.(processControl(control, nonce));
   child.stdout?.setEncoding("utf8"); child.stderr?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
     if (options.collect !== false) { if (stdout.length + chunk.length <= 16 * 1024 * 1024) stdout += chunk; else overflow = true; }
@@ -66,7 +68,8 @@ export async function command(executable: string, args: string[], options: Comma
         if (cause.length > 8192) cause = cause.slice(0, 8192) + `...[truncated ${cause.length - 8192} characters]`;
       }
       throw new RunnerError(cancelled ? "command_cancelled" : timeout ? "command_timeout" : overflow ? "command_output_limit" : !drained ? "command_output_not_closed" : "command_failed",
-        options.stage, cause, { exit_code: code, executable: executable.split("/").pop(), elapsed_ms: Date.now() - started, quiescent: receipt?.quiescent === true });
+        options.stage, cause, { exit_code: code, signal: child.signalCode, executable: executable.split("/").pop(), elapsed_ms: Date.now() - started,
+          timeout_ms: timeoutMs, deadline_ms: started + timeoutMs, quiescent: receipt?.quiescent === true });
     }
     options.log?.event("runtime.operation", "INFO", { stage: options.stage, outcome: "success", quiescent: true, elapsed_ms: Date.now() - started });
     return stdout;
@@ -74,7 +77,29 @@ export async function command(executable: string, args: string[], options: Comma
     clearInterval(heartbeat); clearTimeout(timer); clearTimeout(hardTimer);
     process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel);
     if (fd !== undefined) closeSync(fd);
-    try { await unlink(receiptPath); } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+    for (const name of ["quiescent.json", "pause", "paused.json", "paused.tmp"]) {
+      try { await unlink(join(control, name)); } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+    }
     await rmdir(control);
   }
+}
+
+export function processControl(directory: string, nonce: string): ProcessControl {
+  return { directory, nonce, async freeze(copy) {
+    const request = randomUUID();
+    await writeFile(join(directory, "pause"), request, { mode: 0o600 });
+    try {
+      const deadline = Date.now() + 5000;
+      for (;;) {
+        try {
+          const paused = JSON.parse(await readFile(join(directory, "paused.json"), "utf8"));
+          if (paused.nonce === nonce && paused.request === request) break;
+        }
+        catch (error: any) { if (error.code !== "ENOENT") throw error; }
+        if (Date.now() >= deadline) throw new RunnerError("snapshot_pause_failed", "checkpoint");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      return await copy();
+    } finally { await unlink(join(directory, "pause")).catch(error => { if (error.code !== "ENOENT") throw error; }); }
+  } };
 }
