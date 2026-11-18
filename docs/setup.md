@@ -62,22 +62,17 @@ storage paths and credential files, so those do not need TOML settings.
 
 ### Claude: CLAUDE_SETTINGS_JSON
 
-Use native Claude settings JSON, without Markdown fences. For example:
-
-```json
-{"model":"claude-sonnet-4-6","effortLevel":"high"}
-```
+Set `CLAUDE_SETTINGS_JSON` to the raw JSON in the
+[sample settings](../examples/claude-settings.json).
 
 Use a model available to your account. Store its API key in `ANTHROPIC_API_KEY`.
-For an Anthropic Messages-compatible gateway, add
-`"env": {"ANTHROPIC_BASE_URL":"https://your-gateway.example"}` to the settings.
+For an Anthropic Messages-compatible gateway, replace `env.ANTHROPIC_BASE_URL`
+with the gateway's base URL.
 See the [native settings reference](https://code.claude.com/docs/en/settings).
 
-Optionally provide `CLAUDE_MCP_CONFIG_JSON` with native MCP definitions:
-
-```json
-{"mcpServers":{"example":{"type":"http","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer YOUR_MCP_TOKEN"}}}}
-```
+To configure optional MCP servers, use the
+[sample MCP configuration](../examples/claude-mcp-config.json). Replace the URL
+and bearer token in your copy and store it in `CLAUDE_MCP_CONFIG_JSON`.
 
 Repository `.mcp.json` discovery also remains available. Keep private credentials
 in Actions secrets. The platform controls storage, Git credentials, persistence,
