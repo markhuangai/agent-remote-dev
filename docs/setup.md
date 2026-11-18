@@ -211,6 +211,19 @@ previous run ID and a file containing the additional context:
 gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev --ref main -f runner=claude -f resume-run-id=RUN_ID -F plan=@context.md
 ```
 
+## Install the remote-dev skill
+
+Use `$remote-dev` in Codex to dispatch, inspect, resume, or cancel remote
+development runs. Run this command from a consumer repository root.
+
+```bash
+npx skills add markhuangai/agent-remote-dev --skill remote-dev --agent codex --yes
+```
+
+The CLI installs the skill under `.agents/skills/remote-dev/`. Codex discovers
+the [checked-in skill](../.agents/skills/remote-dev/SKILL.md) automatically in
+this repository.
+
 ## Reuse the workflow from another repository
 
 Releases have not been published. Until a maintainer publishes a version, use an
@@ -328,9 +341,10 @@ native execution returned normally; inspect the response for task completion.
 
 Finish existing sessions before upgrading. Rename `.remote-codex.yml` to
 `.remote-dev.yml`, rename `user-level-agents.md-url` to `user-level-md-url`, update
-the reusable workflow reference to `remote-dev.yml`, and install the renamed
-`remote-dev` dispatch skill. Old names have no aliases. Add and forward the
-`runner` dispatch input. Schema-4 checkpoints are unsupported by this release.
+the reusable workflow reference to `remote-dev.yml`, and
+[install the renamed dispatch skill](#install-the-remote-dev-skill).
+Old names have no aliases. Add and forward the `runner` dispatch input.
+Schema-4 checkpoints are unsupported by this release.
 Select the original runner on manual resume; a runner or pinned-version mismatch
 stops restoration. Automatic continuation preserves the recorded runner.
 
@@ -343,9 +357,9 @@ gh run cancel RUN_ID --repo OWNER/REPO
 ```
 
 Substitute your default branch and caller filename. The optional
-[remote-dev skill](../skills/remote-dev/SKILL.md) contains only Markdown and teaches
-an agent to use GitHub CLI or GitHub MCP. An uncertain dispatch response requires
-inspection of existing runs before another submission.
+[remote-dev skill](#install-the-remote-dev-skill) guides agents using GitHub CLI
+or GitHub MCP. An uncertain dispatch response requires inspection of existing
+runs before another submission.
 
 A fresh run requires a plan. Resume selects the newest completed snapshot from
 the requested run's latest attempt and uses its explicit native session ID.
