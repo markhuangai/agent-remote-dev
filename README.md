@@ -10,6 +10,8 @@ conversation snapshots and cross-run resume.
 
 Follow the [setup guide](docs/setup.md) for configuration examples, credentials
 and instructions for running a task in this repository or another repository.
+To use `$remote-dev` in another repository,
+[install the dispatch skill](docs/setup.md#install-the-remote-dev-skill).
 
 ## How it works
 
