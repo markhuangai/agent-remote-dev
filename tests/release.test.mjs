@@ -15,6 +15,7 @@ test('release channels accept immutable versions and major channels and inspect 
 const source = 'b'.repeat(40);
 const old = 'a'.repeat(40);
 const other = 'c'.repeat(40);
+const diverged = 'd'.repeat(40);
 const absentOid = '0'.repeat(40);
 const published = (tag_name, flags = {}) => ({ tag_name, draft: false, prerelease: false, ...flags });
 
@@ -46,7 +47,12 @@ function publication(version, { releases = [], tags = {} } = {}) {
       assert.equal(method, 'GET');
       if (!endpoint) return { data: { default_branch: 'main', node_id: 'fixture-node' } };
       if (endpoint.startsWith('/commits/')) return { data: { sha: source } };
-      if (endpoint.startsWith('/compare/')) return { data: { status: 'ahead' } };
+      if (endpoint.startsWith('/compare/')) {
+        const [base, head] = endpoint.slice('/compare/'.length).split('...');
+        assert.ok(head === 'main' || head === source);
+        if (base === source) return { data: { status: 'identical' } };
+        return { data: { status: [old, other].includes(base) ? 'ahead' : 'diverged' } };
+      }
       if (endpoint === `/collaborators/${actor}/permission`) return { data: { permission: 'maintain' } };
       if (endpoint === `/contents/.remote-dev.yml?ref=${source}`) {
         return { data: { type: 'file', encoding: 'base64', size: config.length, content: config.toString('base64') } };
@@ -122,6 +128,15 @@ for (const [description, version, releases, tags, aliasNames, latestVersion] of 
     assert.equal(JSON.parse(fixture.output.at(-1)).outcome, 'verified');
   });
 }
+
+test('preflight refuses a diverged major or latest tag before publication', async () => {
+  for (const tag of ['v1', 'latest']) {
+    const fixture = publication('v1.1.0', { releases: [published('v1.0.0')],
+      tags: { v1: old, latest: old, [tag]: diverged } });
+    await assert.rejects(fixture.preflight(), /release_alias_not_forward/);
+    assert.ok(fixture.calls.every(call => call.method === 'GET'));
+  }
+});
 
 test('concurrent alias changes preserve the published version and log the atomic update failure', async t => {
   const fixture = publication('v1.1.0', { releases: [published('v1.0.0')], tags: { v1: old, latest: old } });
