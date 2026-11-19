@@ -4,9 +4,10 @@ import { command } from "./process.js";
 import { Job } from "./setup.js";
 import { Diagnostics } from "./diagnostics.js";
 import type { ProcessControl } from "./process.js";
-import { RunnerError } from "./contracts.js";
-import { parse, stringify } from "smol-toml";
+import { object, RunnerError } from "./contracts.js";
+import { parse, stringify, type TomlTable } from "smol-toml";
 import { protectConfiguration } from "./credentials.js";
+import { readRepositoryMcpFile, type McpConfiguration } from "./mcp-config.js";
 
 // Command arguments can contain unpublished task content even after credential redaction.
 const commandNames = new Set(["cat", "head", "tail", "sed", "rg", "ls", "find", "pwd", "git", "gh", "npm", "npx", "node",
@@ -75,13 +76,59 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
   return { session: observed, result: await readFile(output, "utf8") };
 }
 
-export async function configureCodex(job: Job, raw: string, log: Diagnostics, _mcp = "") {
-  let config: any;
-  try { config = parse(raw); } catch { throw new RunnerError("invalid_codex_config", "configuration", "Codex TOML could not be parsed; configuration contents withheld."); }
+function parseCodexConfig(raw: string, source: "CODEX_CONFIG_TOML" | ".codex/config.toml", log: Diagnostics) {
+  let config: TomlTable;
+  try { config = parse(raw); }
+  catch { throw new RunnerError("invalid_codex_config", "configuration", "Codex TOML could not be parsed; configuration contents withheld.", { source }); }
+  const mcpServers = config.mcp_servers ?? {};
+  if (!object(mcpServers)) {
+    throw new RunnerError("invalid_codex_config", "configuration", "Expected an mcp_servers table.", { source });
+  }
   protectConfiguration(config, log);
+  return { config, mcpServers };
+}
+
+function stringMap(value: unknown): value is Record<string, string> {
+  return object(value) && Object.values(value).every(item => typeof item === "string");
+}
+
+function translateMcpServer(name: string, definition: Record<string, unknown>, source: string, log: Diagnostics): TomlTable | undefined {
+  const { type = "stdio", command, args, env, url, headers } = definition;
+  const invalid = () => new RunnerError("invalid_mcp_server", "configuration", "Check the required fields for this MCP transport.", { source, server: name });
+  if (type === "stdio") {
+    if (typeof command !== "string" || !command.trim() ||
+      (args !== undefined && (!Array.isArray(args) || !args.every(arg => typeof arg === "string"))) ||
+      (env !== undefined && !stringMap(env))) throw invalid();
+    return { command, ...(args === undefined ? {} : { args }), ...(env === undefined ? {} : { env }) };
+  }
+  if (type === "http" || type === "streamable-http") {
+    if (typeof url !== "string" || !url.trim() || (headers !== undefined && !stringMap(headers))) throw invalid();
+    return { url, ...(headers === undefined ? {} : { http_headers: headers }) };
+  }
+  if (typeof type !== "string") throw invalid();
+  log.event("runtime.setup", "WARN", { stage: "configuration", outcome: "skipped", reason: "unsupported_mcp_transport",
+    source, server: name, corrective_action: "Use stdio or Streamable HTTP to run this server with Codex." });
+}
+
+export async function configureCodex(job: Job, raw: string, log: Diagnostics, mcp: McpConfiguration) {
+  const { config, mcpServers } = parseCodexConfig(raw, "CODEX_CONFIG_TOML", log);
+  const projectToml = mcp.cwd ? await readRepositoryMcpFile(mcp.cwd, ".codex/config.toml") : undefined;
+  const projectNative = projectToml === undefined ? {} : parseCodexConfig(projectToml, ".codex/config.toml", log).mcpServers;
+  const servers = new Map(Object.entries(mcpServers));
+  // Codex merges native tables field by field, so remove shadowed entries before it loads the project layer.
+  for (const name of Object.keys(projectNative)) servers.delete(name);
+  for (const [name, definition] of Object.entries({ ...mcp.shared, ...mcp.repository })) {
+    if (Object.hasOwn(projectNative, name)) continue;
+    servers.delete(name);
+    const source = Object.hasOwn(mcp.repository, name) ? ".mcp.json" : "MCP_CONFIG_JSON";
+    const translated = translateMcpServer(name, definition, source, log);
+    if (translated) servers.set(name, translated);
+  }
+  if (config.mcp_servers !== undefined || servers.size) config.mcp_servers = Object.fromEntries(servers);
   for (const key of ["sqlite_home", "log_dir", "sandbox_mode", "sandbox_workspace_write", "approval_policy", "default_permissions", "permissions", "skills", "allow_login_shell", "cli_auth_credentials_store", "mcp_oauth_credentials_store"]) delete config[key];
   Object.assign(config, { sqlite_home: job.runnerHome, log_dir: join(job.root, "logs"), allow_login_shell: false,
     cli_auth_credentials_store: "file", mcp_oauth_credentials_store: "file", skills: { bundled: { enabled: false } } });
   await writeFile(join(job.runnerHome, "config.toml"), stringify(config), { mode: 0o600 });
-  log.event("runtime.setup", "INFO", { stage: "configuration", outcome: "success", paths: { home: job.home, runner_home: job.runnerHome } });
+  log.event("runtime.setup", "INFO", { stage: "configuration", outcome: "success",
+    mcp_servers: [...servers.keys(), ...Object.keys(projectNative)], paths: { home: job.home, runner_home: job.runnerHome } });
 }

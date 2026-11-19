@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
 import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,7 +11,7 @@ import { restoreCheckpoint, validateCheckpoint, unpackArchive } from '../.build/
 import { drive } from '../.build/driver.js';
 import { TaskGit } from '../.build/git.js';
 import { watchSnapshots } from '../.build/checkpoint-worker.js';
-import { checkpoint, exec, fixture, repository, root, sessionId } from './helpers.mjs';
+import { checkpoint, exec, fixture, mcpProvider, repository, root, sessionId } from './helpers.mjs';
 import { call, claudeProvider, text } from './claude-provider.mjs';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -25,6 +24,9 @@ test('runner selection requires only the selected native secrets and isolates pr
     const env = { REMOTE_DEV_RUNNER: runner, REMOTE_DEV_GITHUB_TOKEN: 'fixture-github-token',
       ...(runner === 'codex' ? { CODEX_API_KEY: 'fixture-codex-key', CODEX_CONFIG_TOML: 'model="test"' } : { ANTHROPIC_API_KEY: 'fixture-claude-key', CLAUDE_SETTINGS_JSON: '{}' }) };
     assert.equal(runnerInputs(env).runner, runner);
+    assert.equal(runnerInputs(env).mcp, '');
+    const mcp = JSON.stringify({ mcpServers: {} });
+    assert.equal(runnerInputs({ ...env, MCP_CONFIG_JSON: mcp }).mcp, mcp);
     assert.throws(() => runnerInputs({ ...env, ...(runner === 'codex' ? { CODEX_API_KEY: '' } : { ANTHROPIC_API_KEY: '' }) }), /invalid_credential_input/);
     const f = await fixture(t, runner);
     assert.equal(f.job.env[runner === 'codex' ? 'ANTHROPIC_API_KEY' : 'CODEX_API_KEY'], undefined);
@@ -43,7 +45,7 @@ test('Claude JSON configuration protects secrets and reserves permission, creden
   assert.ok(!f.log.protectedValues.includes('1'));
   await assert.rejects(configure(f.job, '[broken', f.log), /invalid_claude_config/);
   await assert.rejects(configure(f.job, '[]', f.log), /invalid_claude_config/);
-  await assert.rejects(configure(f.job, '{}', f.log, '{"mcpServers":[]}'), /invalid_claude_config/);
+  await assert.rejects(configure(f.job, '{}', f.log, '{"mcpServers":[]}'), { reason: 'invalid_mcp_config', details: { source: 'MCP_CONFIG_JSON' } });
   await installTools(f.job, root, f.log);
   assert.equal(f.records.find(record => record.stage === 'tools').runner_version, versions.claude);
 });
@@ -150,34 +152,62 @@ test('real Claude cold resume consumes generated task, subagent, tool and memory
   assert.ok(captured.includes(freshMemory), 'Fresh native context loads memory absent from conversation history');
   assert.ok(!(await safeTree(fresh.job.runnerHome)).some(path => path.endsWith('auth.json')));
 });
-test('real Claude loads private and repository MCP servers through native discovery', async t => {
-  const f = await fixture(t, 'claude'), r = await repository(f), received = [];
-  const server = createServer(async (request, response) => {
-    if (request.method !== 'POST') { response.writeHead(405); response.end(); return; }
-    const chunks = []; for await (const chunk of request) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString()); received.push({ method: body.method, path: request.url, authorization: request.headers.authorization });
-    if (!('id' in body)) { response.writeHead(202); response.end(); return; }
-    const result = body.method === 'initialize' ? { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } } :
-      body.method === 'tools/list' ? { tools: [{ name: 'ping', description: 'MCP fixture ping', inputSchema: { type: 'object', properties: {} } }] } :
-      { content: [{ type: 'text', text: 'MCP transport result 8194' }] };
-    response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }));
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
-  const definition = { type: 'http', url: `http://127.0.0.1:${server.address().port}/mcp`, headers: { Authorization: 'Bearer private-mcp-token-8194' } };
-  await writeFile(join(r.cwd, '.mcp.json'), JSON.stringify({ mcpServers: { repository: { ...definition, url: definition.url + '/repository' } } }));
-  const api = await claudeProvider(t, [[call('mcp__private__ping', {}, 'private-ping')], [call('mcp__repository__ping', {}, 'repo-ping')], [text('MCP complete.')]]);
-  await configure(f.job, api.config, f.log, JSON.stringify({ mcpServers: { private: definition } }));
-  await runClaude(f.job, r.cwd, 'Use the private MCP ping.', f.log, 90000, 'mcp');
-  assert.ok(received.some(request => request.method === 'tools/call' && request.path === '/mcp'));
-  assert.ok(received.some(request => request.method === 'tools/call' && request.path === '/mcp/repository'));
-  assert.ok(received.every(request => request.authorization === definition.headers.Authorization));
+for (const source of ['shared', 'repository']) test(`real Claude loads MCP when only the ${source} configuration is present`, async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f), mcp = await mcpProvider(t);
+  const definition = { type: 'http', url: mcp.url + '/' + source };
+  const authorization = source === 'shared' ? 'Bearer fixture-shared-claude-token-2745' : undefined;
+  if (authorization) definition.headers = { Authorization: authorization };
+  const config = JSON.stringify({ mcpServers: { probe: definition } });
+  if (source === 'repository') await writeFile(join(r.cwd, '.mcp.json'), config);
+  const api = await claudeProvider(t, [[call('mcp__probe__ping', {}, 'standalone-ping')], [text('MCP complete.')]]);
+  await configure(f.job, api.config, f.log, source === 'shared' ? config : '', r.cwd);
+  await runClaude(f.job, r.cwd, 'Use the configured MCP tool.', f.log, 90000, 'standalone');
+  assert.ok(mcp.requests.some(request => request.method === 'tools/call'));
+  assert.ok(mcp.requests.every(request => request.path === '/' + source && request.authorization === authorization));
+});
+test('real Claude uses whole repository MCP entries over private user entries on fresh and resumed runs', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f), mcp = await mcpProvider(t);
+  const token = 'private-mcp-token-8194';
+  const definition = path => ({ type: 'http', url: mcp.url + path });
+  const privateDefinition = path => ({ ...definition(path), headers: { Authorization: 'Bearer ' + token } });
+  const secret = JSON.stringify({ mcpServers: { private: privateDefinition('/private'), docs: privateDefinition('/shadowed') } });
+  const project = path => JSON.stringify({ mcpServers: { docs: definition(path), repository: definition('/repository') } });
+  await writeFile(join(r.cwd, '.mcp.json'), project('/docs'));
+  const api = await claudeProvider(t, [[call('mcp__private__ping', {}, 'private-ping')], [call('mcp__docs__ping', {}, 'docs-ping')],
+    [call('mcp__repository__ping', {}, 'repo-ping')], [text('MCP complete.')]]);
+  await configure(f.job, api.config, f.log, secret, r.cwd);
+  const first = await runClaude(f.job, r.cwd, 'Use the configured MCP tools.', f.log, 90000, 'mcp');
+  assert.deepEqual(mcp.requests.filter(request => request.method === 'tools/call').map(request => [request.path, request.authorization]),
+    [['/private', 'Bearer ' + token], ['/docs', undefined], ['/repository', undefined]]);
+  assert.ok(mcp.requests.every(request => request.path !== '/shadowed' && (request.path === '/private' || request.authorization === undefined)));
   const results = api.requests.flatMap(request => request.messages).flatMap(message => Array.isArray(message.content) ? message.content : []);
-  for (const id of ['private-ping', 'repo-ping']) {
+  for (const id of ['private-ping', 'docs-ping', 'repo-ping']) {
     const result = results.findLast(block => block.type === 'tool_result' && block.tool_use_id === id);
     assert.ok(result); assert.notEqual(result.is_error, true); assert.match(JSON.stringify(result.content), /MCP transport result 8194/);
   }
-  assert.doesNotMatch(JSON.stringify(f.records), /private-mcp-token-8194/);
+  await writeFile(join(r.cwd, '.mcp.json'), project('/restored-docs'));
+  await r.git('add', '.mcp.json');
+  await r.git('commit', '-m', 'Record the updated repository MCP configuration');
+  await r.git('push', 'origin', 'HEAD');
+  const git = new TaskGit(r.cwd, f.job.env, f.log);
+  const saved = await exportCheckpoint(f.job, checkpoint({ ...await git.snapshot(), workspace: r.cwd, session_id: first.session }), f.log);
+  assert.ok(!saved.manifest.files.some(file => /\.claude\.json$/.test(file.path)));
+  for (const file of saved.files) assert.ok(!(await readFile(file)).includes(token));
+
+  const fresh = await fixture(t, 'claude'), cwd = join(fresh.temporary, 'restored-workspace');
+  await exec('git', ['clone', r.remote, cwd], { env: fresh.job.env });
+  await assert.rejects(readFile(join(cwd, '.mcp.json')), { code: 'ENOENT' });
+  const secondAPI = await claudeProvider(t, [[call('mcp__docs__ping', {}, 'restored-docs-ping')], [text('MCP resumed.')]]);
+  const restored = new TaskGit(cwd, fresh.job.env, fresh.log);
+  await restoreCheckpoint(fresh.job, saved.root, validateCheckpoint(saved.manifest, 'fixture/repo'), restored, fresh.log,
+    () => configure(fresh.job, secondAPI.config, fresh.log, secret, cwd));
+  mcp.requests.length = 0;
+  const second = await runClaude(fresh.job, cwd, 'Use the repository docs tool again.', fresh.log, 90000, 'restored', first.session);
+  assert.equal(second.session, first.session);
+  assert.deepEqual(mcp.requests.filter(request => request.method === 'tools/call').map(request => [request.path, request.authorization]),
+    [['/restored-docs', undefined]]);
+  assert.ok(mcp.requests.every(request => request.path !== '/shadowed' && request.path !== '/docs'));
+  assert.ok(!JSON.stringify([...f.records, ...fresh.records]).includes(token));
 });
 test('real Claude errors preserve an earlier conversation and produce causal sanitized diagnostics', async t => {
   const f = await fixture(t, 'claude'), r = await repository(f);

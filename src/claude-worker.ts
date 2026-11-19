@@ -7,7 +7,6 @@ async function main() {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
   const settings = JSON.parse(await readFile(join(process.env.CLAUDE_CONFIG_DIR!, "settings.json"), "utf8"));
-  const mcp = JSON.parse(await readFile(join(process.env.CLAUDE_CONFIG_DIR!, "mcp.json"), "utf8"));
   const session = process.argv[3] || undefined;
   const tools = new Map<string, string>();
   const invocation = query({ prompt: Buffer.concat(chunks).toString("utf8"), options: {
@@ -17,7 +16,7 @@ async function main() {
     tools: { type: "preset", preset: "claude_code" }, permissionMode: "bypassPermissions",
     allowedTools: ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"],
     allowDangerouslySkipPermissions: true, permissionPrompts: "none", sandbox: { enabled: false },
-    persistSession: true, resume: session, mcpServers: mcp.mcpServers,
+    persistSession: true, resume: session,
   } });
   for await (const message of invocation) {
     if (message.type === "assistant" && message.error) emit({ type: "provider_error", reason: message.error });

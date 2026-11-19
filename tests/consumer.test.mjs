@@ -62,11 +62,13 @@ test('workflow execution separates native timeout from final upload and exposes 
   assert.equal(workflow.jobs.execute['timeout-minutes'], '${{ inputs.timeout-minutes }}');
   assert.equal(workflow.jobs.execute['runs-on'], '${{ fromJSON(inputs.runs-on) }}');
   assert.equal(workflow.on.workflow_call.inputs.runner.default, 'codex');
-  for (const secret of ['codex-config', 'codex-api-key', 'claude-settings', 'claude-api-key', 'claude-mcp-config']) assert.equal(workflow.on.workflow_call.secrets[secret].required, false);
+  for (const secret of ['codex-config', 'codex-api-key', 'claude-settings', 'claude-api-key', 'mcp-config']) assert.equal(workflow.on.workflow_call.secrets[secret].required, false);
+  assert.equal(workflow.on.workflow_call.secrets['claude-mcp-config'], undefined);
   assert.equal(workflow.on.workflow_call.secrets['github-token'].required, true);
   const nativeEnv = workflow.jobs.execute.steps.find(step => step.name === 'Execute agent').env;
   assert.match(nativeEnv.CODEX_API_KEY, /inputs.runner == 'codex'/);
   assert.match(nativeEnv.ANTHROPIC_API_KEY, /inputs.runner == 'claude'/);
+  assert.equal(nativeEnv.MCP_CONFIG_JSON, '${{ secrets.mcp-config }}');
   for (const job of Object.values(workflow.jobs)) for (const step of job.steps) {
     assert.equal(step.env?.REMOTE_DEV_RUNS_ON, undefined);
     assert.equal(step.env?.REMOTE_DEV_TIMEOUT_MINUTES, undefined);
@@ -84,6 +86,8 @@ test('normal task and consumer example expose only plan/resume with YAML-owned s
     assert.deepEqual(Object.keys(caller.on.workflow_dispatch.inputs).sort(), ['plan', 'resume-run-id', 'runner']);
     assert.deepEqual(caller.jobs.run.with, { runner: '${{ inputs.runner }}', plan: '${{ inputs.plan }}', 'resume-run-id': '${{ inputs.resume-run-id }}',
       'runs-on': '["ubuntu-latest"]', 'timeout-minutes': 360 });
+    assert.equal(caller.jobs.run.secrets['mcp-config'], '${{ secrets.MCP_CONFIG_JSON }}');
+    assert.equal(caller.jobs.run.secrets['claude-mcp-config'], undefined);
   }
 });
 test('published maintainer test selects exactly one literal stable or prerelease call', async () => {
@@ -102,7 +106,7 @@ test('published maintainer test selects exactly one literal stable or prerelease
       'runs-on': '${{ inputs.runs-on }}', 'timeout-minutes': '${{ fromJSON(inputs.timeout-minutes) }}' });
     assert.deepEqual(selected[0].secrets, { 'codex-config': '${{ secrets.CODEX_CONFIG_TOML }}',
       'codex-api-key': '${{ secrets.CODEX_API_KEY }}', 'claude-settings': '${{ secrets.CLAUDE_SETTINGS_JSON }}',
-      'claude-api-key': '${{ secrets.ANTHROPIC_API_KEY }}', 'claude-mcp-config': '${{ secrets.CLAUDE_MCP_CONFIG_JSON }}',
+      'claude-api-key': '${{ secrets.ANTHROPIC_API_KEY }}', 'mcp-config': '${{ secrets.MCP_CONFIG_JSON }}',
       'github-token': '${{ secrets.REMOTE_DEV_PAT }}' });
   }
   await assert.rejects(readFile(join(root, '.github/workflows/runner-prerelease.yml')), { code: 'ENOENT' });

@@ -32,7 +32,7 @@ on:
         required: false
       claude-api-key:
         required: false
-      claude-mcp-config:
+      mcp-config:
         required: false
       github-token:
         required: true
@@ -143,7 +143,7 @@ jobs:
           CODEX_API_KEY: ${{ inputs.runner == 'codex' && secrets.codex-api-key || '' }}
           CLAUDE_SETTINGS_JSON: ${{ inputs.runner == 'claude' && secrets.claude-settings || '' }}
           ANTHROPIC_API_KEY: ${{ inputs.runner == 'claude' && secrets.claude-api-key || '' }}
-          CLAUDE_MCP_CONFIG_JSON: ${{ inputs.runner == 'claude' && secrets.claude-mcp-config || '' }}
+          MCP_CONFIG_JSON: ${{ secrets.mcp-config }}
           REMOTE_DEV_GITHUB_TOKEN: ${{ secrets.github-token }}
         with:
           retries: 0

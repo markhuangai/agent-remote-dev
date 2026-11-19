@@ -48,7 +48,7 @@ jobs:
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
       claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
       claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
+      mcp-config: ${{ secrets.MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}
 
   prerelease:
@@ -65,5 +65,5 @@ jobs:
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
       claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
       claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
+      mcp-config: ${{ secrets.MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}

@@ -16,5 +16,5 @@ export function runnerInputs(env: NodeJS.ProcessEnv) {
   const key = (runner === "codex" ? env.CODEX_API_KEY : env.ANTHROPIC_API_KEY)!,
     config = (runner === "codex" ? env.CODEX_CONFIG_TOML : env.CLAUDE_SETTINGS_JSON)!;
   requireValue(token?.length >= 8 && key?.length >= 8 && config, "invalid_credential_input");
-  return { runner, token, key, config, mcp: runner === "claude" ? env.CLAUDE_MCP_CONFIG_JSON ?? "" : "" };
+  return { runner, token, key, config, mcp: env.MCP_CONFIG_JSON ?? "" };
 }

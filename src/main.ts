@@ -36,19 +36,20 @@ export async function main({ github }: { github: any }) {
     const settings = prepared.settings;
     Object.assign(job.env, { GIT_AUTHOR_NAME: settings.git_author_name, GIT_COMMITTER_NAME: settings.git_author_name,
       GIT_AUTHOR_EMAIL: settings.git_author_email, GIT_COMMITTER_EMAIL: settings.git_author_email });
-    await configure(job, config, log, mcp);
+    const git = new TaskGit(cwd, job.env, log);
+    requireValue((await git.run(["rev-parse", "--show-toplevel"])).trim() === cwd && !await git.changedPaths(), "unsafe_worktree");
+    const origin = (await git.run(["remote", "get-url", "origin"])).trim();
+    requireValue([`https://github.com/${repository}.git`, `https://github.com/${repository}`].includes(origin), "origin_identity_mismatch");
+    const restored = prepared.restored;
+    const configureCheckout = () => configure(job, config, log, mcp, cwd);
+    if (restored) await restoreCheckpoint(job, restored.root, restored.manifest, git, log, configureCheckout);
+    else await configureCheckout();
     await installTools(job, resolve(import.meta.dirname, ".."), log);
     const skillAPI = async (path: string) => parseJson(await command("gh", ["api", path.replace(/^\//, '')], { cwd, env: job.env, stage: "skill_source", log }), "skills");
     const skills = await resolveSkills(skillAPI, settings.skills);
     for (const [index, skill] of skills.entries()) await installSkillSource(job, skill, await fetchSkillSource(job, skill, index, log), index, log);
     const userInstructions = settings.user_instructions_url ? await fetchInstructions(settings.user_instructions_url) : null;
     await installUserInstructions(job, userInstructions, log);
-    const git = new TaskGit(cwd, job.env, log);
-    requireValue((await git.run(["rev-parse", "--show-toplevel"])).trim() === cwd && !await git.changedPaths(), "unsafe_worktree");
-    const origin = (await git.run(["remote", "get-url", "origin"])).trim();
-    requireValue([`https://github.com/${repository}.git`, `https://github.com/${repository}`].includes(origin), "origin_identity_mismatch");
-    const restored = prepared.restored;
-    if (restored) await restoreCheckpoint(job, restored.root, restored.manifest, git, log);
     const metadata: CheckpointInput = { repository, ...await git.snapshot(), session_id: restored?.manifest.session_id ?? '',
       root_run_id: prepared.root_run_id, activation_run_id: prepared.activation_run_id, auto_count: prepared.auto_count, operator: prepared.operator, provider_sha: process.env.REMOTE_DEV_PROVIDER_SHA,
       lineage: prepared.lineage, outcome: "running", workspace: cwd };

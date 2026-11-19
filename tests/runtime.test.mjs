@@ -31,6 +31,24 @@ test("configuration is isolated, rejects invalid TOML, and prevents permission a
   assert.ok(!f.log.protectedValues.includes("CODEX_API_KEY"));
   await assert.rejects(configure(f.job, "[invalid", f.log), { reason: "invalid_codex_config" });
 });
+test("shared and repository MCP JSON failures identify the source without configuration contents", async t => {
+  for (const runner of ["codex", "claude"]) {
+    const f = await fixture(t, runner), r = await repository(f);
+    const config = runner === "codex" ? 'model="gpt-5.1"' : "{}";
+    const malformed = '{"mcpServers":{"sensitive-mcp-text-5742":';
+    const assertFailure = source => error => {
+      assert.equal(error.reason, "invalid_mcp_config");
+      f.log.failure(error);
+      const { event, stage, level, source: observed } = f.records.at(-1);
+      assert.deepEqual({ event, stage, level, source: observed }, { event: "runtime.failed", stage: "configuration", level: "ERROR", source });
+      assert.doesNotMatch(JSON.stringify(f.records), /sensitive-mcp-text-5742/);
+      return true;
+    };
+    await assert.rejects(configure(f.job, config, f.log, malformed, r.cwd), assertFailure("MCP_CONFIG_JSON"));
+    await writeFile(join(r.cwd, ".mcp.json"), malformed);
+    await assert.rejects(configure(f.job, config, f.log, "", r.cwd), assertFailure(".mcp.json"));
+  }
+});
 test("actual Skills CLI installs complete pinned portable packages outside project and host skill scope", async (t) => {
   const f = await fixture(t), source = await portableSource(f);
   const before = await readdir(root);

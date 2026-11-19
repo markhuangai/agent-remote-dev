@@ -5,6 +5,7 @@ import { command } from "./process.js";
 import { requireValue, RunnerError, SkillSource, UserInstructions, RunnerKind, versions } from "./contracts.js";
 import { runnerAdapter } from "./runners.js";
 import { instructions } from "./platform/checkpoint-policy.mjs";
+import { parseMcpServers, readRepositoryMcpFile } from "./mcp-config.js";
 
 export type Job = { runner: RunnerKind; root: string; home: string; runnerHome: string; tools: string; staging: string; exports: string; env: NodeJS.ProcessEnv };
 export async function createJob(temp: string, apiKey: string, token: string, author: string, email: string, inherited: NodeJS.ProcessEnv = process.env, runner: RunnerKind = "codex"): Promise<Job> {
@@ -30,8 +31,10 @@ export async function createJob(temp: string, apiKey: string, token: string, aut
     CLAUDE_CODE_REMOTE_MEMORY_DIR: "", CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: "", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "", CLAUDE_CODE_TASK_LIST_ID: "" });
   return { runner, root, home, runnerHome, tools, staging, exports, env };
 }
-export async function configure(job: Job, raw: string, log: Diagnostics, mcp = "") {
-  await runnerAdapter(job.runner).prepare(job, raw, log, mcp);
+export async function configure(job: Job, raw: string, log: Diagnostics, mcp = "", cwd?: string) {
+  const shared = parseMcpServers(mcp || undefined, "MCP_CONFIG_JSON", log);
+  const repository = parseMcpServers(cwd ? await readRepositoryMcpFile(cwd, ".mcp.json") : undefined, ".mcp.json", log);
+  await runnerAdapter(job.runner).prepare(job, raw, log, { cwd, shared, repository });
 }
 export async function installTools(job: Job, providerRoot: string, log: Diagnostics) {
   job.tools = providerRoot;

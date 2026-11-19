@@ -23,11 +23,12 @@ export async function unpackArchive(job: Job, archive: string, destination: stri
       { expected: checkpointSchema, observed: Number.isSafeInteger(failure.observed) ? failure.observed : null } : {});
   }
 }
-export async function restoreCheckpoint(job: Job, root: string, manifest: any, git: TaskGit, log: Diagnostics) {
+export async function restoreCheckpoint(job: Job, root: string, manifest: any, git: TaskGit, log: Diagnostics, configureCheckout?: () => Promise<void>) {
   try {
     const started = Date.now();
     validateCheckpoint(manifest, manifest.repository, job.runner);
     await git.restore(manifest.branch, manifest.checkpoint_sha);
+    await configureCheckout?.();
     await runnerAdapter(job.runner).restore(job, root, manifest, git.cwd, log);
     log.event("resume.restore", "INFO", { runner: job.runner, runner_version: versions[job.runner], session_id: manifest.session_id,
       old_workspace: manifest.workspace, workspace: git.cwd, old_runner_home: manifest.runner_home, runner_home: job.runnerHome,
@@ -35,7 +36,9 @@ export async function restoreCheckpoint(job: Job, root: string, manifest: any, g
   }
   catch (error: any) {
     log.event("resume.restore", "ERROR", { outcome: "rejected", task_id: manifest.task_id, session_id: manifest.session_id,
-      reason: error.reason ?? "restore_failed", ...error.details, corrective_action: "Resolve branch or state drift before restoring; the recorded checkpoint remains authoritative." });
+      reason: error.reason ?? "restore_failed", ...error.details, corrective_action: error.stage === "configuration"
+        ? "Check the MCP and runner configuration for the restored checkout."
+        : "Resolve branch or state drift before restoring; the recorded checkpoint remains authoritative." });
     throw error;
   }
 }

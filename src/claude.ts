@@ -6,13 +6,14 @@ import { command } from "./process.js";
 import type { ProcessControl } from "./process.js";
 import type { Job } from "./setup.js";
 import type { Diagnostics } from "./diagnostics.js";
+import type { McpConfiguration } from "./mcp-config.js";
 
-export async function configureClaude(job: Job, raw: string, log: Diagnostics, rawMcp = "") {
-  let settings: any, mcp: any;
-  try { settings = JSON.parse(raw); mcp = rawMcp ? JSON.parse(rawMcp) : { mcpServers: {} }; }
-  catch { throw new RunnerError("invalid_claude_config", "configuration", "Claude settings or MCP JSON could not be parsed; contents withheld."); }
-  requireValue(object(settings) && object(mcp) && object(mcp.mcpServers) && Object.keys(mcp).every(key => key === "mcpServers"), "invalid_claude_config", "configuration");
-  protectConfiguration(settings, log); protectConfiguration(mcp, log);
+export async function configureClaude(job: Job, raw: string, log: Diagnostics, mcp: McpConfiguration) {
+  let settings: unknown;
+  try { settings = JSON.parse(raw); }
+  catch { throw new RunnerError("invalid_claude_config", "configuration", "Claude settings JSON could not be parsed; contents withheld."); }
+  requireValue(object(settings), "invalid_claude_config", "configuration");
+  protectConfiguration(settings, log);
   requireValue(settings.env === undefined || object(settings.env) && Object.values(settings.env).every(value => typeof value === "string"), "invalid_claude_environment", "configuration");
   const environment: Record<string, string> = {};
   for (const [key, value] of Object.entries(settings.env ?? {})) {
@@ -24,8 +25,11 @@ export async function configureClaude(job: Job, raw: string, log: Diagnostics, r
     enableAllProjectMcpServers: true,
     autoMemoryDirectory: join(job.runnerHome, "projects", job.env.CLAUDE_CODE_PROJECT_DIR_NAME!, "memory") });
   await writeFile(join(job.runnerHome, "settings.json"), JSON.stringify(settings), { mode: 0o600 });
-  await writeFile(join(job.runnerHome, "mcp.json"), JSON.stringify(mcp), { mode: 0o600 });
-  log.event("runtime.setup", "INFO", { stage: "configuration", runner: "claude", outcome: "success", mcp_servers: Object.keys(mcp.mcpServers), paths: { home: job.home, runner_home: job.runnerHome } });
+  if (Object.keys(mcp.shared).length) {
+    await writeFile(join(job.runnerHome, ".claude.json"), JSON.stringify({ mcpServers: mcp.shared }), { mode: 0o600 });
+  }
+  log.event("runtime.setup", "INFO", { stage: "configuration", runner: "claude", outcome: "success",
+    mcp_servers: Object.keys({ ...mcp.shared, ...mcp.repository }), paths: { home: job.home, runner_home: job.runnerHome } });
 }
 
 export async function runClaude(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,

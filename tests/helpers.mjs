@@ -67,6 +67,27 @@ export function message(text, id = "m1") {
 export function tool(cmd, id = "call1") {
   return { type: "response.output_item.done", item: { type: "function_call", call_id: id, name: "exec_command", arguments: JSON.stringify({ cmd, login: false, yield_time_ms: 1000, max_output_tokens: 1000 }) } };
 }
+export async function mcpProvider(t) {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    if (request.method !== "POST") { response.writeHead(405).end(); return; }
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    requests.push({ method: body.method, path: request.url, authorization: request.headers.authorization });
+    if (!("id" in body)) { response.writeHead(202).end(); return; }
+    const result = body.method === "initialize"
+      ? { protocolVersion: body.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } }
+      : body.method === "tools/list"
+        ? { tools: [{ name: "ping", description: "MCP fixture ping", inputSchema: { type: "object", properties: {} } }] }
+        : { content: [{ type: "text", text: "MCP transport result 8194" }] };
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  return { requests, url: `http://127.0.0.1:${server.address().port}` };
+}
 export async function provider(t, replies) {
   const requests = [];
   const server = createServer(async (request, response) => {
