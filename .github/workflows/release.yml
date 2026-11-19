@@ -86,7 +86,7 @@ jobs:
           node-version: 24
       - name: Install locked helper dependencies
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - name: Publish immutable version and forward-only alias
+      - name: Publish immutable version and forward-only aliases
         uses: actions/github-script@v9
         with:
           retries: 0
@@ -94,8 +94,4 @@ jobs:
             const { pathToFileURL } = require('node:url');
             const { releasePreflight, publishRelease } = await import(pathToFileURL(process.env.GITHUB_WORKSPACE + '/.github/scripts/release-policy.mjs').href);
             const plan = await releasePreflight({ github, context, core });
-            const api = async (path, options = {}) => {
-              const { method = 'GET', ...data } = options;
-              return (await github.request(`${method} ${path}`, data)).data;
-            };
-            await publishRelease({ api, plan });
+            await publishRelease({ github, plan, core });
