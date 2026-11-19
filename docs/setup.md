@@ -249,9 +249,9 @@ this repository.
 
 ## Reuse the workflow from another repository
 
-Releases have not been published. Until a maintainer publishes a version, use an
-explicitly authorized exact commit in place of `v1`. The caller below shows the
-interface for a published release.
+The caller below uses `@v1` to follow stable v1 releases. Use `@latest` to
+follow the highest stable version across major versions, or an exact release
+such as `@v1.0.0` to pin the workflow.
 
 Commit `.remote-dev.yml` in the consumer repository root:
 

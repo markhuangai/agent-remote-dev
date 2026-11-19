@@ -134,10 +134,10 @@ agent runner, plan, resume ID, machine labels and timeout. Mutually exclusive jo
 `@v1` and `@v1-prerelease` references. Provider checkout uses the executing job's
 workflow identity, not the run's list of all declared reusable calls.
 
-No release tags or channel aliases exist yet, so published-version smoke execution
-is deferred until both declared channel references exist. Do not create placeholder tags.
-Once published and explicitly authorized, select the channel and supply a test
-plan; for manual resume select the same channel and prior run ID. Recovery sends
+`v1` is published. Published-version smoke execution waits for both declared
+channel tags, including `v1-prerelease`. Once both tags exist and the run is
+authorized, select the channel and supply a test plan. For manual resume, select
+the same channel and prior run ID. Recovery sends
 no channel or scheduling overrides, so this maintainer form's YAML defaults apply
 to automatic children. Automatic continuation remains disabled in this repository.
 
@@ -146,7 +146,13 @@ to automatic children. Automatic continuation remains disabled in this repositor
 `release.yml`, named **Publish release**, is the sole release publisher. It
 verifies the dispatched main source, locked build/tests and required CI/CodeQL
 results, then publishes an immutable version tag and GitHub release record.
-Stable versions advance `vN`; prereleases advance `vN-prerelease`. Aliases move
-forward without force; partial publication requires maintainer inspection.
+Stable versions advance their major tag (`vN`). The highest stable version also
+advances `latest` and receives GitHub's **Latest** badge. A patch for an older
+major advances its own tag. Prereleases advance `vN-prerelease` alone.
+
+The publisher updates the applicable aliases atomically and requires each update
+to move forward. For partial publication, inspect the version tag, release record,
+and alias SHAs using `gh run view <run-id> --log | rg 'release\.(verify|aliases)'`.
+Use the logged version and verified refs for any authorized alias repair.
 It does not execute development tasks or publish custom runtime archives.
 Release publication requires its own explicit authorization.
