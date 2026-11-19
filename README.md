@@ -55,8 +55,9 @@ Repository owners configure Linux runner labels and job timeout
 in the caller's YAML. This repository uses `ubuntu-latest` and 360 minutes.
 
 Call `.github/workflows/remote-dev.yml` and configure `.remote-dev.yml`, including
-the optional `user-level-md-url`. Codex uses TOML configuration; Claude uses
-native settings JSON and optional MCP JSON. Each runner has its own API-key secret.
+the optional `user-level-md-url`. Codex uses TOML and Claude uses native settings
+JSON. Each runner has its own API-key secret. Both support the optional
+`MCP_CONFIG_JSON` secret and the repository's root `.mcp.json`.
 
 This is a breaking migration from the old configuration, workflow, skill, and
 checkpoint names. Finish old sessions before upgrading; schema-4 snapshots cannot

@@ -7,9 +7,9 @@ import { configure, installSkillSource, installUserInstructions } from '../.buil
 import { logCodexActivity, runCodex } from '../.build/codex.js';
 import { TaskGit } from '../.build/git.js';
 import { drive } from '../.build/driver.js';
-import { durableCheckpoint } from '../.build/checkpoint.js';
+import { durableCheckpoint, exportCheckpoint } from '../.build/checkpoint.js';
 import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
-import { exec, checkpoint, fixture, logger, message, provider, repository, tool } from './helpers.mjs';
+import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, repository, tool } from './helpers.mjs';
 
 const plan = 'Implement the supplied plan autonomously. Ask only when clarification is indispensable.';
 test('real Codex streams reads, edits and command failures without logging their output', async t => {
@@ -85,6 +85,99 @@ async function driver(f, r, overrides = {}) {
   if (state.session) await save(state.session, undefined, state.outcome);
   return { result: { ...result, checkpoint: last }, git, exports };
 }
+test('real Codex applies whole-server MCP precedence on fresh and resumed checkouts', async t => {
+  const f = await fixture(t), r = await repository(f), mcp = await mcpProvider(t);
+  const api = await provider(t, [[message('MCP configured.')], [message('MCP resumed.')]]);
+  const token = 'private-mcp-token-3246';
+  const http = path => ({ type: 'http', url: mcp.url + path });
+  const toml = (name, path, withAuth = false) => `\n[mcp_servers.${name}]\nurl = "${mcp.url + path}"\n` +
+    (withAuth ? `http_headers = { Authorization = "Bearer ${token}" }\n` : '');
+  const config = api.config + toml('codex_only', '/codex-only') + toml('native', '/shadowed', true) +
+    toml('shared_winner', '/shadowed', true) + toml('legacy', '/shadowed', true);
+  const secret = JSON.stringify({ mcpServers: {
+    organization: { ...http('/organization'), headers: { Authorization: 'Bearer ' + token } },
+    docs: { ...http('/shadowed'), headers: { Authorization: 'Bearer ' + token } },
+    native: http('/shadowed'),
+    shared_winner: http('/shared-winner'),
+  } });
+  const project = path => JSON.stringify({ mcpServers: {
+    docs: http(path),
+    project_only: { ...http('/project-only'), type: 'streamable-http' },
+    native: http('/shadowed'),
+    legacy: { ...http('/shadowed'), type: 'sse' },
+  } });
+  await mkdir(join(r.cwd, '.codex'));
+  await writeFile(join(r.cwd, '.codex/config.toml'), toml('native', '/native'));
+  await writeFile(join(r.cwd, '.mcp.json'), project('/docs'));
+  const checkRequests = path => {
+    const initialized = mcp.requests.filter(request => request.method === 'initialize').map(request => request.path);
+    assert.deepEqual([...new Set(initialized)].sort(), ['/codex-only', '/native', '/organization', '/project-only', '/shared-winner', path].sort());
+    for (const request of mcp.requests) assert.equal(request.authorization, request.path === '/organization' ? 'Bearer ' + token : undefined);
+  };
+  await configure(f.job, config, f.log, secret, r.cwd);
+  const first = await runCodex(f.job, r.cwd, 'Start with the project MCP configuration.', f.log, 60000, 'mcp');
+  checkRequests('/docs');
+  assert.deepEqual(f.records.filter(record => record.reason === 'unsupported_mcp_transport')
+    .map(({ event, level, run_id, source, server }) => ({ event, level, run_id, source, server })),
+    [{ event: 'runtime.setup', level: 'WARN', run_id: '13', source: '.mcp.json', server: 'legacy' }]);
+
+  await writeFile(join(r.cwd, '.mcp.json'), project('/restored-docs'));
+  await r.git('add', '.mcp.json', '.codex/config.toml');
+  await r.git('commit', '-m', 'Record the updated repository MCP configuration');
+  await r.git('push', 'origin', 'HEAD');
+  const git = new TaskGit(r.cwd, f.job.env, f.log);
+  const saved = await exportCheckpoint(f.job, checkpoint({ ...await git.snapshot(), workspace: r.cwd, session_id: first.session }), f.log);
+  assert.ok(!saved.manifest.files.some(file => file.path.endsWith('/config.toml')));
+  for (const file of saved.files) assert.ok(!(await readFile(file)).includes(token));
+
+  const fresh = await fixture(t), cwd = join(fresh.temporary, 'restored-workspace');
+  await exec('git', ['clone', r.remote, cwd], { env: fresh.job.env });
+  await assert.rejects(readFile(join(cwd, '.mcp.json')), { code: 'ENOENT' });
+  const restored = new TaskGit(cwd, fresh.job.env, fresh.log);
+  await restoreCheckpoint(fresh.job, saved.root, validateCheckpoint(saved.manifest, 'fixture/repo'), restored, fresh.log,
+    () => configure(fresh.job, config, fresh.log, secret, cwd));
+  mcp.requests.length = 0;
+  const second = await runCodex(fresh.job, cwd, 'Continue with the restored MCP configuration.', fresh.log, 60000, 'restored', first.session);
+  assert.equal(second.session, first.session);
+  checkRequests('/restored-docs');
+  assert.ok(!JSON.stringify([...f.records, ...fresh.records]).includes(token));
+});
+test('real Codex loads a shared MCP secret without a repository MCP file', async t => {
+  const f = await fixture(t), r = await repository(f), mcp = await mcpProvider(t);
+  const api = await provider(t, [[message('Shared MCP configured.')]]);
+  const authorization = 'Bearer fixture-shared-codex-token-2754';
+  const secret = JSON.stringify({ mcpServers: { shared: { type: 'http', url: mcp.url + '/shared', headers: { Authorization: authorization } } } });
+  await configure(f.job, api.config, f.log, secret, r.cwd);
+  await runCodex(f.job, r.cwd, 'Start with the shared MCP server.', f.log, 60000, 'shared');
+  assert.ok(mcp.requests.some(request => request.method === 'initialize'));
+  assert.ok(mcp.requests.every(request => request.path === '/shared' && request.authorization === authorization));
+});
+test('real Codex starts a repository-only stdio MCP server with its arguments and environment', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const probe = join(f.temporary, 'stdio-result.txt');
+  await writeFile(join(r.cwd, 'mcp-fixture.mjs'), `
+import { createInterface } from 'node:readline';
+import { writeFile } from 'node:fs/promises';
+for await (const line of createInterface({ input: process.stdin })) {
+  const request = JSON.parse(line);
+  if (request.id === undefined) continue;
+  if (request.method === 'initialize') {
+    await writeFile(process.argv[2], process.argv[3] + ' ' + process.env.FIXTURE_MARKER);
+  }
+  const result = request.method === 'initialize'
+    ? { protocolVersion: request.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } }
+    : { tools: [] };
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
+}
+`);
+  await writeFile(join(r.cwd, '.mcp.json'), JSON.stringify({ mcpServers: {
+    stdio: { command: process.execPath, args: ['./mcp-fixture.mjs', probe, 'project-argument'], env: { FIXTURE_MARKER: 'project-environment' } },
+  } }));
+  const api = await provider(t, [[message('Project tool available.')]]);
+  await configure(f.job, api.config, f.log, '', r.cwd);
+  await runCodex(f.job, r.cwd, 'Use the repository MCP settings.', f.log, 60000, 'stdio');
+  assert.equal(await readFile(probe, 'utf8'), 'project-argument project-environment');
+});
 for (const downloaded of [false, true]) test(`real Codex discovers skills and attribution with ${downloaded ? 'downloaded' : 'default'} user instructions`, async t => {
   const f = await fixture(t), r = await repository(f), source = join(f.temporary, 'skills');
   await mkdir(join(source, 'skills/fixture-selected/references'), { recursive: true });

@@ -70,13 +70,41 @@ For an Anthropic Messages-compatible gateway, replace `env.ANTHROPIC_BASE_URL`
 with the gateway's base URL.
 See the [native settings reference](https://code.claude.com/docs/en/settings).
 
-To configure optional MCP servers, use the
-[sample MCP configuration](../examples/claude-mcp-config.json). Replace the URL
-and bearer token in your copy and store it in `CLAUDE_MCP_CONFIG_JSON`.
+### Shared MCP servers
 
-Repository `.mcp.json` discovery also remains available. Keep private credentials
-in Actions secrets. The platform controls storage, Git credentials, persistence,
-and full-access permissions; configuration cannot override those settings.
+Use the [sample MCP configuration](../examples/mcp-config.json) for either runner.
+Both the optional `MCP_CONFIG_JSON` Actions secret and the repository's root
+`.mcp.json` use the same `mcpServers` JSON object. Put private server credentials
+in the secret. Commit `.mcp.json` to the repository to add its own servers or
+replace specific servers from the selected secret.
+
+GitHub supplies the organization secret when the repository has access to it.
+A repository secret with the same name replaces the entire organization value,
+including entries with distinct server names. Set an Actions **secret** for this
+input. [GitHub secret precedence](https://docs.github.com/en/actions/reference/security/secrets#naming-your-secrets)
+
+The matrix applies to both runners for shared transports. A merge keeps distinct
+names and gives the complete definition to `.mcp.json` when a server name appears
+in both sources. The winning entry supplies its own URL, command, headers,
+arguments, and environment.
+
+| Organization secret | Repository secret | Without `.mcp.json` | With `.mcp.json` |
+| --- | --- | --- | --- |
+| Set | Absent | Organization secret | Organization secret merged with file |
+| Absent | Set | Repository secret | Repository secret merged with file |
+| Set | Set | Repository secret | Repository secret merged with file |
+| Absent | Absent | No shared servers | File only |
+
+For Codex, the order from lowest to highest priority is `CODEX_CONFIG_TOML`,
+`MCP_CONFIG_JSON`, `.mcp.json`, and the repository's `.codex/config.toml`. Codex
+translates stdio entries (`command`, `args`, `env`) and Streamable HTTP entries
+(`type: "http"`, `url`, `headers`). For a winning entry with an unsupported
+transport such as legacy SSE, Codex warns with the server name and skips the
+entry. Claude uses its native project discovery and transport support.
+
+To migrate, put the existing `CLAUDE_MCP_CONFIG_JSON` value in the
+`MCP_CONFIG_JSON` secret and replace the caller's `claude-mcp-config` mapping
+with `mcp-config: ${{ secrets.MCP_CONFIG_JSON }}`.
 
 ## 2. Create REMOTE_DEV_PAT
 
@@ -126,7 +154,7 @@ then create repository secrets with these exact names:
 | `CODEX_API_KEY` | An API key for the model provider selected in the TOML |
 | `CLAUDE_SETTINGS_JSON` | Native settings JSON when selecting Claude |
 | `ANTHROPIC_API_KEY` | Claude provider API key when selecting Claude |
-| `CLAUDE_MCP_CONFIG_JSON` | Optional Claude MCP server JSON |
+| `MCP_CONFIG_JSON` | Optional private MCP server JSON for either runner |
 | `REMOTE_DEV_PAT` | The GitHub token from step 2 |
 
 Organization secrets also work when this repository is included in their access
@@ -270,7 +298,7 @@ jobs:
       codex-api-key: ${{ secrets.CODEX_API_KEY }}
       claude-settings: ${{ secrets.CLAUDE_SETTINGS_JSON }}
       claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-      claude-mcp-config: ${{ secrets.CLAUDE_MCP_CONFIG_JSON }}
+      mcp-config: ${{ secrets.MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}
 ```
 
