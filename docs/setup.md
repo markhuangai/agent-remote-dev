@@ -415,8 +415,12 @@ after a replacement upload succeeds. Existing log/evidence artifacts are retaine
 Uncommitted files and unpushed commits are excluded. A dirty checkout or rejected
 push still permits conversation export: the artifact records the nearest
 published ancestor and an omitted-work warning. Resume tells the agent that omitted
-work may need recreating. The agent owns milestone pushes. On resume, check the
-task branch's remote tip because it may contain progress newer than the snapshot.
+work may need recreating. The agent owns milestone pushes. On resume, it compares
+the saved commit with the remote task branch tip. If they differ, verify that
+an authorized task participant pushed the intended milestone and approve its
+full SHA in the resume context. The agent checks the current tip and its ancestry
+before fast-forwarding. An automatic continuation that needs this approval reports
+both SHAs and leaves the task incomplete for a manual resume.
 Repository/user native hooks can also publish progress under their own policy.
 
 Snapshots exclude authentication files, secret configuration, logs, caches and

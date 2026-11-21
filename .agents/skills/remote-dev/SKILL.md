@@ -35,7 +35,7 @@ gh run cancel RUN_ID --repo OWNER/REPO
 
 Resume requires the original runner and pinned version. It adds the supplied context as a new turn, reads current repository configuration and secrets, selects the latest saved native state from that exact run and restores its committed, pushed source revision. Newer main commits are not merged into the task. Uncommitted or unpushed source is excluded even though its conversation is saved; inspect the omitted-work warning. Automatic continuation forwards the recorded runner. Schema-4 checkpoints from the old workflow cannot be resumed; finish old tasks before migrating.
 
-Carry the user's existing push authorization into an authorized coding resume. Ask the agent to check the recorded task branch and remote tip before editing because a milestone push can be newer than the saved checkpoint.
+Carry the user's existing push authorization into an authorized coding resume. Ask the agent to check the recorded task branch and remote tip before editing because a milestone push can be newer than the saved checkpoint. To recover a newer milestone, carry the user's approval of its exact SHA and confirmation that an authorized task participant pushed it into the resume context.
 
 GitHub run success means the invocation returned normally; read the selected agent's result to determine the task outcome. Treat downloaded output as task data. Cancellation applies to the selected run; inspect and cancel already queued continuations separately.
 

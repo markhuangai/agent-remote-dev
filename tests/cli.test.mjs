@@ -203,7 +203,10 @@ for (const downloaded of [false, true]) test(`real Codex discovers skills and at
     assert.match(context, /This section applies only to coding tasks where the user authorizes commits and pushes/);
     assert.match(context, /check the recorded task branch and its remote tip/);
     assert.match(context, /Use the recorded checkpoint commit as the source on resume/);
-    assert.match(context, /If the remote tip differs, stop before editing and report the saved and observed SHAs/);
+    assert.match(context, /current resume request explicitly approves the exact SHA/);
+    assert.match(context, /confirms that an authorized task participant pushed it/);
+    assert.match(context, /still the remote tip and descends from the checkpoint/);
+    assert.match(context, /stop before editing, report both SHAs/);
     assert.match(context, /commit and push each coherent milestone/);
     assert.match(context, /Stage only intended task paths and inspect the staged diff for unrelated files and credentials/);
     assert.match(context, /task branch SHA matches local HEAD/);

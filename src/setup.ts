@@ -59,20 +59,25 @@ This section applies only to coding tasks where the user authorizes commits and 
 Follow the task and repository's publication limits.
 
 After read-only preflight, verify the base revision and create the task branch before
-editing. On resume, check the recorded task branch and its remote tip, if present,
-before editing. Use the recorded checkpoint commit as the source on resume. If the
-remote tip differs, stop before editing and report the saved and observed SHAs.
+editing. On resume, check the recorded task branch and its remote tip before editing.
+Use the recorded checkpoint commit as the source on resume. If a remote tip exists and
+differs, advance only when the current resume request explicitly approves the exact
+SHA and confirms that an authorized task participant pushed it. Verify that the
+approved SHA is still the remote tip and descends from the checkpoint before
+fast-forwarding. For any other mismatch, stop before editing, report both SHAs,
+and ask the user to verify the push and approve the expected SHA in a new resume.
 
 For tasks covered by this authorization, commit and push each coherent milestone,
 including before a long audit or test run. Stage only intended task paths and inspect
 the staged diff for unrelated files and credentials. Push normally to the task branch
 and set its upstream on the first push.
 
-Before ending the turn, including an incomplete handoff, inspect staged and unstaged
-changes, untracked files, and unpushed commits. Within the same authorization, commit
-remaining task changes and push outstanding task commits. Verify that the exact remote
-task branch SHA matches local HEAD and report the branch and SHA. If a push fails,
-report the cause, what remains local, and the last verified remote SHA, if available.
+Before handing off work on the verified task branch, including incomplete work,
+inspect staged and unstaged changes, untracked files, and unpushed commits. Within the
+same authorization, commit remaining task changes and push outstanding task commits.
+Verify that the exact remote task branch SHA matches local HEAD and report the branch
+and SHA. If a push fails, report the cause, what remains local, and the last verified
+remote SHA, if available.
 
 For audited PR delivery, obtain a conformant plan audit before required pre-PR tests.
 Open the PR after the audit and those tests pass.
