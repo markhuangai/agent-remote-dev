@@ -186,9 +186,9 @@ Both the initiating and triggering user must be allowed and have repository
 write, maintain or admin access. Changes must reach the default branch before
 they apply to a run.
 
-Skills are optional. Put branch creation, commits, pushes, PR creation and review
-requirements in the plan or selected skills; the platform does not perform those
-delivery steps itself. This repository's `AGENTS.md` also applies to task execution.
+The agent handles branches, commits and pushes for coding tasks that authorize
+them. Put task-specific publication, PR and review requirements in the plan or
+selected skills. This repository's `AGENTS.md` also applies to task execution.
 
 This repository and the consumer example use the Golden instructions through
 the optional `user-level-md-url` key in the root `.remote-dev.yml`:
@@ -201,15 +201,16 @@ The runner downloads the Markdown to isolated `$CODEX_HOME/AGENTS.md` for Codex
 or `$CLAUDE_CONFIG_DIR/CLAUDE.md` for Claude. The source filename is unrestricted.
 Repository instructions and skills use each agent's native discovery. This
 repository's `CLAUDE.md` imports `AGENTS.md` to share its instructions.
-Set a different public HTTPS URL to use other shared
-instructions, or omit the key to use only the repository instructions.
+Set a different public HTTPS URL to use other shared instructions, or omit the
+key to use the runner's built-in instructions and the repository instructions.
 
 ## 5. Start a task
 
-Write your refined plan to `plan.md`, including the linked issue, intended change,
-acceptance criteria and delivery requirements. For example, request a task
-branch, required validation, commits and a push, then a pull request and the
-review loop. Avoid asking the runner to merge.
+Write your refined plan to `plan.md`, including any linked issue, the intended
+change, acceptance criteria and delivery requirements. For a coding task with
+push authorization, ask the agent to save task-branch milestones while it works
+and verify the final push before exit. Use the prompt below for audited PR delivery.
+[Audited delivery prompt](#deliver-an-audited-implementation-through-a-pr)
 
 In [Actions → Remote development task runner](https://github.com/markhuangai/agent-remote-dev/actions/workflows/runner-task.yml),
 select **Run workflow**, choose `main`, select `runner`, and paste the plan.
@@ -237,7 +238,8 @@ gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev --ref main -
 ## Install the remote-dev skill
 
 Use `$remote-dev` in Codex to dispatch, inspect, resume, or cancel remote
-development runs. Run this command from a consumer repository root.
+development runs. Run this command from a consumer repository root to install or
+refresh the dispatch skill.
 
 ```bash
 npx skills add markhuangai/agent-remote-dev --skill remote-dev --agent codex --yes
@@ -252,6 +254,13 @@ this repository.
 The caller below uses `@v1` to follow stable v1 releases. Use `@latest` to
 follow the highest stable version across major versions, or an exact release
 such as `@v1.0.0` to pin the workflow.
+
+The task-branch progress instructions arrive when a release containing them
+reaches `@v1` or `@latest`. With an exact version or SHA pin, update the caller's
+`uses:` reference to a revision containing the change. Existing `.remote-dev.yml`
+settings and shared skill pins support the instructions. The task credential
+needs Contents write access to push. Align any repository policy that delays
+all pushes before using milestone pushes.
 
 Commit `.remote-dev.yml` in the consumer repository root:
 
@@ -406,9 +415,13 @@ after a replacement upload succeeds. Existing log/evidence artifacts are retaine
 Uncommitted files and unpushed commits are excluded. A dirty checkout or rejected
 push still permits conversation export: the artifact records the nearest
 published ancestor and an omitted-work warning. Resume tells the agent that omitted
-work may need recreating. The platform never stages, commits or pushes on its
-own. Repository/user native hooks can publish coherent progress under their own
-policy and run with the same privileges as the agent.
+work may need recreating. The agent owns milestone pushes. On resume, it compares
+the saved commit with the remote task branch tip. If they differ, verify that
+an authorized task participant pushed the intended milestone and approve its
+full SHA in the resume context. The agent checks the current tip and its ancestry
+before fast-forwarding. An automatic continuation that needs this approval reports
+both SHAs and leaves the task incomplete for a manual resume.
+Repository/user native hooks can also publish progress under their own policy.
 
 Snapshots exclude authentication files, secret configuration, logs, caches and
 working files. Archive validation rejects traversal, links, duplicate/encrypted
@@ -443,15 +456,17 @@ packages work with either selected runner. Begin the task prompt with:
 ```text
 Use $sdlc-plan-implementation to implement the following approved plan through
 an audited, tested, non-draft PR and complete the configured PR review loop.
+Commit and push task-branch milestones. Open the PR after the plan audit and
+required pre-PR tests pass.
 Do not merge. Approved plan:
 <complete plan text>
 ```
 
-The skill performs read-only preflight, branches, implements, obtains an
-independent conformance audit, runs required checks, commits and pushes normally,
-opens the PR, and completes current-head review/CI before handoff. Delivery
-authority comes from the user's request. The platform itself does not enforce
-this task-specific workflow on unrelated tasks.
+Keep the approved plan verbatim below the delivery request. The user's request
+authorizes the milestone pushes. The agent creates the task branch after read-only
+preflight, pushes progress while implementing, and obtains an independent audit
+before running the required pre-PR tests. CI and automated review run on the PR
+head after the PR opens.
 
 ## Diagnose runtime infrastructure
 

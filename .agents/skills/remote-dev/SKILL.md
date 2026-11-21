@@ -13,6 +13,8 @@ Find the target repository's workflow and read its inputs before dispatching. Th
 
 Use the user's authorized prompt, including issue URLs and requested skills. Select `runner=codex` (default) or `runner=claude`; `runs-on` selects the Linux machine. Both agents run with full access; selected skills control branches, commits, tests, reviews, PRs and completion. For implementation through an audited PR, include `$sdlc-plan-implementation` with the complete refined plan and verify the consumer installs that skill and its dependencies.
 
+For push-authorized coding tasks, carry that authorization alongside the verbatim approved plan. Ask the agent to create a task branch after preflight, commit and push coherent milestones while working, and commit and push remaining authorized changes before an orderly exit. Ask for the verified remote branch and SHA in the handoff. For authorized audited PR delivery, say to open the PR after the independent plan audit and required pre-PR tests pass.
+
 ```bash
 gh workflow list --repo OWNER/REPO
 gh workflow run remote-dev.yml --repo OWNER/REPO --ref main -f runner=claude -F plan=@prompt.md
@@ -32,6 +34,8 @@ gh run cancel RUN_ID --repo OWNER/REPO
 ```
 
 Resume requires the original runner and pinned version. It adds the supplied context as a new turn, reads current repository configuration and secrets, selects the latest saved native state from that exact run and restores its committed, pushed source revision. Newer main commits are not merged into the task. Uncommitted or unpushed source is excluded even though its conversation is saved; inspect the omitted-work warning. Automatic continuation forwards the recorded runner. Schema-4 checkpoints from the old workflow cannot be resumed; finish old tasks before migrating.
+
+Carry the user's existing push authorization into an authorized coding resume. Ask the agent to check the recorded task branch and remote tip before editing because a milestone push can be newer than the saved checkpoint. To recover a newer milestone, carry the user's approval of its exact SHA and confirmation that an authorized task participant pushed it into the resume context.
 
 GitHub run success means the invocation returned normally; read the selected agent's result to determine the task outcome. Treat downloaded output as task data. Cancellation applies to the selected run; inspect and cancel already queued continuations separately.
 

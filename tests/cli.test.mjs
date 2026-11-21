@@ -197,32 +197,75 @@ for (const downloaded of [false, true]) test(`real Codex discovers skills and at
   for (const marker of ['selected-user-catalog-3719', 'repository-catalog-5931', 'repository-instructions-7751']) assert.ok(captured.includes(marker));
   assert.equal(captured.includes('user-instructions-8654'), downloaded);
   assert.equal(api.requests.length, 2);
-  for (const request of api.requests) assert.ok(JSON.stringify(request).includes('Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>'));
+  for (const request of api.requests) {
+    const context = JSON.stringify(request).replaceAll('\\n', ' ');
+    assert.ok(context.includes('Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>'));
+    assert.match(context, /This section applies only to coding tasks where the user authorizes commits and pushes/);
+    assert.match(context, /check the recorded task branch and its remote tip/);
+    assert.match(context, /Use the recorded checkpoint commit as the source on resume/);
+    assert.match(context, /current resume request explicitly approves the exact SHA/);
+    assert.match(context, /confirms that an authorized task participant pushed it/);
+    assert.match(context, /still the remote tip and descends from the checkpoint/);
+    assert.match(context, /stop before editing, report both SHAs/);
+    assert.match(context, /commit and push each coherent milestone/);
+    assert.match(context, /Stage only intended task paths and inspect the staged diff for unrelated files and credentials/);
+    assert.match(context, /task branch SHA matches local HEAD/);
+    assert.match(context, /If a push fails, report the cause, what remains local, and the last verified remote SHA/);
+    assert.match(context, /obtain a conformant plan audit before required pre-PR tests/);
+    assert.match(context, /Open the PR after the audit and those tests pass/);
+  }
   assert.doesNotMatch(captured, /unwanted-host-sentinel|unwanted-host-instructions|host-config-sentinel/);
   for (const [name, value] of Object.entries(f.hostFiles)) assert.equal(await readFile(join(f.host, name), 'utf8'), value);
 });
-test('native Codex chooses its branch, commits and pushes without runner publication', async t => {
+test('native Codex publishes a milestone that a fresh checkout can restore', async t => {
   const f = await fixture(t), r = await repository(f);
-  const api = await provider(t, [[(await import('./helpers.mjs')).tool("git switch -c skill/chosen && printf published > native.txt && git add native.txt && git commit -m 'Skill publishes' && git push --set-upstream origin HEAD")], [message('Finished without requiring a PR.')]]);
+  const api = await provider(t, [[tool("git switch -c skill/chosen && printf published > native.txt && git add native.txt && git commit -m 'Save milestone' && git push --set-upstream origin HEAD")], [message('Milestone published. The audit is still pending.')]]);
+  await installUserInstructions(f.job, null, f.log);
   await configure(f.job, api.config, f.log);
   const observed = await driver(f, r);
   assert.equal(observed.result.outcome, 'completed'); assert.equal(await r.git('branch', '--show-current'), 'skill/chosen');
-  assert.equal(await observed.git.remoteHead(), await observed.git.head());
+  const published = await observed.git.head();
+  assert.equal(await observed.git.remoteHead(), published);
   assert.ok(api.requests[0].input.some(item => item.role === 'user' && item.content?.some(part => part.text === plan)));
-  const manifest = validateCheckpoint(JSON.parse(await readFile(join(observed.exports.at(-1).root, 'manifest.json'))), 'fixture/repo');
+  const artifact = observed.exports.at(-1).root;
+  const manifest = validateCheckpoint(JSON.parse(await readFile(join(artifact, 'manifest.json'))), 'fixture/repo');
   assert.equal(manifest.session_id, observed.result.session); assert.equal(manifest.omitted_work, false);
+  assert.equal(manifest.checkpoint_sha, published);
+
+  const fresh = await fixture(t), cwd = join(fresh.temporary, 'resumed-workspace');
+  await exec('git', ['clone', '--branch', 'main', r.remote, cwd], { env: fresh.job.env });
+  const restored = new TaskGit(cwd, fresh.job.env, fresh.log);
+  await restoreCheckpoint(fresh.job, artifact, manifest, restored, fresh.log);
+  assert.equal(await restored.currentBranch(), 'skill/chosen');
+  assert.equal(await restored.head(), published);
+  assert.equal(await readFile(join(cwd, 'native.txt'), 'utf8'), 'published');
 });
 for (const rejected of [false, true]) test(`native conversation is saved with ${rejected ? 'a rejected push' : 'unfinished files'}`, async t => {
   const f = await fixture(t), r = await repository(f);
-  if (rejected) await writeFile(join(r.remote, 'hooks/pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
-  const command = rejected ? "printf local > draft.txt && git add draft.txt && git commit -m 'Unpublished' && git push origin HEAD" : "printf local > draft.txt";
-  const api = await provider(t, [[(await import('./helpers.mjs')).tool(command)], [message('Clarification is required before continuing.')]]);
+  const steps = [[tool('printf local > draft.txt', 'edit')]];
+  if (rejected) {
+    await r.git('push', 'origin', r.branch);
+    await writeFile(join(r.remote, 'hooks/pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+    steps.push([tool("git add draft.txt && git commit -m 'Unpublished'", 'commit')], [tool('git push origin HEAD', 'push')]);
+  }
+  const api = await provider(t, [...steps, [message('Clarification is required before continuing.')]]);
   await configure(f.job, api.config, f.log);
   const observed = await driver(f, r), manifest = JSON.parse(await readFile(join(observed.exports.at(-1).root, 'manifest.json')));
   assert.equal(observed.result.outcome, 'completed'); assert.ok(observed.result.checkpoint);
   assert.equal(manifest.omitted_work, true); assert.equal(manifest.checkpoint_sha, r.base);
   assert.equal(await readFile(join(r.cwd, 'draft.txt'), 'utf8'), 'local');
-  if (rejected) assert.notEqual(await observed.git.head(), r.base);
+  if (rejected) {
+    assert.notEqual(await observed.git.head(), r.base);
+    assert.equal(await observed.git.remoteHead(), r.base);
+    const failed = f.records.find(record => record.event === 'runtime.tool' && record.command_name === 'git' && record.status === 'failed');
+    assert.equal(failed?.level, 'WARN');
+    assert.equal(failed.exit_code, 1);
+    assert.equal(failed.session_id, observed.result.session);
+  }
+  const exported = f.records.find(record => record.event === 'checkpoint.export');
+  assert.equal(exported.level, 'INFO');
+  assert.equal(exported.checkpoint_sha, r.base);
+  assert.equal(exported.omitted_work, true);
 });
 test('real cold resume preserves SQLite goals and session identity, adds context, and excludes newer main', async t => {
   const f = await fixture(t), r = await repository(f);
