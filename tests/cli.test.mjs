@@ -198,13 +198,16 @@ for (const downloaded of [false, true]) test(`real Codex discovers skills and at
   assert.equal(captured.includes('user-instructions-8654'), downloaded);
   assert.equal(api.requests.length, 2);
   for (const request of api.requests) {
-    const context = JSON.stringify(request);
+    const context = JSON.stringify(request).replaceAll('\\n', ' ');
     assert.ok(context.includes('Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>'));
     assert.match(context, /This section applies only to coding tasks where the user authorizes commits and pushes/);
     assert.match(context, /check the recorded task branch and its remote tip/);
-    assert.match(context, /Stop on divergence/);
+    assert.match(context, /Use the recorded checkpoint commit as the source on resume/);
+    assert.match(context, /If the remote tip differs, stop before editing and report the saved and observed SHAs/);
     assert.match(context, /commit and push each coherent milestone/);
+    assert.match(context, /Stage only intended task paths and inspect the staged diff for unrelated files and credentials/);
     assert.match(context, /task branch SHA matches local HEAD/);
+    assert.match(context, /If a push fails, report the cause, what remains local, and the last verified remote SHA/);
     assert.match(context, /obtain a conformant plan audit before required pre-PR tests/);
     assert.match(context, /Open the PR after the audit and those tests pass/);
   }

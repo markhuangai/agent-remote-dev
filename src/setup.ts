@@ -60,8 +60,8 @@ Follow the task and repository's publication limits.
 
 After read-only preflight, verify the base revision and create the task branch before
 editing. On resume, check the recorded task branch and its remote tip, if present,
-before editing. If the remote is ahead of the checkpoint, verify the intervening
-commits belong to the task before fast-forwarding. Stop on divergence.
+before editing. Use the recorded checkpoint commit as the source on resume. If the
+remote tip differs, stop before editing and report the saved and observed SHAs.
 
 For tasks covered by this authorization, commit and push each coherent milestone,
 including before a long audit or test run. Stage only intended task paths and inspect
