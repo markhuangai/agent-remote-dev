@@ -53,7 +53,19 @@ export async function installUserInstructions(job: Job, value: UserInstructions,
   catch (error: any) { throw new RunnerError(error.reason ?? "invalid_user_instructions", "instructions", "Frozen user instructions were rejected.", error.details); }
   const attribution = "For every Git commit you create, include this trailer exactly once after a blank line:\n\n" +
     "Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>\n";
-  await writeFile(join(job.runnerHome, runnerAdapter(job.runner).instructionFile), attribution + (value ? "\n" + value.content : ""), { mode: 0o600, flag: "wx" });
+  const progress = [
+    "## Save progress on the task branch",
+    "",
+    "For coding tasks where the user authorizes commits and pushes, finish read-only preflight, verify the base revision, and create the task branch before editing. On resume, check the recorded task branch and its remote tip, if present, before editing. If the remote is ahead of the checkpoint, verify the intervening commits belong to the task before fast-forwarding. Stop on divergence.",
+    "",
+    "Commit and push each coherent milestone, including before a long audit or test run. Stage only intended task paths and inspect the staged diff for unrelated files and credentials. Push normally to the task branch and set its upstream on the first push. Honor the task and repository's publication limits.",
+    "",
+    "Before ending the turn, including an incomplete handoff, inspect staged and unstaged changes, untracked files, and unpushed commits. Commit remaining authorized task changes and push outstanding commits. Verify that the exact remote task branch SHA matches local HEAD and report the branch and SHA. If a push fails, report the cause, what remains local, and the last verified remote SHA, if available.",
+    "",
+    "For audited PR delivery, obtain a conformant plan audit before required pre-PR tests. Open the PR after the audit and those tests pass.",
+    "",
+  ].join("\n");
+  await writeFile(join(job.runnerHome, runnerAdapter(job.runner).instructionFile), `${attribution}\n${progress}${value ? "\n" + value.content : ""}`, { mode: 0o600, flag: "wx" });
   log.event("runtime.setup", "INFO", { stage: "user_instructions", configured: value !== null, source_url: value?.url ?? null,
     sha256: value?.sha256 ?? null, bytes: value ? Buffer.byteLength(value.content) : 0, outcome: "success" });
 }

@@ -9,7 +9,8 @@ isolate GitHub transport; do not replace the policy under test.
 
 ## Validation
 
-Before publication, run:
+Authorized coding tasks can push milestones to their task branch as work progresses.
+Run these checks before opening a PR.
 
 1. `npm run check` after installing locked dependencies with `npm ci --ignore-scripts`.
 2. `actionlint` (v1.7.12, verified against its published SHA-256).

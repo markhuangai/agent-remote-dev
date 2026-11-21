@@ -80,7 +80,13 @@ for (const downloaded of [false, true]) test(`real Claude discovers user/reposit
   const captured = JSON.stringify(api.requests);
   for (const marker of ['remote-dev', 'repository-catalog-5931', 'repository-instructions-7751']) assert.ok(captured.includes(marker), marker);
   assert.equal(captured.includes('user-instructions-8654'), downloaded);
-  for (const request of api.requests) assert.match(JSON.stringify(request), /Assisted-by: remote-agent-dev/);
+  for (const request of api.requests) {
+    const context = JSON.stringify(request);
+    assert.match(context, /Assisted-by: remote-agent-dev/);
+    assert.match(context, /For coding tasks where the user authorizes commits and pushes/);
+    assert.match(context, /Commit and push each coherent milestone/);
+    assert.match(context, /Verify that the exact remote task branch SHA matches local HEAD/);
+  }
   assert.doesNotMatch(captured, /unwanted-host|host-config-sentinel/);
   for (const [name, value] of Object.entries(f.hostFiles)) assert.equal(await readFile(join(f.host, name), 'utf8'), value);
 });
