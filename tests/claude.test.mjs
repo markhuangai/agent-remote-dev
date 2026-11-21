@@ -82,10 +82,14 @@ for (const downloaded of [false, true]) test(`real Claude discovers user/reposit
   assert.equal(captured.includes('user-instructions-8654'), downloaded);
   for (const request of api.requests) {
     const context = JSON.stringify(request);
-    assert.match(context, /Assisted-by: remote-agent-dev/);
-    assert.match(context, /For coding tasks where the user authorizes commits and pushes/);
-    assert.match(context, /Commit and push each coherent milestone/);
-    assert.match(context, /Verify that the exact remote task branch SHA matches local HEAD/);
+    assert.ok(context.includes('Assisted-by: remote-agent-dev <https://github.com/markhuangai/agent-remote-dev>'));
+    assert.match(context, /This section applies only to coding tasks where the user authorizes commits and pushes/);
+    assert.match(context, /check the recorded task branch and its remote tip/);
+    assert.match(context, /Stop on divergence/);
+    assert.match(context, /commit and push each coherent milestone/);
+    assert.match(context, /task branch SHA matches local HEAD/);
+    assert.match(context, /obtain a conformant plan audit before required pre-PR tests/);
+    assert.match(context, /Open the PR after the audit and those tests pass/);
   }
   assert.doesNotMatch(captured, /unwanted-host|host-config-sentinel/);
   for (const [name, value] of Object.entries(f.hostFiles)) assert.equal(await readFile(join(f.host, name), 'utf8'), value);
