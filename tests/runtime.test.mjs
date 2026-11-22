@@ -8,7 +8,7 @@ import test from "node:test";
 import { hash, skillSources } from "../.build/contracts.js";
 import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
 import { exportCheckpoint, durableCheckpoint, inspectCredentials } from "../.build/checkpoint.js";
-import { uploadSnapshot } from "../.build/checkpoint-worker.js";
+import { saveSnapshot, uploadSnapshot, watchSnapshots } from "../.build/checkpoint-worker.js";
 import { TaskGit } from "../.build/git.js";
 import { command } from "../.build/process.js";
 import { exec, executionSource, checkpoint, sessionId, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
@@ -300,7 +300,7 @@ for (const mode of ['direct', 'threaded', 'resume-in-flight']) test(`a managed l
   const ready = join(f.temporary, 'resume-ready'), allow = join(f.temporary, 'resume-allow');
   if (mode === 'resume-in-flight') {
     const source = await readFile(join(root, '.build/supervise.py'), 'utf8');
-    const line = source.split('\n').findIndex(value => value.includes('(control / "paused.json").unlink')) + 1;
+    const line = source.split('\n').findIndex(value => value.includes('reply.unlink(missing_ok=True)')) + 1;
     assert.ok(line > 0);
     await writeFile(join(f.temporary, 'sitecustomize.py'), `import sys,time
 from pathlib import Path
@@ -357,6 +357,159 @@ worker=threading.Thread(target=run);worker.start();worker.join()`;
   assert.ok(Number(await readFile(marker)) > before);
   const result = await running; assert.equal(result.reason, 'command_timeout'); assert.equal(result.details.quiescent, true);
   const stopped = await readFile(marker, 'utf8'); await new Promise(resolve => setTimeout(resolve, 50)); assert.equal(await readFile(marker, 'utf8'), stopped);
+});
+
+async function waitFor(check, message) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const result = await check();
+    if (result) return result;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.fail(message);
+}
+
+async function readMarker(path) {
+  try { return await readFile(path, 'utf8'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; return ''; }
+}
+
+test('the checkpoint watcher recovers from a real cross-user pause denial in the same session', async t => {
+  try {
+    assert.notEqual(process.getuid(), 0);
+    await exec('sudo', ['-n', '--', 'true']);
+  } catch (error) {
+    if (process.env.GITHUB_ACTIONS === 'true') throw error;
+    t.skip('requires a non-root test runner with passwordless sudo for the cross-user helper');
+    return;
+  }
+  const f = await fixture(t), r = await repository(f);
+  await history(f);
+  const statePath = join(f.job.root, 'state.json'), latestPath = join(f.job.root, 'latest.json');
+  const counter = join(f.temporary, 'writer-counter'), helperPid = join(f.temporary, 'helper-pid');
+  const release = join(f.temporary, 'release-helper'), finish = join(f.temporary, 'finish-writer');
+  const captures = [], records = [];
+  const upload = async (_job, _name, _files, directory) => {
+    captures.push(JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8')));
+    if (captures.length > 1) {
+      const db = new DatabaseSync(join(directory, 'codex/state_5.sqlite'), { readOnly: true });
+      try { assert.ok(db.prepare('SELECT value FROM progress').get().value > 0); }
+      finally { db.close(); }
+    }
+    return { id: captures.length };
+  };
+  const api = async () => ({ artifacts: [] });
+  const saved = { job: f.job, metadata: checkpoint({ workspace: r.cwd }), secrets: f.log.protectedValues };
+  const previous = await saveSnapshot(saved, f.log, api, upload);
+  const helper = `import os, sys, time
+from pathlib import Path
+print(os.getpid(), flush=True)
+deadline = time.monotonic() + 12
+while not Path(sys.argv[1]).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+`;
+  const writer = `const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+const { DatabaseSync } = require('node:sqlite');
+const [counter, helperPid, release, finish, helperCode] = process.argv.slice(1);
+const db = new DatabaseSync(process.env.CODEX_HOME + '/state_5.sqlite');
+db.exec('PRAGMA journal_mode=WAL; CREATE TABLE progress (value INTEGER); INSERT INTO progress VALUES (0); CREATE TABLE threads (id TEXT, rollout_path TEXT)');
+db.prepare('INSERT INTO threads VALUES (?, ?)').run(${JSON.stringify(sessionId)}, process.env.CODEX_HOME + '/sessions/rollout.jsonl');
+const helper = spawn('sudo', ['-n', '--', 'python3', '-I', '-c', helperCode, release], { stdio: ['ignore', 'pipe', 'inherit'] });
+helper.once('error', error => { throw error; });
+helper.stdout.once('data', data => fs.writeFileSync(helperPid, data.toString().trim()));
+const timer = setInterval(() => {
+  if (fs.existsSync(finish)) { clearInterval(timer); db.close(); return; }
+  db.exec('UPDATE progress SET value = value + 1');
+  fs.writeFileSync(counter + '.tmp', String(db.prepare('SELECT value FROM progress').get().value));
+  fs.renameSync(counter + '.tmp', counter);
+}, 10);`;
+  const running = command(process.execPath, ['-e', writer, counter, helperPid, release, finish, helper], {
+    cwd: r.cwd, env: f.job.env, stage: 'writer', timeoutMs: 15000,
+    onControl: value => { saved.control = { directory: value.directory, nonce: value.nonce }; },
+  }).catch(error => error);
+  let watching;
+  try {
+    const pid = await waitFor(async () => Number(await readMarker(helperPid)), 'The root-owned helper did not start');
+    assert.throws(() => process.kill(pid, 0), { code: 'EPERM' });
+    await writeFile(statePath, JSON.stringify(saved));
+    watching = watchSnapshots(statePath, { intervalMs: 250, api, upload, emit: line => records.push(JSON.parse(line)) });
+    const deferred = await waitFor(() => records.find(record => record.event === 'checkpoint.deferred'), 'The watcher did not report the deferral');
+    assert.equal(deferred.level, 'WARN');
+    assert.equal(deferred.session_id, sessionId);
+    assert.equal(deferred.pause_reason, 'permission_denied');
+    assert.equal(deferred.signal, 'SIGSTOP');
+    assert.equal(deferred.os_errno, 1);
+    assert.ok(Number.isSafeInteger(deferred.pid) && deferred.pid > 0);
+    assert.equal(deferred.retry_interval_ms, 250);
+    assert.deepEqual(deferred.last_durable_checkpoint, previous);
+    assert.equal(captures.length, 1);
+    assert.deepEqual(JSON.parse(await readFile(latestPath, 'utf8')), previous);
+    const stalledAt = Number(await readMarker(counter));
+    await waitFor(async () => Number(await readMarker(counter)) > stalledAt, 'The same writer did not resume after the denied pause');
+    await writeFile(release, 'exit');
+    await waitFor(async () => JSON.parse(await readFile(latestPath, 'utf8')).artifact_id > previous.artifact_id,
+      'The next eligible checkpoint did not complete');
+    assert.equal(captures[1].session_id, sessionId);
+    assert.ok(captures[1].sequence > previous.sequence + 1);
+  } finally {
+    saved.metadata.outcome = 'completed';
+    await writeFile(statePath + '.tmp', JSON.stringify(saved));
+    await rename(statePath + '.tmp', statePath);
+    await writeFile(release, 'exit');
+    await writeFile(finish, 'exit');
+    await Promise.all([watching, running]);
+  }
+  assert.equal(await running, '');
+});
+
+test('cancellation during a partial pause stops the worker without allowing a copy', async t => {
+  const f = await fixture(t);
+  const ready = join(f.temporary, 'partial-pause'), allow = join(f.temporary, 'allow-cancel');
+  const pids = join(f.temporary, 'worker-pids');
+  const source = await readFile(join(root, '.build/supervise.py'), 'utf8');
+  const line = source.split('\n').findIndex(value => value.includes('paused.add((pid, started))')) + 1;
+  assert.ok(line > 0);
+  await writeFile(join(f.temporary, 'sitecustomize.py'), `import sys, time
+from pathlib import Path
+def trace(frame, event, arg):
+    if event == 'line' and frame.f_code.co_filename.endswith('/supervise.py') and frame.f_lineno == ${line}:
+        Path(${JSON.stringify(ready)}).write_text(str(frame.f_locals['pid']))
+        deadline = time.monotonic() + 3
+        while not Path(${JSON.stringify(allow)}).exists() and time.monotonic() < deadline:
+            time.sleep(0.001)
+    return trace
+sys.settrace(trace)
+`);
+  const worker = `import os, subprocess, sys
+from pathlib import Path
+helper = subprocess.Popen(['sleep', '30'])
+Path(sys.argv[1]).write_text(f'{os.getpid()} {helper.pid}')
+helper.wait()
+`;
+  let control, copying = false, pausing;
+  const running = command('python3', ['-c', worker, pids], {
+    cwd: f.temporary, env: { ...f.job.env, PYTHONPATH: f.temporary }, stage: 'writer', timeoutMs: 10000,
+    onControl: value => { control = value; },
+  }).catch(error => error);
+  const state = async pid => (await readMarker(`/proc/${pid}/stat`)).split(') ').at(-1).charAt(0);
+  try {
+    const [parent, child] = (await waitFor(() => readMarker(pids), 'The worker and helper did not start')).split(' ');
+    pausing = control.freeze(async () => { copying = true; }).catch(error => error);
+    const stoppedPid = await waitFor(() => readMarker(ready), 'The supervisor did not enter the partial pause');
+    assert.equal(stoppedPid, parent);
+    await waitFor(async () => await state(parent) === 'T', 'The worker was not stopped');
+    await waitFor(async () => await state(child) === 'S', 'The helper was not running independently of the stopped worker');
+  } finally {
+    process.emit('SIGTERM');
+    await writeFile(allow, 'continue');
+    await Promise.all([running, pausing]);
+  }
+  const failure = await running;
+  assert.equal(failure.reason, 'command_cancelled');
+  assert.equal(failure.details.quiescent, true);
+  assert.ok(await pausing instanceof Error);
+  assert.equal(copying, false);
 });
 
 test('an upload finalized remotely with a lost receipt does not poison later snapshot identities', async t => {

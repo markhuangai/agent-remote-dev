@@ -59,6 +59,11 @@ export async function command(executable: string, args: string[], options: Comma
     let receipt;
     try { receipt = JSON.parse(await readFile(receiptPath, "utf8")); }
     catch (error: any) { if (error.code !== "ENOENT") throw error; }
+    if (receipt?.nonce === nonce && receipt.quiescent === false && receipt.pause_recovery_failure) {
+      throw new RunnerError("snapshot_resume_failed", options.stage, "The supervisor could not verify that paused processes resumed or exited.",
+        { pause_failure: receipt.pause_recovery_failure.pause_failure, resume_failure: receipt.pause_recovery_failure.resume_failure,
+          exit_code: code, elapsed_ms: Date.now() - started, quiescent: false, output_closed: drained });
+    }
     if (!spawnError && code === 0 && (receipt?.nonce !== nonce || receipt?.quiescent !== true)) throw new RunnerError("worker_not_quiescent", options.stage, "The Linux supervisor did not prove descendant quiescence.");
     if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained) {
       let cause = spawnError?.message ?? stderr;
@@ -87,19 +92,30 @@ export async function command(executable: string, args: string[], options: Comma
 export function processControl(directory: string, nonce: string): ProcessControl {
   return { directory, nonce, async freeze(copy) {
     const request = randomUUID();
-    await writeFile(join(directory, "pause"), request, { mode: 0o600 });
+    const pausePath = join(directory, "pause");
+    const readReply = async () => {
+      try {
+        const reply = JSON.parse(await readFile(join(directory, "paused.json"), "utf8"));
+        if (reply.nonce === nonce && reply.request === request) return reply;
+      } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+    };
+    const start = Date.now();
+    await writeFile(pausePath, request, { mode: 0o600 });
     try {
-      const deadline = Date.now() + 5000;
       for (;;) {
-        try {
-          const paused = JSON.parse(await readFile(join(directory, "paused.json"), "utf8"));
-          if (paused.nonce === nonce && paused.request === request) break;
+        const reply = await readReply();
+        if (reply?.problem === null) break;
+        if (reply?.problem) {
+          const { reason, signal, pid, os_errno } = reply.problem;
+          throw new RunnerError("snapshot_pause_deferred", "checkpoint", "The supervisor resumed processes from an incomplete pause.",
+            { pause_reason: reason, signal, pid, os_errno, elapsed_ms: Date.now() - start });
         }
-        catch (error: any) { if (error.code !== "ENOENT") throw error; }
-        if (Date.now() >= deadline) throw new RunnerError("snapshot_pause_failed", "checkpoint");
+        if (Date.now() - start >= 5000) throw new RunnerError("snapshot_pause_failed", "checkpoint");
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      return await copy();
-    } finally { await unlink(join(directory, "pause")).catch(error => { if (error.code !== "ENOENT") throw error; }); }
+      const result = await copy();
+      if ((await readReply())?.problem !== null) throw new RunnerError("snapshot_pause_lost", "checkpoint");
+      return result;
+    } finally { await unlink(pausePath).catch(error => { if (error.code !== "ENOENT") throw error; }); }
   } };
 }
