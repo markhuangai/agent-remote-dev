@@ -4,7 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DefaultArtifactClient } from "@actions/artifact";
 import { command, processControl } from "./process.js";
-import { requireValue } from "./contracts.js";
+import { requireValue, RunnerError } from "./contracts.js";
 import { durableCheckpoint } from "./checkpoint.js";
 import { TaskGit } from "./git.js";
 import { Diagnostics } from "./diagnostics.js";
@@ -50,9 +50,11 @@ export async function saveSnapshot(saved: SavedRun, log: Diagnostics, api: any, 
   catch { log.event("checkpoint.retention", "WARN", { reason: "snapshot_prune_failed", artifact_id: receipt.artifact_id }); }
   return receipt;
 }
-export async function watchSnapshots(path: string, options: { intervalMs?: number; api?: any; upload?: typeof uploadSnapshot } = {}) {
+export async function watchSnapshots(path: string, options: {
+  intervalMs?: number; api?: any; upload?: typeof uploadSnapshot; emit?: (line: string | Error) => void;
+} = {}) {
   const initial: SavedRun = JSON.parse(await readFile(path, "utf8"));
-  const emit = (line: string | Error) => process.stdout.write(String(line) + "\n");
+  const emit = options.emit ?? ((line: string | Error) => process.stdout.write(String(line) + "\n"));
   const log = new Diagnostics({ repository: initial.metadata.repository, runner: initial.job.runner, run_id: initial.metadata.lineage.run_id, run_attempt: initial.metadata.lineage.run_attempt, workflow_sha: initial.metadata.lineage.workflow_sha }, { info: emit, warning: emit, error: emit, debug: emit });
   for (const secret of initial.secrets) log.protect(secret);
   const api = options.api ?? (async (endpoint: string, options: any = {}) => {
@@ -61,16 +63,23 @@ export async function watchSnapshots(path: string, options: { intervalMs?: numbe
     requireValue(response.ok, "snapshot_retention_api_failed", "checkpoint");
     return response.status === 204 ? null : response.json();
   });
+  const intervalMs = options.intervalMs ?? 60000;
   let next = 0;
   try {
     for (;;) {
       const saved: SavedRun = JSON.parse(await readFile(path, "utf8"));
       if (saved.metadata.outcome !== "running") break;
       if (saved.control && saved.metadata.session_id && Date.now() >= next) {
-        next = Date.now() + (options.intervalMs ?? 60000);
+        next = Date.now() + intervalMs;
         log.fields.session_id = saved.metadata.session_id;
         try { await saveSnapshot(saved, log, api, options.upload); }
-        catch (error) { log.failure(error, await latestSnapshot(saved.job)); }
+        catch (error) {
+          const previous = await latestSnapshot(saved.job);
+          if (error instanceof RunnerError && error.reason === "snapshot_pause_deferred") {
+            log.event("checkpoint.deferred", "WARN", { stage: error.stage, reason: error.reason, ...error.details,
+              last_durable_checkpoint: previous, retry_interval_ms: intervalMs });
+          } else log.failure(error, previous);
+        }
       }
       await new Promise(resolve => setTimeout(resolve, 100));
     }

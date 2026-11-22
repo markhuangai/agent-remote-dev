@@ -15,7 +15,8 @@ import { resolveSkills } from "./platform/sources.mjs";
 import { fetchInstructions } from "./platform/instructions.mjs";
 import { runnerInputs } from "./runners.js";
 
-export type SavedRun = { control?: { directory: string; nonce: string }; watcher_pid?: number; job: Job; metadata: CheckpointInput; secrets: string[]; response: string; latest: DurableCheckpoint | null };
+export type SavedRun = { control?: { directory: string; nonce: string }; watcher_pid?: number; job: Job; metadata: CheckpointInput;
+  secrets: string[]; response: string; latest: DurableCheckpoint | null; skip_final_snapshot?: boolean };
 export async function main({ github }: { github: any }) {
   let saved: SavedRun | undefined, pendingJob: Job | undefined;
   const log = new Diagnostics({ repository: process.env.GITHUB_REPOSITORY, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT });
@@ -83,7 +84,9 @@ export async function main({ github }: { github: any }) {
         metadata.outcome = value.outcome as CheckpointInput['outcome']; await persist();
       } });
     clearInterval(logs); await flushLogs();
-    state.response = result.response; await persist();
+    state.response = result.response;
+    state.skip_final_snapshot = result.reason === "snapshot_resume_failed";
+    await persist();
     core.setOutput("session-id", result.session ?? ''); core.setOutput("status", result.outcome);
     if (result.outcome !== 'completed') core.setFailed(`Native invocation ${result.outcome}; inspect the saved session and diagnostics.`);
   } catch (error) {
@@ -107,10 +110,12 @@ export async function finish({ github, statePath }: { github: any; statePath: st
     saved.latest = await latestSnapshot(saved.job);
     const workerLog = await readFile(join(saved.job.root, "snapshots.log"), "utf8").catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
     for (const line of workerLog.split("\n").filter(line => line.startsWith("{"))) core.info(line);
-    if (saved.metadata.session_id) {
-      const receipt = await saveSnapshot(saved, log, githubAPI(github));
-      saved.latest = receipt; core.setOutput("artifact-id", receipt.artifact_id);
+    if (saved.skip_final_snapshot) {
+      log.event("checkpoint.final", "WARN", { outcome: "skipped", reason: "snapshot_resume_failed", last_durable_checkpoint: saved.latest });
+    } else if (saved.metadata.session_id) {
+      saved.latest = await saveSnapshot(saved, log, githubAPI(github));
     }
+    if (saved.latest) core.setOutput("artifact-id", saved.latest.artifact_id);
     inspectCredentials(saved.response, log, "credential_in_result");
     const file = join(saved.job.exports, "record.json"); await writeFile(file, JSON.stringify({ runner: saved.job.runner, runner_version: versions[saved.job.runner], response: saved.response, native_outcome: saved.metadata.outcome, session_id: saved.metadata.session_id }), { mode: 0o600 });
     await uploadSnapshot(saved.job, `remote-dev-result-r${saved.metadata.lineage.run_id}-a${saved.metadata.lineage.run_attempt}`, [file], saved.job.exports, log);
