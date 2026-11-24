@@ -1,16 +1,16 @@
 import * as core from "@actions/core";
 import { lstat, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { requireValue, versions, parseJson, projectStorageKey } from "./contracts.js";
+import { requireValue, versions, parseJson, projectStorageKey, RunnerError } from "./contracts.js";
 import { uploadSnapshot, startSnapshots, waitSnapshots, saveSnapshot, latestSnapshot } from "./checkpoint-worker.js";
-import { durableCheckpoint, inspectCredentials, CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
+import { inspectCredentials, CheckpointInput, DurableCheckpoint } from "./checkpoint.js";
 import { Diagnostics } from "./diagnostics.js";
 import { drive } from "./driver.js";
 import { TaskGit } from "./git.js";
 import { command } from "./process.js";
 import { configure, createJob, fetchSkillSource, installSkillSource, installTools, installUserInstructions, removeJob, Job } from "./setup.js";
 import { restoreCheckpoint } from "./resume.js";
-import { githubAPI, prepareExecution, pruneSnapshots } from "./platform/continuation-policy.mjs";
+import { githubAPI, prepareExecution } from "./platform/continuation-policy.mjs";
 import { resolveSkills } from "./platform/sources.mjs";
 import { fetchInstructions } from "./platform/instructions.mjs";
 import { runnerInputs } from "./runners.js";
@@ -75,6 +75,8 @@ export async function main({ github }: { github: any }) {
       project_config_sha256: prepared.config_sha256, skills, user_instructions_sha256: userInstructions?.sha256 ?? null };
     let prompt = process.env.REMOTE_DEV_PLAN ?? '';
     if (restored) prompt = `Continue this conversation using the current repository configuration. The checkout is the published revision ${restored.manifest.checkpoint_sha}. ` +
+      (prepared.automatic_recovery === "native_worker_sigkill"
+        ? "The previous worker was interrupted. Verify published work and any external effects before repeating an operation. " : "") +
       (restored.manifest.omitted_work ? 'Uncommitted or unpushed work from the previous runner was not restored; inspect the checkout and recreate missing work as needed. ' : '') +
       `\n\nAdditional context:\n${prompt || 'Continue the unfinished task.'}`;
     const result = await drive({ job, cwd, log, plan: prompt, session: restored?.manifest.session_id,
@@ -86,16 +88,28 @@ export async function main({ github }: { github: any }) {
     clearInterval(logs); await flushLogs();
     state.response = result.response;
     state.skip_final_snapshot = result.reason === "snapshot_resume_failed";
+    if (result.reason === "native_worker_sigkill") state.metadata.recovery_reason = result.reason;
     await persist();
     core.setOutput("session-id", result.session ?? ''); core.setOutput("status", result.outcome);
     if (result.outcome !== 'completed') core.setFailed(`Native invocation ${result.outcome}; inspect the saved session and diagnostics.`);
   } catch (error) {
     log.failure(error, saved?.latest);
-    if (saved) { saved.metadata.outcome = "failed"; await writeFile(join(saved.job.root, "state.json"), JSON.stringify(saved), { mode: 0o600 }); }
+    if (saved) {
+      saved.metadata.outcome = "failed";
+      delete saved.metadata.recovery_reason;
+      await writeFile(join(saved.job.root, "state.json"), JSON.stringify(saved), { mode: 0o600 });
+    }
     if (!saved && pendingJob) await removeJob(pendingJob.root);
     core.setFailed("Remote development failed; inspect structured diagnostics.");
   }
 }
+
+function filesystemCause(error: unknown) {
+  const { code, syscall } = (error instanceof Error ? error : {}) as NodeJS.ErrnoException;
+  return { errno_code: typeof code === "string" && /^E[A-Z0-9]{2,25}$/.test(code) ? code : null,
+    syscall: syscall && ["chmod", "lstat", "mkdir", "open", "read", "rename", "rmdir", "scandir", "unlink", "write"].includes(syscall) ? syscall : null };
+}
+
 export async function finish({ github, statePath }: { github: any; statePath: string }) {
   if (!statePath) return;
   const temporary = await realpath(process.env.RUNNER_TEMP!), path = resolve(statePath);
@@ -103,8 +117,16 @@ export async function finish({ github, statePath }: { github: any; statePath: st
   let saved: SavedRun;
   try { saved = JSON.parse(await readFile(path, "utf8")); }
   catch (error: any) { if (error.code === 'ENOENT') return; throw error; }
-  const log = new Diagnostics({ repository: saved.metadata.repository, runner: saved.job.runner, runner_version: versions[saved.job.runner], run_id: saved.metadata.lineage.run_id, session_id: saved.metadata.session_id });
+  const host = process.env.RUNNER_ENVIRONMENT;
+  const runnerEnvironment = host === "github-hosted" || host === "self-hosted" ? host : "unknown";
+  const { lineage } = saved.metadata;
+  const log = new Diagnostics({ repository: saved.metadata.repository, runner: saved.job.runner, runner_version: versions[saved.job.runner],
+    run_id: lineage.run_id, run_attempt: lineage.run_attempt, session_id: saved.metadata.session_id, workflow_sha: lineage.workflow_sha,
+    root_run_id: saved.metadata.root_run_id, runner_environment: runnerEnvironment });
   for (const secret of saved.secrets) log.protect(secret);
+  const api = githubAPI(github), uploadContext = { api, metadata: saved.metadata };
+  const exportStarted = Date.now();
+  let finalCheckpoint: DurableCheckpoint | null = null, resultArtifactId: number | null = null, exportSucceeded = false;
   try {
     await waitSnapshots(saved);
     saved.latest = await latestSnapshot(saved.job);
@@ -113,13 +135,40 @@ export async function finish({ github, statePath }: { github: any; statePath: st
     if (saved.skip_final_snapshot) {
       log.event("checkpoint.final", "WARN", { outcome: "skipped", reason: "snapshot_resume_failed", last_durable_checkpoint: saved.latest });
     } else if (saved.metadata.session_id) {
-      saved.latest = await saveSnapshot(saved, log, githubAPI(github));
+      finalCheckpoint = await saveSnapshot(saved, log, api, (job, name, files, root, diagnostics) =>
+        uploadSnapshot(job, name, files, root, diagnostics, undefined, { ...uploadContext, kind: "checkpoint" }));
+      saved.latest = finalCheckpoint;
     }
     if (saved.latest) core.setOutput("artifact-id", saved.latest.artifact_id);
     inspectCredentials(saved.response, log, "credential_in_result");
     const file = join(saved.job.exports, "record.json"); await writeFile(file, JSON.stringify({ runner: saved.job.runner, runner_version: versions[saved.job.runner], response: saved.response, native_outcome: saved.metadata.outcome, session_id: saved.metadata.session_id }), { mode: 0o600 });
-    await uploadSnapshot(saved.job, `remote-dev-result-r${saved.metadata.lineage.run_id}-a${saved.metadata.lineage.run_attempt}`, [file], saved.job.exports, log);
+    const result = await uploadSnapshot(saved.job, `remote-dev-result-r${lineage.run_id}-a${lineage.run_attempt}`, [file], saved.job.exports,
+      log, undefined, { ...uploadContext, kind: "record" });
+    resultArtifactId = result.id;
     await core.summary.addTable([["Outcome", "Session", "Saved artifact"], [saved.metadata.outcome, saved.metadata.session_id || "unavailable", String(saved.latest?.artifact_id ?? "unavailable")]]).write();
-  } catch (error) { log.failure(error, saved.latest); core.setFailed("Final session export failed; retain the last completed snapshot."); }
-  finally { await removeJob(saved.job.root); }
+    exportSucceeded = true;
+  } catch (error) {
+    const failure = error instanceof RunnerError ? error : null;
+    log.event("runtime.failed", "ERROR", { stage: failure?.stage ?? "final_export", reason: failure?.reason ?? "final_export_failed",
+      cause_reason: failure?.details.cause_reason, ...filesystemCause(error), outcome: "failed",
+      last_durable_checkpoint: saved.latest, result_artifact_id: resultArtifactId, elapsed_ms: Date.now() - exportStarted,
+      corrective_action: "Inspect the export failure and use the last completed snapshot to resume by run ID." });
+    core.setFailed("Final session export failed; retain the last completed snapshot.");
+  } finally {
+    const cleanupStarted = Date.now();
+    const fields = { stage: "cleanup", native_outcome: saved.metadata.outcome, export_succeeded: exportSucceeded,
+      last_durable_checkpoint: saved.latest, final_checkpoint_artifact_id: finalCheckpoint?.artifact_id ?? null, result_artifact_id: resultArtifactId };
+    log.event("runtime.cleanup", "INFO", { ...fields, outcome: "started" });
+    try {
+      await removeJob(saved.job.root);
+    } catch (error) {
+      const warning = runnerEnvironment === "github-hosted" && exportSucceeded && finalCheckpoint !== null && resultArtifactId !== null;
+      log.event(warning ? "runtime.cleanup" : "runtime.failed", warning ? "WARN" : "ERROR", {
+        ...fields, ...filesystemCause(error), reason: "job_cleanup_failed", outcome: "failed", elapsed_ms: Date.now() - cleanupStarted,
+        corrective_action: warning ? "The artifacts are available. Inspect directory ownership and permissions if cleanup fails again."
+          : "Inspect runner directory ownership and permissions before reusing the runner. Resume by run ID if a completed snapshot is available.",
+      });
+      if (!warning) core.setFailed("Temporary job cleanup failed; inspect structured diagnostics.");
+    }
+  }
 }

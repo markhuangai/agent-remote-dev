@@ -42,9 +42,10 @@ on the latest successful upload, so a 60-second interval does not guarantee
 only 60 seconds of lost progress.
 
 Automatic continuation is optional and disabled by default. When enabled,
-a separate job can resume after the agent execution times out, up to the
-configured limit, retaining the selected runner. The default limit is three automatic continuations; manual
-resume starts a new allowance.
+a separate job can resume the selected runner after a native execution timeout
+or a verified unexpected native worker kill with a saved final checkpoint.
+The default limit is three automatic continuations. Manual resume by run ID
+starts a new allowance.
 
 ## Workflow interface
 

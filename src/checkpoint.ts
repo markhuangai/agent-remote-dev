@@ -15,7 +15,8 @@ export const checkpointLimit = checkpointBytes;
 export type DurableCheckpoint = { artifact_id: number; checkpoint_sha: string; sequence: number };
 export type CheckpointInput = { repository: string; branch: string | null; checkpoint_sha: string; omitted_work: boolean;
   session_id: string; root_run_id: string; activation_run_id: string; operator: string; auto_count: number;
-  provider_sha?: string; sequence?: number; lineage: any; outcome: "running" | "completed" | "failed" | "cancelled"; workspace: string; previous?: DurableCheckpoint | null };
+  provider_sha?: string; sequence?: number; lineage: any; outcome: "running" | "completed" | "failed" | "cancelled";
+  recovery_reason?: "native_worker_sigkill"; workspace: string; previous?: DurableCheckpoint | null };
 export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Diagnostics, limit = checkpointLimit, control?: ProcessControl) {
   const sequence = input.sequence ?? (input.previous?.sequence ?? 0) + 1;
   const root = await mkdtemp(join(job.exports, `snapshot-${sequence}-`));

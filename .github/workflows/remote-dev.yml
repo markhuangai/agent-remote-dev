@@ -181,7 +181,7 @@ jobs:
       - name: Install locked recovery dependencies
         working-directory: provider
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - name: Continue after timeout
+      - name: Continue interrupted session
         uses: actions/github-script@v9
         with:
           retries: 0

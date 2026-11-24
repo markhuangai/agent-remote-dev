@@ -38,6 +38,7 @@ export async function runClaude(job: Job, cwd: string, prompt: string, log: Diag
   let observed: string | undefined, identityChanged = false, terminal = false, failure: string | undefined;
   await command(process.execPath, [join(import.meta.dirname, "claude-worker.js"), output, session ?? ""], {
     cwd, env: job.env, stage: "claude", onControl, log, timeoutMs, stdin: prompt, collect: false,
+    nativeSessionUnfinished: () => Boolean(observed) && !identityChanged && !terminal,
     onLine(line) {
       let event: any; try { event = JSON.parse(line); } catch { return; }
       if (event.type === "session" && typeof event.session === "string") {

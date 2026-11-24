@@ -19,7 +19,7 @@ with zipfile.ZipFile(sys.argv[1], 'w', compression=zipfile.ZIP_DEFLATED) as z:
   z.writestr(info,item.get('text',''))`, path, JSON.stringify(entries)]);
   return path;
 }
-async function transport(t, runner = 'codex') {
+async function transport(t, runner = 'codex', metadata = {}) {
   const f = await fixture(t, runner);
   if (runner === 'codex') {
     await mkdir(join(f.job.runnerHome, 'sessions'));
@@ -28,7 +28,7 @@ async function transport(t, runner = 'codex') {
     await mkdir(join(f.job.runnerHome, 'projects/remote-fixture'), { recursive: true });
     await writeFile(join(f.job.runnerHome, `projects/remote-fixture/${sessionId}.jsonl`), JSON.stringify({ sessionId, type: 'user' }) + '\n');
   }
-  const exported = await exportCheckpoint(f.job, checkpoint(), f.log);
+  const exported = await exportCheckpoint(f.job, checkpoint(metadata), f.log);
   const zip = join(f.temporary, 'snapshot.zip');
   await exec('python3', ['-c', `import json,sys,zipfile
 with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
@@ -61,11 +61,13 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
     throw new Error(`Unexpected transport: ${path}`);
   };
   const root = () => mkdtemp(join(f.temporary, 'download-'));
-  const core = { info: () => {}, warning: () => {}, error: () => {} };
+  const records = [];
+  const emit = line => records.push(JSON.parse(line));
+  const core = { info: emit, warning: emit, error: emit };
   const recover = async () => recoverExecution({ api, repository, runId: '13', attempt: '1', root: await root(), core });
   const prepare = async (extra = {}) => prepareExecution({ api, repository, runId: '20', attempt: '1', actor: 'Z-M-Huang', triggeringActor: 'Z-M-Huang',
     ref: 'refs/heads/main', resumeRunId: '13', plan: 'New context', runner, root: await root(), ...extra });
-  return { f, api, state, root, recover, prepare, exported };
+  return { f, api, state, root, recover, prepare, exported, records, core };
 }
 test('run-ID resume loads the latest verified full native state from an arbitrary caller workflow', async t => {
   const x = await transport(t), loaded = await loadRunCheckpoint(x.api, repository, '13', await x.root());
@@ -135,10 +137,89 @@ for (const scenario of ['error', 'clarification', 'cancelled', 'setup-timeout', 
 test('an ambiguous dispatch response is attempted once and reruns cannot dispatch again', async t => {
   const x = await transport(t); let dispatches = 0;
   const api = async (path, options) => { if (options?.method === 'POST') { dispatches++; throw new Error('uncertain response'); } return x.api(path, options); };
-  await assert.rejects(recoverExecution({ api, repository, runId: '13', attempt: '1', root: await x.root(), core: { info() {} } }));
+  await assert.rejects(recoverExecution({ api, repository, runId: '13', attempt: '1', root: await x.root(), core: x.core }), /uncertain response/);
   assert.equal(dispatches, 1);
-  assert.equal((await recoverExecution({ api, repository, runId: '13', attempt: '2', core: { info() {} } })).dispatched, false); assert.equal(dispatches, 1);
+  assert.equal((await recoverExecution({ api, repository, runId: '13', attempt: '2', core: x.core })).dispatched, false); assert.equal(dispatches, 1);
+  assert.equal(x.records[0].outcome, 'unconfirmed');
 });
+
+const interrupted = { outcome: 'failed', recovery_reason: 'native_worker_sigkill' };
+const bot = { actor: 'github-actions[bot]', triggeringActor: 'github-actions[bot]', plan: '' };
+function interruptedJob(job) {
+  job.conclusion = 'failure';
+  job.steps[1].conclusion = 'failure';
+  Object.assign(job.steps[2], { status: 'completed', conclusion: 'success', started_at: '2026-11-17T00:04:00Z' });
+}
+
+for (const runner of ['codex', 'claude']) test(`verified ${runner} worker interruption dispatches and admits one continuation`, async t => {
+  const x = await transport(t, runner, interrupted);
+  interruptedJob(x.state.job);
+  x.state.parent.status = 'in_progress';
+  assert.equal((await x.recover()).dispatched, true);
+  const posts = x.state.calls.filter(call => call.options?.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0].options.inputs, { runner, 'resume-run-id': '13', plan: '' });
+  const resumed = await x.prepare(bot);
+  assert.equal(resumed.restored.manifest.session_id, sessionId);
+  assert.equal(resumed.restored.manifest.runner, runner);
+  assert.equal(resumed.restored.manifest.recovery_reason, 'native_worker_sigkill');
+  assert.equal(resumed.automatic_recovery, 'native_worker_sigkill');
+  assert.equal(resumed.auto_count, 1);
+  const [decision] = x.records;
+  assert.equal(decision.event, 'continuation.dispatch');
+  assert.equal(decision.reason, 'native_worker_sigkill');
+  assert.equal(decision.parent_job_id, 70);
+  assert.equal(decision.artifact_id, 55);
+  assert.equal(decision.run_attempt, '1');
+  assert.equal(decision.native_conclusion, 'failure');
+  assert.equal(decision.final_save_conclusion, 'success');
+  assert.equal(decision.max_continuations, 3);
+  assert.ok(decision.elapsed_ms >= 0);
+  t.diagnostic(JSON.stringify(decision));
+});
+
+for (const scenario of ['cleanup-only failure', 'stale running snapshot', 'ordinary failed snapshot', 'failed final save', 'cancelled run', 'disabled policy', 'exhausted allowance']) {
+  test(`worker interruption recovery stops for ${scenario}`, async t => {
+    const metadata = scenario === 'stale running snapshot' || scenario === 'cleanup-only failure' ? {} :
+      scenario === 'ordinary failed snapshot' ? { outcome: 'failed' } : interrupted;
+    const x = await transport(t, 'codex', metadata);
+    interruptedJob(x.state.job);
+    if (scenario === 'cleanup-only failure') x.state.job.steps[1].conclusion = 'success';
+    if (scenario === 'cleanup-only failure' || scenario === 'failed final save') x.state.job.steps[2].conclusion = 'failure';
+    if (scenario === 'cancelled run') x.state.parent.conclusion = 'cancelled';
+    if (scenario === 'disabled policy') x.state.config = x.state.config.replace('auto-continue: true', 'auto-continue: false');
+    if (scenario === 'exhausted allowance') x.state.config += 'max-continuations: 0\n';
+    assert.equal((await x.recover()).dispatched, false);
+    assert.ok(!x.state.calls.some(call => call.options?.method === 'POST'));
+    await assert.rejects(x.prepare(bot));
+    if (scenario === 'cleanup-only failure') assert.equal((await x.prepare()).restored.manifest.session_id, sessionId);
+  });
+}
+
+for (const change of ['newer-attempt', 'failed-save', 'newer-checkpoint', 'ambiguous-checkpoint']) {
+  test(`worker interruption recovery fences ${change} before dispatch`, async t => {
+    const x = await transport(t, 'codex', interrupted);
+    interruptedJob(x.state.job);
+    let runReads = 0, jobReads = 0, artifactReads = 0;
+    const api = async (path, options) => {
+      const data = await x.api(path, options);
+      if (path.endsWith('/actions/runs/13') && ++runReads === 3 && change === 'newer-attempt') return { ...data, run_attempt: 2 };
+      if (path.includes('/attempts/1/jobs?') && ++jobReads === 2 && change === 'failed-save') {
+        return { jobs: [{ ...x.state.job, steps: x.state.job.steps.map(step =>
+          step.name === 'Save final session' ? { ...step, conclusion: 'failure' } : step) }] };
+      }
+      if (path.includes('/actions/runs/13/artifacts?') && ++artifactReads === 2 && change.endsWith('-checkpoint')) {
+        const name = change === 'newer-checkpoint' ? 'remote-dev-session-r13-a1-2' : x.state.artifact.name;
+        return { artifacts: [...data.artifacts, { ...x.state.artifact, id: 56, name }] };
+      }
+      return data;
+    };
+    await assert.rejects(recoverExecution({ api, repository, runId: '13', attempt: '1', root: await x.root(), core: x.core }),
+      /parent_execution_changed|recovery_checkpoint_changed|ambiguous_latest_checkpoint/);
+    assert.ok(!x.state.calls.some(call => call.options?.method === 'POST'));
+  });
+}
+
 test('snapshot retention removes only old snapshots of this run and attempt after replacement', async t => {
   const x = await transport(t);
   x.state.artifacts = [1, 2, 3, 4].map(id => ({ ...x.state.artifact, id, name: `remote-dev-session-r13-a1-${id}` }));
@@ -162,6 +243,8 @@ test('manifest validation rejects legacy schemas, unsupported native versions an
   assert.equal(validateCheckpoint(manifest, repository).session_id, sessionId);
   for (const changed of [{ ...manifest, schema_version: 4 }, { ...manifest, runner_version: '0.0.1' }, { ...manifest, files: [{ path: '../auth', bytes: 0, sha256: 'a'.repeat(64) }] }]) assert.throws(() => validateCheckpoint(changed, repository));
   assert.throws(() => validateProducer({ ...x.state.artifact, workflow_run: { id: 99 } }, x.state.parent, manifest, repository));
+  assert.throws(() => validateManifest({ ...manifest, recovery_reason: 'native_worker_sigkill' }, { repository }), /invalid_checkpoint_recovery_reason/);
+  assert.throws(() => validateManifest({ ...manifest, outcome: 'failed', recovery_reason: 'unknown' }, { repository }), /invalid_checkpoint_recovery_reason/);
 });
 
 test('native timeout remains eligible when skipped cleanup steps have timestamps', () => {

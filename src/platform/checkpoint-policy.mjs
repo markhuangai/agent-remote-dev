@@ -78,6 +78,7 @@ export function validateManifest(value, { repository, runner, runnerVersion } = 
   invariant(positiveId(value.root_run_id) && positiveId(value.activation_run_id) && Number.isSafeInteger(value.auto_count) && value.auto_count >= 0 && value.auto_count <= 100 &&
     typeof value.operator === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(value.operator), 'invalid_session_lineage');
   invariant(['running', 'completed', 'failed', 'cancelled'].includes(value.outcome), 'invalid_native_outcome');
+  invariant(value.recovery_reason === undefined || value.outcome === 'failed' && value.recovery_reason === 'native_worker_sigkill', 'invalid_checkpoint_recovery_reason');
   invariant(Number.isSafeInteger(value.sequence) && value.sequence > 0 && Array.isArray(value.files) && value.files.length <= 10000, 'invalid_checkpoint_inventory');
   const paths = new Set(); let bytes = Buffer.byteLength(JSON.stringify(value));
   for (const file of value.files) {
