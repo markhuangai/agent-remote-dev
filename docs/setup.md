@@ -430,21 +430,30 @@ integrity, credential exclusion, native version and session references are
 verified. Expired artifacts, unrelated producers, unsupported native versions and
 legacy checkpoint formats stop restoration with diagnostics.
 
-Enable `auto-continue: true` to recover after GitHub times out the Agent execution
-job. A separate recovery job checks the actual execution step, current policy,
-saved session and continuation limit before dispatching the same consumer
-workflow. Setup or upload timeouts, normal returns, clarification, errors and
-cancellation do not trigger continuation. The default maximum is three automatic
-runs; explicit manual resume starts a fresh allowance. Recovery dispatch happens
-only on the parent's first attempt, without automatic retries of ambiguous API
-responses. Manual cancellation stops that run; inspect and cancel any child
-already dispatched during a race.
+Enable `auto-continue: true` to recover after a native execution timeout or an
+unexpected native worker `SIGKILL`. For a worker kill, the supervisor must confirm
+that the session started, the worker died before returning a result, and its
+descendants exited. The final-save step must publish a verified checkpoint
+recording the interruption. A separate recovery job checks the execution steps,
+current policy, checkpoint and continuation limit before dispatching the same
+consumer workflow. The default maximum is three automatic runs. An explicit
+manual resume by run ID starts a fresh allowance.
+
+Setup and upload timeouts, completed turns, ordinary failed exits and
+cancellation are ineligible for automatic continuation. Dispatch happens only
+on the parent's first attempt. An ambiguous dispatch requires inspection before
+another request. If a worker was interrupted, check published work and external
+effects before repeating an operation. After cancellation, inspect and cancel
+any child already dispatched during a race.
 
 Recovery uses the last completed upload, not the terminated runner's disk. A
 60-second capture interval does not guarantee only 60 seconds of lost progress:
 upload failures, validation failures or slow storage can leave an older snapshot.
-A downstream job cannot retrieve files from a terminated runner. Final-save is a
-separate step, so a failure while saving cannot masquerade as a native timeout.
+A downstream job uses the uploaded checkpoint. If a final upload loses its
+receipt, the final-save step can verify a stored artifact by comparing its
+contents with the local export. A completed GitHub-hosted run can finish with a
+cleanup warning when both final artifacts are confirmed. On self-hosted runners,
+inspect and correct a cleanup error before reusing the runner.
 
 ## Deliver an audited implementation through a PR
 
@@ -471,7 +480,7 @@ head after the PR opens.
 ## Diagnose runtime infrastructure
 
 ```bash
-gh run view RUN_ID --repo OWNER/REPO --log | rg 'submission\.|runtime\.|checkpoint\.|resume\.|continuation\.|release\.'
+gh run view RUN_ID --repo OWNER/REPO --attempt ATTEMPT --log | rg 'submission\.|runtime\.|checkpoint\.|artifact\.reconcile|resume\.|continuation\.|release\.'
 ```
 
 INFO records identify setup, dependency versions, selected skills, current config

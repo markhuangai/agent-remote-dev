@@ -7,15 +7,16 @@ export async function workflowCommand(mode, { github, core, env = process.env })
   try {
     const common = { api, repository, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT,
       root: join(env.RUNNER_TEMP, `remote-dev-${mode}-${env.GITHUB_RUN_ID}-${env.GITHUB_RUN_ATTEMPT}`) };
-    if (mode === 'recover') return await recoverExecution({ ...common, core });
+    if (mode === 'recover') return await recoverExecution({ ...common, core, env });
     const prepared = await prepareExecution({ ...common, actor: env.GITHUB_ACTOR, triggeringActor: env.TRIGGERING_ACTOR, ref: env.GITHUB_REF,
       resumeRunId: env.REMOTE_DEV_RESUME_RUN_ID ?? '', plan: env.REMOTE_DEV_PLAN ?? '', runner: env.REMOTE_DEV_RUNNER ?? 'codex' });
     for (const [name, value] of Object.entries({ root_run_id: prepared.root_run_id, source_sha: prepared.source_sha })) core.setOutput(name, value);
     logEvent(core, 'submission.resolve', 'INFO', { root_run_id: prepared.root_run_id, config_sha256: prepared.config_sha256, outcome: 'authorized' }, env);
     return prepared;
   } catch (error) {
-    logEvent(core, 'submission.workflow', 'ERROR', { ...safeError(error), outcome: 'blocked' }, env);
-    core.setFailed('Remote development preparation failed; inspect structured diagnostics.');
+    if (mode !== 'recover') logEvent(core, 'submission.workflow', 'ERROR', { ...safeError(error), outcome: 'blocked' }, env);
+    core.setFailed(mode === 'recover' ? 'Automatic continuation failed; inspect structured diagnostics.' :
+      'Remote development preparation failed; inspect structured diagnostics.');
     return null;
   }
 }

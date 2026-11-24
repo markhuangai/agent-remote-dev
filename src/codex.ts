@@ -56,12 +56,14 @@ export function logCodexActivity(log: Diagnostics, event: any, session: string) 
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
-  let observed: string | undefined, identityChanged = false;
+  let observed: string | undefined, identityChanged = false, terminal = false;
   await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, output, session), {
     cwd, env: job.env, stage: "codex", onControl, log, timeoutMs, stdin: prompt, collect: false,
+    nativeSessionUnfinished: () => Boolean(observed) && !identityChanged && !terminal,
     onLine(line) {
       let value: any;
       try { value = JSON.parse(line); } catch { return; }
+      if (value?.type === "turn.completed" || value?.type === "turn.failed") terminal = true;
       if (value.type === "thread.started" && typeof value.thread_id === "string") {
         if (session && value.thread_id !== session || observed && value.thread_id !== observed) { identityChanged = true; return; }
         observed = value.thread_id;

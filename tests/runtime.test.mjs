@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
@@ -90,6 +90,76 @@ test("safe tree and cleanup refuse export symlinks and never follow cleanup link
   await assert.rejects(safeTree(f.job.home), { reason: "symlink_not_allowed" });
   await removeJob(f.job.home);
   assert.equal(await readFile(outside, "utf8"), "retain");
+});
+
+async function readOnlyCache(home) {
+  const module = join(home, "go/pkg/mod/example@v1");
+  await mkdir(module, { recursive: true });
+  await writeFile(join(module, "README"), "module cache", { mode: 0o444 });
+  for (const name of ["go/pkg/mod/example@v1", "go/pkg/mod", "go/pkg", "go"]) await chmod(join(home, name), 0o555);
+}
+
+test("job cleanup repairs a read-only module cache and preserves the target of an outside directory link", async t => {
+  assert.notEqual(process.geteuid(), 0);
+  const f = await fixture(t);
+  const outside = join(f.temporary, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "sentinel"), "retain");
+  await chmod(outside, 0o555);
+  await symlink(outside, join(f.job.home, "alias"));
+  await readOnlyCache(f.job.home);
+  await removeJob(f.job.home);
+  await assert.rejects(lstat(f.job.home), { code: "ENOENT" });
+  assert.equal((await lstat(outside)).mode & 0o777, 0o555);
+  assert.equal(await readFile(join(outside, "sentinel"), "utf8"), "retain");
+});
+
+test("job cleanup can remove an empty read-only foreign-owned directory from a writable parent", async t => {
+  const f = await fixture(t);
+  const foreign = join(f.job.home, "foreign-owned");
+  await exec("sudo", ["-n", "install", "-d", "-o", "root", "-m", "0555", foreign]);
+  const stat = await lstat(foreign);
+  assert.notEqual(stat.uid, process.geteuid());
+  assert.equal(stat.mode & 0o777, 0o555);
+  await removeJob(f.job.home);
+  await assert.rejects(lstat(f.job.home), { code: "ENOENT" });
+});
+
+for (const variant of ["kill", "exit-137", "terminal", "cancel"]) test(`native worker recovery distinguishes ${variant} using the real supervisor`, async t => {
+  const f = await fixture(t);
+  const processModule = JSON.stringify(new URL("../.build/process.js", import.meta.url).href);
+  const script = `
+    import { command } from ${processModule};
+    const variant = process.argv[1];
+    const snippets = {
+      kill: 'process.kill(process.pid, "SIGKILL")',
+      "exit-137": 'process.exit(137)',
+      terminal: 'console.log("terminal"); process.kill(process.pid, "SIGKILL")',
+      cancel: 'process.on("SIGTERM", () => {}); console.log("ready"); setInterval(() => {}, 1000)',
+    };
+    let terminal = false;
+    try {
+      await command(process.execPath, ["-e", snippets[variant]], {
+        cwd: process.cwd(), env: process.env, timeoutMs: 8000, stage: "codex",
+        nativeSessionUnfinished: () => !terminal,
+        onLine(line) {
+          if (line === "terminal") terminal = true;
+          if (line === "ready") process.kill(process.pid, "SIGTERM");
+        },
+      });
+    } catch (error) {
+      console.log(JSON.stringify({ reason: error.reason, ...error.details }));
+    }
+  `;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, variant], { env: f.job.env });
+  const evidence = JSON.parse(stdout);
+  assert.equal(evidence.reason, { kill: "native_worker_sigkill", "exit-137": "command_failed",
+    terminal: "command_failed", cancel: "command_cancelled" }[variant]);
+  if (variant === "kill") {
+    assert.equal(evidence.worker_exit_code, -9);
+    assert.equal(evidence.quiescent, true);
+    assert.equal(evidence.output_closed, true);
+  }
 });
 
 test("checkpoint exports exact session state and consistent SQLite backups, excluding secrets and caches", async (t) => {
@@ -293,6 +363,206 @@ test("the real Actions logger retains required failure evidence after DEBUG filt
   const line=output.split("\n").find(line=>line.includes('"event":"runtime.failed"'));
   const evidence=JSON.parse(line.slice(line.indexOf("{")));
   assert.equal(evidence.stage,"checkpoint");assert.equal(evidence.expected_sha,"a".repeat(40));assert.equal(evidence.observed_sha,"b".repeat(40));assert.equal(evidence.last_durable_checkpoint.artifact_id,17);
+});
+
+async function finalization(t, { host, denyCleanup = false, lost = [], failResult = false, conflicting = null, protectResult = false }) {
+  assert.notEqual(process.geteuid(), 0);
+  const f = await fixture(t), repo = await repository(f);
+  await history(f);
+  await readOnlyCache(f.job.home);
+  const previous = { artifact_id: 72, sequence: 3, checkpoint_sha: repo.base };
+  const payload = "fixture-result-private-content-8147";
+  const statePath = join(f.job.root, "state.json");
+  await writeFile(join(f.job.root, "latest.json"), JSON.stringify(previous));
+  await writeFile(statePath, JSON.stringify({ job: f.job, metadata: checkpoint({ outcome: "completed", workspace: repo.cwd }),
+    secrets: [...f.log.protectedValues, ...(protectResult ? [payload] : [])], response: payload, latest: previous }), { mode: 0o600 });
+  const outputFile = join(f.temporary, "actions-output"), summaryFile = join(f.temporary, "actions-summary");
+  await writeFile(outputFile, "");
+  await writeFile(summaryFile, "");
+
+  const remote = { full_name: "fixture/repo", id: 9 };
+  const run = { id: 13, run_attempt: 1, workflow_id: lineage.workflow_id, head_sha: lineage.workflow_sha,
+    head_branch: lineage.branch, path: lineage.workflow_path, event: "workflow_dispatch", repository: remote, head_repository: remote };
+  const assets = new Map(), attempts = [], lookups = [];
+  let endpoint;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, endpoint);
+    const json = (status, body) => response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(body));
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    if (url.pathname.endsWith("/CreateArtifact")) {
+      const { name } = JSON.parse(body);
+      const id = name.startsWith("remote-dev-session-") ? 80 : 81;
+      assets.set(id, { name, blocks: [], finalized: false });
+      return json(200, { ok: true, signedUploadUrl: endpoint + "/account/container/" + id });
+    }
+    if (url.pathname.startsWith("/account/container/") && request.method === "PUT") {
+      const asset = assets.get(Number(url.pathname.split("/").at(-1)));
+      if (url.searchParams.get("comp") === "block") asset.blocks.push(body);
+      return response.writeHead(201, { etag: '"fixture-blob"' }).end();
+    }
+    if (url.pathname.endsWith("/FinalizeArtifact")) {
+      const { name } = JSON.parse(body);
+      const id = name.startsWith("remote-dev-session-") ? 80 : 81;
+      attempts.push(id);
+      if (id === 81 && failResult) return json(409, { msg: "fixture upload rejected" });
+      assets.get(id).finalized = true;
+      if (lost.includes(id)) return response.destroy();
+      return json(200, { ok: true, artifactId: String(id) });
+    }
+    const runPath = "/repos/fixture/repo/actions/runs/13";
+    if (url.pathname === runPath) return json(200, run);
+    const metadata = ([id, asset]) => ({ id, name: asset.name, size_in_bytes: Buffer.concat(asset.blocks).length,
+      expired: false, expires_at: "2099-01-01T00:00:00Z", workflow_run: {
+        id: run.id, repository_id: remote.id, head_repository_id: remote.id, head_sha: run.head_sha, head_branch: run.head_branch,
+      } });
+    if (url.pathname === runPath + "/artifacts") {
+      const name = url.searchParams.get("name");
+      if (name) lookups.push(name);
+      const artifacts = [...assets].filter(([, asset]) => asset.finalized && (!name || asset.name === name)).map(metadata);
+      if (name && conflicting === "duplicate" && artifacts.length) artifacts.push({ ...artifacts[0], id: 82 });
+      return json(200, { artifacts });
+    }
+    const artifact = url.pathname.match(/^\/repos\/fixture\/repo\/actions\/artifacts\/(80|81)(\/zip)?$/);
+    if (artifact) {
+      const id = Number(artifact[1]), asset = assets.get(id);
+      if (!asset?.finalized) return json(404, { message: "fixture artifact absent" });
+      if (!artifact[2]) return json(200, metadata([id, asset]));
+      const bytes = conflicting === "content" && id === 81 ? await readFile(join(f.temporary, "wrong-record.zip")) : Buffer.concat(asset.blocks);
+      return response.writeHead(200, { "Content-Type": "application/zip" }).end(bytes);
+    }
+    return json(404, { message: "unrecognized fixture endpoint" });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  endpoint = "http://127.0.0.1:" + server.address().port;
+  if (conflicting === "content") {
+    await exec("python3", ["-c", 'import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1], "w") as z: z.writestr("record.json", "{}")',
+      join(f.temporary, "wrong-record.zip")]);
+  }
+  const token = "e30." + Buffer.from(JSON.stringify({ scp: "Actions.Results:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222" })).toString("base64url") + ".fixture";
+  const env = { ...process.env, RUNNER_TEMP: f.temporary, TMPDIR: join(f.job.root, "tmp"), NO_PROXY: "127.0.0.1,localhost",
+    GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: summaryFile, ACTIONS_RESULTS_URL: endpoint, ACTIONS_RUNTIME_TOKEN: token, REMOTE_DEV_UPLOAD_TIMEOUT_MS: "7000" };
+  if (host === undefined) delete env.RUNNER_ENVIRONMENT;
+  else env.RUNNER_ENVIRONMENT = host;
+  const script = `
+    import { finish } from ${JSON.stringify(new URL("../.build/main.js", import.meta.url).href)};
+    const [statePath, endpoint] = process.argv.slice(1);
+    const github = { request: async (route, options) => {
+      const [method, path] = route.split(" ");
+      const response = await fetch(endpoint + path, { method, signal: options.request?.signal });
+      if (!response.ok) throw Object.assign(new Error("Fixture GitHub request failed"), { status: response.status });
+      return { data: path.endsWith("/zip") ? await response.arrayBuffer() : await response.json() };
+    } };
+    await finish({ github, statePath });
+  `;
+  let stdout, code = 0;
+  if (denyCleanup) await chmod(f.temporary, 0o555);
+  try {
+    ({ stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, statePath, endpoint], { env, timeout: 35000 }));
+  } catch (error) {
+    assert.equal(error.code, 1, error.stderr);
+    ({ stdout, code } = error);
+  } finally {
+    if (denyCleanup) await chmod(f.temporary, 0o700);
+  }
+  const lines = stdout.split("\n").filter(line => !line.startsWith("::debug::") && !line.startsWith("::add-mask::"));
+  assert.ok(lines.every(line => !line.includes(f.temporary) && !line.includes(payload) &&
+    f.log.protectedValues.every(secret => !line.includes(secret))));
+  const records = lines.filter(line => line.includes('"schema_version":1')).map(line => JSON.parse(line.slice(line.indexOf("{"))));
+  const cleanup = records.find(record => record.reason === "job_cleanup_failed");
+  const exportFailure = records.find(record => record.event === "runtime.failed" && record.stage !== "cleanup");
+  const reconciled = records.filter(record => record.event === "artifact.reconcile");
+  if (denyCleanup) assert.deepEqual(await readdir(f.job.root), []);
+  else await assert.rejects(lstat(f.job.root), { code: "ENOENT" });
+  return { code, cleanup, exportFailure, reconciled, attempts, lookups, assets, records, previous };
+}
+
+test("final cleanup removes the Go cache after successful uploads", async t => {
+  const result = await finalization(t, { host: "github-hosted" });
+  assert.equal(result.code, 0);
+  assert.equal(result.cleanup, undefined);
+  assert.deepEqual(result.attempts, [80, 81]);
+  assert.deepEqual(result.lookups, []);
+});
+
+for (const host of ["github-hosted", "self-hosted", undefined]) test(`final cleanup reports a real denied rmdir on ${host ?? "an unknown runner"}`, async t => {
+  const result = await finalization(t, { host, denyCleanup: true, lost: host === "github-hosted" ? [80, 81] : [] });
+  const warning = host === "github-hosted";
+  assert.equal(result.code, warning ? 0 : 1);
+  assert.equal(result.exportFailure, undefined);
+  assert.deepEqual(result.attempts, [80, 81]);
+  assert.deepEqual(result.reconciled.map(record => [record.outcome, record.artifact_id]), warning ? [["reconciled", 80], ["reconciled", 81]] : []);
+  const { cleanup } = result;
+  assert.equal(cleanup.level, warning ? "WARN" : "ERROR");
+  assert.equal(cleanup.runner_environment, host ?? "unknown");
+  assert.equal(cleanup.stage, "cleanup");
+  assert.equal(cleanup.syscall, "rmdir");
+  assert.equal(cleanup.errno_code, "EACCES");
+  assert.equal(cleanup.run_id, "13");
+  assert.equal(cleanup.run_attempt, "1");
+  assert.equal(cleanup.session_id, sessionId);
+  assert.equal(cleanup.last_durable_checkpoint.artifact_id, 80);
+  assert.equal(cleanup.result_artifact_id, 81);
+  assert.ok(cleanup.elapsed_ms >= 0);
+  t.diagnostic(JSON.stringify(cleanup));
+});
+
+test("final cleanup preserves a separate failed export and its saved checkpoint", async t => {
+  const result = await finalization(t, { host: "github-hosted", denyCleanup: true, failResult: true });
+  assert.equal(result.code, 1);
+  assert.equal(result.exportFailure.stage, "artifact_upload");
+  assert.equal(result.exportFailure.last_durable_checkpoint.artifact_id, 80);
+  assert.equal(result.cleanup.level, "ERROR");
+  assert.equal(result.cleanup.result_artifact_id, null);
+  assert.equal(result.reconciled[0].reason, "artifact_receipt_not_found");
+});
+
+for (const [conflicting, reason, id] of [["duplicate", "ambiguous_artifact_receipt", 80], ["content", "artifact_content_mismatch", 81]]) {
+  test(`final artifact recovery rejects ${conflicting} evidence without another upload`, async t => {
+    const result = await finalization(t, { host: "github-hosted", lost: [id], conflicting });
+    assert.equal(result.code, 1);
+    assert.equal(result.lookups.length, 1);
+    assert.deepEqual(result.attempts, id === 80 ? [80] : [80, 81]);
+    assert.equal(result.reconciled[0].reason, reason);
+    assert.equal(result.exportFailure.last_durable_checkpoint.artifact_id, id === 80 ? result.previous.artifact_id : 80);
+  });
+}
+
+test("final credential validation stops before attempting or reconciling the result upload", async t => {
+  const result = await finalization(t, { host: "github-hosted", protectResult: true });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.attempts, [80]);
+  assert.deepEqual(result.lookups, []);
+  assert.equal(result.exportFailure.reason, "credential_in_result");
+});
+
+test("final artifact recovery leaves SDK file validation failed even when the exact artifact already exists", async t => {
+  const f = await fixture(t);
+  const name = "remote-dev-result-r13-a1";
+  await writeFile(join(f.job.exports, "record.json"), "{}");
+  const archive = join(f.temporary, "stored-result.zip");
+  await exec("python3", ["-c", 'import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1], "w") as z: z.write(sys.argv[2], "record.json")',
+    archive, join(f.job.exports, "record.json")]);
+  const bytes = await readFile(archive);
+  const remote = { full_name: "fixture/repo", id: 9 };
+  const artifact = { id: 81, name, size_in_bytes: bytes.length, expired: false, expires_at: "2099-01-01T00:00:00Z",
+    workflow_run: { id: 13, repository_id: remote.id, head_repository_id: remote.id, head_sha: lineage.workflow_sha, head_branch: lineage.branch } };
+  const calls = [];
+  const api = async path => {
+    calls.push(path);
+    if (path.endsWith("/runs/13")) return { id: 13, run_attempt: 1, repository: remote, head_repository: remote,
+      event: "workflow_dispatch", workflow_id: lineage.workflow_id, path: lineage.workflow_path, head_sha: lineage.workflow_sha, head_branch: lineage.branch };
+    if (path.includes("/runs/13/artifacts?")) return { artifacts: [artifact] };
+    if (path.endsWith("/artifacts/81")) return artifact;
+    if (path.endsWith("/artifacts/81/zip")) return bytes;
+    throw new Error("Unexpected fixture GitHub request");
+  };
+  await assert.rejects(uploadSnapshot(f.job, name, [], f.job.exports, f.log, f.job.env,
+    { api, metadata: checkpoint({ outcome: "completed" }), kind: "record" }), { reason: "command_failed" });
+  assert.deepEqual(calls, []);
+  assert.ok(f.records.every(record => record.event !== "artifact.reconcile"));
 });
 
 for (const mode of ['direct', 'threaded', 'resume-in-flight']) test(`a managed live SQLite/WAL writer pauses for consistent snapshots and resumes afterward (${mode})`, async t => {

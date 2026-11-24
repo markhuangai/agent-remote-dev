@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { channel } from "node:diagnostics_channel";
 import { openSync, closeSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
+import type { ClientRequest } from "node:http";
 import { join } from "node:path";
 import { DefaultArtifactClient } from "@actions/artifact";
 import { command, processControl } from "./process.js";
@@ -9,22 +11,65 @@ import { durableCheckpoint } from "./checkpoint.js";
 import { TaskGit } from "./git.js";
 import { Diagnostics } from "./diagnostics.js";
 import { pruneSnapshots } from "./platform/continuation-policy.mjs";
+import { reconcileUpload } from "./platform/artifact-io.mjs";
+import { safeError } from "./platform/runtime-log.mjs";
+import type { CheckpointInput } from "./checkpoint.js";
 import type { Job } from "./setup.js";
 import type { SavedRun } from "./main.js";
 
+const uploadAttempted = "remote-dev:artifact-upload-attempted";
 export async function checkpointWorker(path: string) {
   const request = JSON.parse(await readFile(path, "utf8"));
-  const result = await new DefaultArtifactClient().uploadArtifact(request.name, request.files, request.root);
-  requireValue(Number.isSafeInteger(result.id) && result.id! > 0, "missing_artifact_receipt", "checkpoint");
-  await writeFile(request.result, JSON.stringify({ id: result.id }), { mode: 0o600 });
+  const requests = channel("http.client.request.start");
+  let attempted = false;
+  // The pinned SDK validates local inputs before issuing CreateArtifact.
+  const observe = (message: unknown) => {
+    const { request: outgoing } = message as { request: ClientRequest };
+    if (!attempted && outgoing.method === "POST" && outgoing.path === "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact") {
+      attempted = true;
+      process.stdout.write(uploadAttempted + "\n");
+    }
+  };
+  if (request.observeUpload) requests.subscribe(observe);
+  try {
+    const result = await new DefaultArtifactClient().uploadArtifact(request.name, request.files, request.root);
+    requireValue(Number.isSafeInteger(result.id) && result.id! > 0, "missing_artifact_receipt", "checkpoint");
+    await writeFile(request.result, JSON.stringify({ id: result.id }), { mode: 0o600 });
+  } finally {
+    if (request.observeUpload) requests.unsubscribe(observe);
+  }
 }
-export async function uploadSnapshot(job: Job, name: string, files: string[], root: string, log: Diagnostics, environment = process.env) {
+type FinalUpload = { api: (path: string, options?: any) => Promise<any>; metadata: CheckpointInput; kind: "checkpoint" | "record" };
+export async function uploadSnapshot(job: Job, name: string, files: string[], root: string, log: Diagnostics, environment = process.env, final?: FinalUpload): Promise<{ id: number }> {
   const request = join(root, "upload.json"), result = join(root, "receipt.json");
-  await writeFile(request, JSON.stringify({ name, files, root, result }), { mode: 0o600 });
-  await command(process.execPath, [join(import.meta.dirname, "entry.js"), "--upload", request], {
-    cwd: job.root, env: environment, stage: "artifact_upload", log, timeoutMs: Number(environment.REMOTE_DEV_UPLOAD_TIMEOUT_MS ?? 45000), collect: false,
-  });
-  return JSON.parse(await readFile(result, "utf8"));
+  await writeFile(request, JSON.stringify({ name, files, root, result, observeUpload: Boolean(final) }), { mode: 0o600 });
+  let attempted = false;
+  try {
+    await command(process.execPath, [join(import.meta.dirname, "entry.js"), "--upload", request], {
+      cwd: job.root, env: environment, stage: "artifact_upload", log, timeoutMs: Number(environment.REMOTE_DEV_UPLOAD_TIMEOUT_MS ?? 45000), collect: false,
+      onLine: final ? line => { if (line === uploadAttempted) attempted = true; } : undefined,
+    });
+    const receipt = JSON.parse(await readFile(result, "utf8"));
+    requireValue(Number.isSafeInteger(receipt?.id) && receipt.id > 0, "missing_artifact_receipt", "artifact_upload");
+    return receipt;
+  } catch (error) {
+    if (!final || !attempted || error instanceof RunnerError && error.reason === "command_cancelled") throw error;
+
+    const started = Date.now(), signal = AbortSignal.timeout(20000);
+    const { metadata, kind } = final;
+    const fields = { stage: "artifact_upload", artifact_name: name, artifact_kind: kind, lookup_attempt: 1,
+      upload_failure_reason: error instanceof RunnerError ? error.reason : "missing_artifact_receipt" };
+    try {
+      const receipt = await reconcileUpload({ api: path => final.api(path, { request: { signal } }),
+        repository: metadata.repository, lineage: metadata.lineage, name, root, kind });
+      log.event("artifact.reconcile", "INFO", { ...fields, outcome: "reconciled", reason: "artifact_verified",
+        artifact_id: receipt.id, elapsed_ms: Date.now() - started });
+      return receipt;
+    } catch (failure) {
+      log.event("artifact.reconcile", "WARN", { ...fields, ...safeError(failure), outcome: "unconfirmed", elapsed_ms: Date.now() - started });
+      throw error;
+    }
+  }
 }
 export async function startSnapshots(path: string, job: Job) {
   const fd = openSync(join(job.root, "snapshots.log"), "a", 0o600);

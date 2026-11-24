@@ -1,4 +1,4 @@
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, sep } from "node:path";
 import { Diagnostics } from "./diagnostics.js";
 import { command } from "./process.js";
@@ -103,6 +103,9 @@ export async function safeTree(root: string) {
 export async function removeJob(root: string) {
   const stat = await lstat(root);
   if (stat.isDirectory() && !stat.isSymbolicLink()) {
+    if (stat.uid === process.geteuid?.() && (stat.mode & 0o700) !== 0o700) {
+      await chmod(root, (stat.mode & 0o7777) | 0o700);
+    }
     for (const name of await readdir(root)) await removeJob(join(root, name));
     await rmdir(root);
   } else await unlink(root);
