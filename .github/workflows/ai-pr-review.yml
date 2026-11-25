@@ -23,7 +23,7 @@ permissions:
 env:
   TRIGGERING_ACTOR: ${{ github.triggering_actor }}
   REVIEW_MODEL: auto
-  REVIEW_EFFORT: high
+  REVIEW_EFFORT: medium
 
 jobs:
   resolve:
