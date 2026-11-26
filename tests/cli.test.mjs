@@ -105,6 +105,38 @@ test('Codex command events suppress the diff after a real symlink move', async t
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-4398|new-unregistered-secret-4398/);
 });
 
+test('Codex command events suppress an expanded external patch target', async t => {
+  const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'external.txt');
+  await writeFile(outside, 'old-unregistered-secret-5267\n');
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: $TARGET\n@@\n-old-unregistered-secret-5267\n+new-unregistered-secret-5267\n*** End Patch';
+  const command = `apply_patch <<PATCH\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd,
+    env: { ...f.job.env, TARGET: outside, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.equal(await readFile(outside, 'utf8'), 'new-unregistered-secret-5267\n');
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'expanded', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('shell expansion unresolved')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-5267|new-unregistered-secret-5267/);
+});
+
+test('Codex identity failures retain the conflicting session ID', async t => {
+  const f = await fixture(t), r = await repository(f), binary = join(f.job.tools, 'node_modules/.bin/codex');
+  const expected = 'expected-session-1428', observed = 'observed-session-2428';
+  for (const exit of [0, 1]) {
+    await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' '{"type":"thread.started","thread_id":"${observed}"}' '{"type":"turn.completed"}'\nexit ${exit}\n`, { mode: 0o700 });
+    await assert.rejects(runCodex(f.job, r.cwd, 'Continue the fixture.', f.log, 60000, `identity-${exit}`, expected), error => {
+      assert.equal(error.reason, exit ? 'command_failed' : 'conversation_identity_changed');
+      assert.equal(error.details.expected_session, expected); assert.equal(error.details.observed_session, observed);
+      f.log.failure(error); return true;
+    });
+    const failure = f.records.at(-1);
+    assert.equal(failure.expected_session, expected); assert.equal(failure.observed_session, observed);
+  }
+});
+
 test('Codex command events suppress move diffs for sensitive destinations', () => {
   const { log, lines } = logger();
   const patch = '*** Begin Patch\n*** Update File: config.txt\n*** Move to: .env\n@@\n-old-unregistered-secret-6249\n+new-unregistered-secret-6249\n*** End Patch';

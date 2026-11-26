@@ -896,6 +896,19 @@ test("patch detection ignores heredoc data and binds patches to their executable
   assert.equal(edits.length, 1); assert.equal(edits[0].suppressed, "working directory unknown");
 });
 
+test("patch parsing suppresses unresolved shell expansion while preserving quoted heredocs", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const patch = '*** Begin Patch\n*** Update File: $TARGET\n@@\n-before\n+after\n*** End Patch';
+  const command = marker => `apply_patch <<${marker}\n${patch}\nPATCH`;
+  const expanded = parseApplyPatch(command('PATCH'), "", r.cwd);
+  assert.equal(expanded[0].path, "<outside-workspace>"); assert.equal(expanded[0].suppressed, "shell expansion unresolved");
+  assert.equal(expanded[0].diff, undefined);
+  const quoted = parseApplyPatch(command("'PATCH'"), "", r.cwd);
+  assert.equal(quoted[0].path, "$TARGET"); assert.match(quoted[0].diff, /\+after/);
+  const wrapped = parseApplyPatch(`/bin/bash -c "${command("'PATCH'")}"`, "", r.cwd);
+  assert.equal(wrapped[0].suppressed, "shell expansion unresolved"); assert.equal(wrapped[0].diff, undefined);
+});
+
 test("patch parsing suppresses diffs when the effective shell directory is outside or uncertain", async t => {
   const f = await fixture(t), r = await repository(f);
   const patch = "*** Begin Patch\n*** Update File: config.txt\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch";

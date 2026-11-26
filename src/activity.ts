@@ -45,9 +45,11 @@ function unwrapCommand(command: string) {
   return wrapper ? wrapper[2] : command;
 }
 
-function commandSegments(command: string, separators?: string[], bodies?: Map<number, string[]>) {
+type HereDocument = { text: string; expands: boolean };
+
+function commandSegments(command: string, separators?: string[], bodies?: Map<number, HereDocument[]>) {
   const result: string[] = [];
-  const heredocs: { delimiter: string; stripTabs: boolean; segment: number }[] = [];
+  const heredocs: { delimiter: string; stripTabs: boolean; segment: number; expands: boolean }[] = [];
   let quote = "", escaped = false, start = 0;
   for (let index = 0; index < command.length; index++) {
     const character = command[index];
@@ -59,7 +61,8 @@ function commandSegments(command: string, separators?: string[], bodies?: Map<nu
       if (command[index + 2] === "<") { index += 2; continue; }
       const match = /^<<(-)?[ \t]*(?:'([^'\n]*)'|"([^"$`\\\n]*)"|([\w./-]+))(?=[\s;&|<>]|$)/.exec(command.slice(index));
       if (!match) return result;
-      heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], stripTabs: Boolean(match[1]), segment: result.length });
+      heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], stripTabs: Boolean(match[1]), segment: result.length,
+        expands: match[2] === undefined && match[3] === undefined });
       index += match[0].length - 1;
       continue;
     }
@@ -70,7 +73,7 @@ function commandSegments(command: string, separators?: string[], bodies?: Map<nu
       start = index + 1;
       if (character === "\n" && heredocs.length) {
         let cursor = start;
-        for (const { delimiter, stripTabs, segment } of heredocs) {
+        for (const { delimiter, stripTabs, segment, expands } of heredocs) {
           const bodyStart = cursor;
           let found = false;
           while (cursor < command.length) {
@@ -80,7 +83,7 @@ function commandSegments(command: string, separators?: string[], bodies?: Map<nu
             cursor = end < 0 ? command.length : end + 1;
             if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) {
               const body = command.slice(bodyStart, lineStart);
-              if (bodies) bodies.set(segment, [...(bodies.get(segment) ?? []), stripTabs ? body.replace(/^\t+/gm, "") : body]);
+              if (bodies) bodies.set(segment, [...(bodies.get(segment) ?? []), { text: stripTabs ? body.replace(/^\t+/gm, "") : body, expands }]);
               found = true; break;
             }
           }
@@ -135,11 +138,18 @@ export function editForPath(path: string, kind: string, diff: string | undefined
 export function parseApplyPatch(command: string, output: string, cwd: string): ActivityEdit[] | null {
   const unwrapped = unwrapCommand(command);
   const separators: string[] = [];
-  const bodies = new Map<number, string[]>();
+  const bodies = new Map<number, HereDocument[]>();
   let base: string | undefined = cwd, found = false, changedDirectory = false;
-  let patchSource = "";
+  let patchSource = "", expansion = false;
+  const doubleWrapped = /^\s*(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+"/.test(command);
   for (const [index, segment] of commandSegments(unwrapped, separators, bodies).entries()) {
-    if (/^apply_patch(?:\s|$)/.test(segment)) { found = true; patchSource = [segment, ...(bodies.get(index) ?? [])].join("\n"); break; }
+    if (/^apply_patch(?:\s|$)/.test(segment)) {
+      const documents = bodies.get(index) ?? [];
+      found = true; patchSource = [segment, ...documents.map(document => document.text)].join("\n");
+      expansion = documents.some(document => document.expands && /[$`\\]/.test(document.text)) ||
+        !documents.length && /[$`\\]/.test(segment) || doubleWrapped && /[$`\\]/.test(patchSource);
+      break;
+    }
     const changeDirectory = /^cd\s+(?:--\s+)?(?:'([^']*)'|"([^"$`\\]*)"|([\w./-]+))$/.exec(segment);
     if (changeDirectory) {
       const directory = changeDirectory[1] ?? changeDirectory[2] ?? changeDirectory[3];
@@ -151,10 +161,11 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
     if (changedDirectory && separators[index] !== "&&") base = undefined;
   }
   if (!found) return null;
-  const edit = (path: string, kind: string, diff?: string) => base
-    ? editForPath(path, kind, diff, cwd, base)
-    : { path: "<outside-workspace>", kind, suppressed: "working directory unknown" };
   const patch = /\*\*\* Begin Patch\r?\n([\s\S]*?)\r?\n\*\*\* End Patch/.exec(patchSource)?.[1];
+  const edit = (path: string, kind: string, diff?: string) => patch && expansion
+    ? { path: "<outside-workspace>", kind, suppressed: "shell expansion unresolved" }
+    : base ? editForPath(path, kind, diff, cwd, base)
+      : { path: "<outside-workspace>", kind, suppressed: "working directory unknown" };
   const edits: ActivityEdit[] = [];
   if (patch) {
     const sections = patch.split(/(?=^\*\*\* (?:Add|Update|Delete) File: )/m);

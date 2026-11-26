@@ -83,7 +83,7 @@ export function logCodexActivity(log: Diagnostics, event: any, session: string, 
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
-  let observed: string | undefined, identityChanged = false, terminal = false, pending: { id: string; text: string } | undefined;
+  let observed: string | undefined, conflictingSession: string | undefined, identityChanged = false, terminal = false, pending: { id: string; text: string } | undefined;
   let unparsed = 0;
   const started = new Map<string, number>();
   const flushMessage = () => { if (pending) { log.line(`[agent] ${pending.text}`); pending = undefined; } };
@@ -103,7 +103,9 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
         return;
       }
       if (value.type === "thread.started" && typeof value.thread_id === "string") {
-        if (session && value.thread_id !== session || observed && value.thread_id !== observed) { identityChanged = true; return; }
+        if (session && value.thread_id !== session || observed && value.thread_id !== observed) {
+          identityChanged = true; conflictingSession ??= value.thread_id; return;
+        }
         observed = value.thread_id;
         onSession?.(observed!);
         log.event("runtime.session", "INFO", { session_id: observed, outcome: session ? "resumed" : "created" });
@@ -117,14 +119,17 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
       }
     },
   }); } catch (error) {
-    if (error instanceof RunnerError) error.details.unparsed_stdout_lines = unparsed;
+    if (error instanceof RunnerError) {
+      error.details.unparsed_stdout_lines = unparsed;
+      if (identityChanged) Object.assign(error.details, { expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? null });
+    }
     throw error;
   } finally {
     flushMessage();
     log.event("runtime.native_stream", "INFO", { stage: "codex", session_id: observed ?? session, unparsed_stdout_lines: unparsed });
   }
   if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "codex", "Codex did not return the expected conversation identity.",
-    { expected_session: session ?? null, observed_session: observed ?? null, unparsed_stdout_lines: unparsed });
+    { expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? observed ?? null, unparsed_stdout_lines: unparsed });
   return { session: observed, result: await readFile(output, "utf8") };
 }
 
