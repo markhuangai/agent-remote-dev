@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -120,6 +120,40 @@ test('Codex command events suppress an expanded external patch target', async t 
     exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
   assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('shell expansion unresolved')));
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-5267|new-unregistered-secret-5267/);
+});
+
+test('Codex command events suppress diffs when a patch leaves a dangling symlink', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-3926\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  const binary = join(f.temporary, 'apply_patch'); await symlink(native, binary);
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-3926\n+new-unregistered-secret-3926\n*** Delete File: .env\n*** End Patch';
+  const { stdout } = await exec(binary, [patch], { cwd: r.cwd, env: f.job.env });
+  assert.ok((await lstat(join(r.cwd, 'settings'))).isSymbolicLink());
+  await assert.rejects(readFile(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'dangling', type: 'command_execution', status: 'completed',
+    exit_code: 0, command: `apply_patch <<'PATCH'\n${patch}\nPATCH`, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('<outside-workspace>')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-3926|new-unregistered-secret-3926/);
+});
+
+test('Codex command events suppress patch diffs after option-only cd', async t => {
+  const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'home');
+  await mkdir(outside); await writeFile(join(outside, 'config.txt'), 'old-unregistered-secret-1948\n');
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n@@\n-old-unregistered-secret-1948\n+new-unregistered-secret-1948\n*** End Patch';
+  const command = `cd -P && apply_patch <<'PATCH'\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd,
+    env: { ...f.job.env, HOME: outside, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.equal(await readFile(join(outside, 'config.txt'), 'utf8'), 'new-unregistered-secret-1948\n');
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'option-cd', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('working directory unknown')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-1948|new-unregistered-secret-1948/);
 });
 
 test('Codex identity failures retain the conflicting session ID', async t => {

@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Diagnostics } from "./diagnostics.js";
 
@@ -16,6 +16,8 @@ function existingPath(path: string) {
     try { return resolve(realpathSync.native(current), ...remaining); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      try { lstatSync(current); return undefined; }
+      catch (lookupError) { if ((lookupError as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
       const parent = dirname(current);
       if (parent === current) return undefined;
       remaining.unshift(basename(current));
@@ -153,7 +155,8 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
     const changeDirectory = /^cd\s+(?:--\s+)?(?:'([^']*)'|"([^"$`\\]*)"|([\w./-]+))$/.exec(segment);
     if (changeDirectory) {
       const directory = changeDirectory[1] ?? changeDirectory[2] ?? changeDirectory[3];
-      base = directory === "-" ? undefined : isAbsolute(directory) ? resolve(directory) : base ? resolve(base, directory) : undefined;
+      const option = directory.startsWith("-") && !/^cd\s+--\s+/.test(segment);
+      base = directory === "-" || option ? undefined : isAbsolute(directory) ? resolve(directory) : base ? resolve(base, directory) : undefined;
       changedDirectory = true;
     } else if (!/^(?:true|false|:|pwd|echo|printf|test)(?:\s|$)/.test(segment) || /[|<>]/.test(segment)) {
       base = undefined;

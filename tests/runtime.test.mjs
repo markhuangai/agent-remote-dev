@@ -917,7 +917,7 @@ test("patch parsing suppresses diffs when the effective shell directory is outsi
   assert.equal(external[0].path, "<outside-workspace>");
   assert.equal(external[0].suppressed, "outside workspace");
   assert.equal(external[0].diff, undefined);
-  for (const prefix of ['cd "$TARGET"', "cd /tmp/private && cd /missing || true", "cd /tmp/private && echo done; true"]) {
+  for (const prefix of ['cd "$TARGET"', "cd -P", "cd -L", "cd /tmp/private && cd /missing || true", "cd /tmp/private && echo done; true"]) {
     const edits = parseApplyPatch(command(prefix), "", r.cwd);
     assert.equal(edits[0].path, "<outside-workspace>");
     assert.equal(edits[0].suppressed, "working directory unknown");
@@ -927,6 +927,9 @@ test("patch parsing suppresses diffs when the effective shell directory is outsi
   const inside = parseApplyPatch(command(`cd '/tmp' && cd '${join(r.cwd, "sub directory")}'`), "", r.cwd);
   assert.equal(inside[0].path, "sub directory/config.txt");
   assert.match(inside[0].diff, /unregistered-sensitive-value/);
+  await mkdir(join(r.cwd, "-P"));
+  const explicit = parseApplyPatch(command("cd -- -P"), "", r.cwd);
+  assert.equal(explicit[0].path, "-P/config.txt"); assert.match(explicit[0].diff, /unregistered-sensitive-value/);
 });
 
 test("patch moves suppress diff bodies when either path is sensitive or outside the workspace", async t => {
@@ -957,6 +960,9 @@ test("activity paths protect sensitive symlink names and resolve symlink travers
   await writeFile(join(r.cwd, "config/.env"), "sensitive target\n");
   await symlink("config/.env", join(r.cwd, "settings"));
   assert.equal(activityPath("settings", r.cwd).sensitive, true);
+  await symlink("missing.env", join(r.cwd, "broken"));
+  assert.equal(activityPath("broken", r.cwd).outside, true);
+  assert.equal(activityPath("broken/child", r.cwd).outside, true);
   const outside = join(f.temporary, "outside"), child = join(outside, "child");
   await mkdir(child, { recursive: true });
   await writeFile(join(outside, "external.txt"), "outside\n");
