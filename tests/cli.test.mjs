@@ -60,6 +60,28 @@ test('real Codex suppresses patch bodies for a quoted outside directory', async 
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-5724|new-unregistered-secret-5724/);
 });
 
+test('real Codex suppresses a patch moved into a sensitive file', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, 'config.txt'), 'old-unregistered-secret-6249\n');
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n*** Move to: .env\n@@\n-old-unregistered-secret-6249\n+new-unregistered-secret-6249\n*** End Patch';
+  const api = await provider(t, [[tool(`cd . && apply_patch <<'PATCH'\n${patch}\nPATCH`, 'move-edit')], [message('Finished moving the file.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Move the fixture file.', f.log, 60000, 'sensitive-move');
+  assert.equal(await readFile(join(r.cwd, '.env'), 'utf8'), 'new-unregistered-secret-6249\n');
+  assert.ok(f.lines.some(line => line.includes('[edit]')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-6249|new-unregistered-secret-6249/);
+});
+
+test('Codex command events suppress move diffs for sensitive destinations', () => {
+  const { log, lines } = logger();
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n*** Move to: .env\n@@\n-old-unregistered-secret-6249\n+new-unregistered-secret-6249\n*** End Patch';
+  const event = { type: 'item.completed', item: { id: 'move-edit', type: 'command_execution', status: 'completed', exit_code: 0,
+    command: `cd . && apply_patch <<'PATCH'\n${patch}\nPATCH` } };
+  logCodexActivity(log, event, 'session-1', process.cwd());
+  assert.ok(lines.some(line => line.includes('[edit]') && line.includes('sensitive file')));
+  assert.doesNotMatch(lines.join('\n'), /old-unregistered-secret-6249|new-unregistered-secret-6249/);
+});
+
 test('real Codex folds reasoning while keeping the final reply in the result', async t => {
   const f = await fixture(t), r = await repository(f);
   const api = await provider(t, [[reasoning('Inspect the fixture first.'),

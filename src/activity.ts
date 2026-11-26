@@ -120,7 +120,11 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
     for (const section of sections) {
       const header = /^\*\*\* (Add|Update|Delete) File: ([^\r\n]+)/.exec(section);
       if (!header) continue;
-      edits.push(edit(header[2], header[1].toLowerCase(), section));
+      const move = /^\*\*\* Move to: ([^\r\n]+)/m.exec(section);
+      if (!move) { edits.push(edit(header[2], header[1].toLowerCase(), section)); continue; }
+      const source = edit(header[2], "move"), destination = edit(move[1], "move");
+      const suppressed = source.suppressed ?? destination.suppressed;
+      edits.push({ path: `${source.path} -> ${destination.path}`, kind: "move", ...(suppressed ? { suppressed } : { diff: section }) });
     }
   } else {
     const lines = output.split(/\r?\n/);

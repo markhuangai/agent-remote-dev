@@ -747,6 +747,20 @@ test("patch parsing suppresses diffs when the effective shell directory is outsi
   assert.match(inside[0].diff, /unregistered-sensitive-value/);
 });
 
+test("patch moves suppress diff bodies when either path is sensitive or outside the workspace", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const command = (source, destination) => `apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: ${source}\n*** Move to: ${destination}\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch\nPATCH`;
+  for (const [source, destination] of [["config.txt", ".env"], ["config.txt", "../outside.txt"], [".env", "config.txt"]]) {
+    const edits = parseApplyPatch(command(source, destination), "", r.cwd);
+    assert.equal(edits.length, 1);
+    assert.ok(edits[0].suppressed);
+    assert.equal(edits[0].diff, undefined);
+  }
+  const safe = parseApplyPatch(command("config.txt", "renamed.txt"), "", r.cwd);
+  assert.equal(safe[0].path, "config.txt -> renamed.txt");
+  assert.match(safe[0].diff, /unregistered-sensitive-value/);
+});
+
 test("Git summary parses renamed and untracked paths with NUL delimiters", async t => {
   const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
   await r.git("mv", "README.md", "renamed & file.md");
