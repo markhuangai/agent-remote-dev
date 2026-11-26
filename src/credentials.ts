@@ -44,7 +44,6 @@ function protectAuthorization(value: string, log: Diagnostics, source: string) {
       if (separator >= 0) {
         components.push(pair);
         const password = pair.slice(separator + 1);
-        if (isEnvironmentReference(password)) return;
         if (trivialCredential(password)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "basic_password" });
         components.push(password);
       }

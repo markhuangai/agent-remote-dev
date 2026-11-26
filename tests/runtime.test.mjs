@@ -439,6 +439,27 @@ test("credential headers in MCP command arguments are validated and protected", 
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
 });
 
+test("decoded Basic passwords resembling environment references are treated as literals", async t => {
+  const f = await fixture(t);
+  const config = password => JSON.stringify({ mcpServers: { fixture: { type: "http", url: "https://example.invalid/mcp",
+    headers: { Authorization: `Basic ${Buffer.from(`user:${password}`).toString("base64")}` } } } });
+  const rejected = "$x", rejectedPayload = Buffer.from(`user:${rejected}`).toString("base64");
+  await assert.rejects(configure(f.job, 'model="fixture"', f.log, config(rejected)), { reason: "invalid_configured_credential" });
+  assert.ok(!f.log.protectedValues.includes(rejected)); assert.ok(!f.log.protectedValues.includes(rejectedPayload));
+  for (const password of ["$LocalPassword9284", "${TOKEN}"]) {
+    const pair = `user:${password}`, payload = Buffer.from(pair).toString("base64"), header = `Basic ${payload}`;
+    await configure(f.job, 'model="fixture"', f.log, config(password));
+    for (const value of [password, pair, payload, header]) {
+      assert.ok(f.log.protectedValues.includes(value));
+      assert.throws(() => inspectCredentials(value, f.log, "credential_in_result"), { reason: "credential_in_result" });
+    }
+    f.log.line(`Fixture output: ${password}`);
+    assert.ok(!f.lines.join("\n").includes(password));
+  }
+  await history(f, "$LocalPassword9284");
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
 test("URL-encoded configured credentials cannot pass checkpoint or result inspection", async t => {
   const f = await fixture(t);
   const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http",
