@@ -37,7 +37,7 @@ function unwrapCommand(command: string) {
   return wrapper ? wrapper[2] : command;
 }
 
-function commandSegments(command: string) {
+function commandSegments(command: string, separators?: string[]) {
   const result: string[] = [];
   let quote = "", escaped = false, start = 0;
   for (let index = 0; index < command.length; index++) {
@@ -48,6 +48,7 @@ function commandSegments(command: string) {
     if (character === "'" || character === '"') { quote = character; continue; }
     if (character === "\n" || character === ";" || character === "&" && command[index + 1] === "&") {
       result.push(command.slice(start, index).trim());
+      separators?.push(character === "&" ? "&&" : character);
       if (character === "&") index++;
       start = index + 1;
     }
@@ -94,13 +95,24 @@ export function editForPath(path: string, kind: string, diff: string | undefined
 
 export function parseApplyPatch(command: string, output: string, cwd: string): ActivityEdit[] | null {
   const unwrapped = unwrapCommand(command);
-  let base = cwd, found = false;
-  for (const segment of commandSegments(unwrapped)) {
-    const changeDirectory = /^cd\s+([\w./-]+)$/.exec(segment);
-    if (changeDirectory) base = resolve(base, changeDirectory[1]);
+  const separators: string[] = [];
+  let base: string | undefined = cwd, found = false, changedDirectory = false;
+  for (const [index, segment] of commandSegments(unwrapped, separators).entries()) {
     if (/^apply_patch(?:\s|$)/.test(segment)) { found = true; break; }
+    const changeDirectory = /^cd\s+(?:--\s+)?(?:'([^']*)'|"([^"$`\\]*)"|([\w./-]+))$/.exec(segment);
+    if (changeDirectory) {
+      const directory = changeDirectory[1] ?? changeDirectory[2] ?? changeDirectory[3];
+      base = directory === "-" ? undefined : isAbsolute(directory) ? resolve(directory) : base ? resolve(base, directory) : undefined;
+      changedDirectory = true;
+    } else if (!/^(?:true|false|:|pwd|echo|printf|test)(?:\s|$)/.test(segment) || /[|<>]/.test(segment)) {
+      base = undefined;
+    }
+    if (changedDirectory && separators[index] !== "&&") base = undefined;
   }
   if (!found) return null;
+  const edit = (path: string, kind: string, diff?: string) => base
+    ? editForPath(path, kind, diff, cwd, base)
+    : { path: "<outside-workspace>", kind, suppressed: "working directory unknown" };
   const patch = /\*\*\* Begin Patch\r?\n([\s\S]*?)\r?\n\*\*\* End Patch/.exec(unwrapped)?.[1];
   const edits: ActivityEdit[] = [];
   if (patch) {
@@ -108,7 +120,7 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
     for (const section of sections) {
       const header = /^\*\*\* (Add|Update|Delete) File: ([^\r\n]+)/.exec(section);
       if (!header) continue;
-      edits.push(editForPath(header[2], header[1].toLowerCase(), section, cwd, base));
+      edits.push(edit(header[2], header[1].toLowerCase(), section));
     }
   } else {
     const lines = output.split(/\r?\n/);
@@ -116,7 +128,7 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
     if (start >= 0) for (const line of lines.slice(start + 1)) {
       const entry = /^([AMD])\s+(.+)$/.exec(line);
       if (!entry) break;
-      edits.push(editForPath(entry[2], { A: "add", M: "update", D: "delete" }[entry[1]]!, undefined, cwd, base));
+      edits.push(edit(entry[2], { A: "add", M: "update", D: "delete" }[entry[1]]!));
     }
   }
   return edits;

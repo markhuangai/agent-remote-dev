@@ -727,6 +727,26 @@ test("patch parsing limits edits to the executable and suppresses sensitive or o
   assert.equal(summarizeCommand("node --test tests/runtime.test.mjs", r.cwd), "node --test tests/runtime.test.mjs");
 });
 
+test("patch parsing suppresses diffs when the effective shell directory is outside or uncertain", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const patch = "*** Begin Patch\n*** Update File: config.txt\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch";
+  const command = prefix => `${prefix} && apply_patch <<'PATCH'\n${patch}\nPATCH`;
+  const external = parseApplyPatch(command("cd '/tmp/private folder'"), "", r.cwd);
+  assert.equal(external[0].path, "<outside-workspace>");
+  assert.equal(external[0].suppressed, "outside workspace");
+  assert.equal(external[0].diff, undefined);
+  for (const prefix of ['cd "$TARGET"', "cd /tmp/private && cd /missing || true", "cd /tmp/private && echo done; true"]) {
+    const edits = parseApplyPatch(command(prefix), "", r.cwd);
+    assert.equal(edits[0].path, "<outside-workspace>");
+    assert.equal(edits[0].suppressed, "working directory unknown");
+    assert.equal(edits[0].diff, undefined);
+  }
+  await mkdir(join(r.cwd, "sub directory"));
+  const inside = parseApplyPatch(command(`cd '/tmp' && cd '${join(r.cwd, "sub directory")}'`), "", r.cwd);
+  assert.equal(inside[0].path, "sub directory/config.txt");
+  assert.match(inside[0].diff, /unregistered-sensitive-value/);
+});
+
 test("Git summary parses renamed and untracked paths with NUL delimiters", async t => {
   const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
   await r.git("mv", "README.md", "renamed & file.md");

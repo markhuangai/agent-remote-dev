@@ -47,6 +47,19 @@ test('real Codex streams reads, edits and command failures without logging their
   assert.doesNotMatch(f.lines.join('\n'), /private-tool-output-9158|private-inline-task-content-3982|fixture-api-credential-9374/);
 });
 
+test('real Codex suppresses patch bodies for a quoted outside directory', async t => {
+  const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'outside directory');
+  await mkdir(outside);
+  await writeFile(join(outside, 'config.txt'), 'old-unregistered-secret-5724\n');
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n@@\n-old-unregistered-secret-5724\n+new-unregistered-secret-5724\n*** End Patch';
+  const api = await provider(t, [[tool(`cd '${outside}' && apply_patch <<'PATCH'\n${patch}\nPATCH`, 'outside-edit')], [message('Finished outside edit.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Apply the fixture change.', f.log, 60000, 'outside');
+  assert.equal(await readFile(join(outside, 'config.txt'), 'utf8'), 'new-unregistered-secret-5724\n');
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('<outside-workspace>')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-5724|new-unregistered-secret-5724/);
+});
+
 test('real Codex folds reasoning while keeping the final reply in the result', async t => {
   const f = await fixture(t), r = await repository(f);
   const api = await provider(t, [[reasoning('Inspect the fixture first.'),
