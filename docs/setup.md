@@ -225,11 +225,16 @@ gh run view RUN_ID --repo markhuangai/agent-remote-dev --log
 
 The caller's YAML fixes `runs-on: '["ubuntu-latest"]'` and `timeout-minutes: 360`
 under `jobs.run.with`. Repository owners change scheduling there, not in the
-task form or `.remote-dev.yml`. Read the `remote-dev-result-*` artifact to confirm
-what the selected agent completed.
+task form or `.remote-dev.yml`. Open the run's **Summary** tab first. The agent's
+final reply appears at the top, followed by the runner outcome, session and saved
+checkpoint details, links to the full `remote-dev-result-*` artifact and execution
+log, and the fields needed to resume when a checkpoint exists. Open the full
+artifact or execution log when the summary marks a truncated or missing reply.
 
-To answer a clarification or continue saved work, run the same caller with the
-previous run ID and a file containing the additional context:
+When the summary includes **How to resume**, answer a clarification or continue
+saved work by opening **Run workflow** with the listed `runner`,
+`resume-run-id`, and `plan` values. For this repository, the equivalent command
+uses the previous run ID and a file containing the additional context:
 
 ```bash
 gh workflow run runner-task.yml --repo markhuangai/agent-remote-dev --ref main -f runner=claude -f resume-run-id=RUN_ID -F plan=@context.md
