@@ -6,7 +6,7 @@ import type { ClientRequest } from "node:http";
 import { join } from "node:path";
 import { DefaultArtifactClient } from "@actions/artifact";
 import { command, processControl } from "./process.js";
-import { requireValue, RunnerError } from "./contracts.js";
+import { requireValue, RunnerError, versions } from "./contracts.js";
 import { durableCheckpoint } from "./checkpoint.js";
 import { TaskGit } from "./git.js";
 import { Diagnostics } from "./diagnostics.js";
@@ -92,7 +92,7 @@ export async function saveSnapshot(saved: SavedRun, log: Diagnostics, api: any, 
     saved.metadata.outcome === "running" && saved.control ? processControl(saved.control.directory, saved.control.nonce) : undefined);
   await writeFile(join(saved.job.root, "latest.json"), JSON.stringify(receipt), { mode: 0o600 });
   try { await pruneSnapshots(api, saved.metadata.repository, saved.metadata.lineage.run_id, saved.metadata.lineage.run_attempt); }
-  catch { log.event("checkpoint.retention", "WARN", { reason: "snapshot_prune_failed", artifact_id: receipt.artifact_id }); }
+  catch (error) { log.event("checkpoint.retention", "WARN", { ...safeError(error), reason: "snapshot_prune_failed", artifact_id: receipt.artifact_id }); }
   return receipt;
 }
 export async function watchSnapshots(path: string, options: {
@@ -100,16 +100,20 @@ export async function watchSnapshots(path: string, options: {
 } = {}) {
   const initial: SavedRun = JSON.parse(await readFile(path, "utf8"));
   const emit = options.emit ?? ((line: string | Error) => process.stdout.write(String(line) + "\n"));
-  const log = new Diagnostics({ repository: initial.metadata.repository, runner: initial.job.runner, run_id: initial.metadata.lineage.run_id, run_attempt: initial.metadata.lineage.run_attempt, workflow_sha: initial.metadata.lineage.workflow_sha }, { info: emit, warning: emit, error: emit, debug: emit });
+  const log = new Diagnostics({ repository: initial.metadata.repository, runner: initial.job.runner, runner_version: versions[initial.job.runner], run_id: initial.metadata.lineage.run_id, run_attempt: initial.metadata.lineage.run_attempt, workflow_sha: initial.metadata.lineage.workflow_sha }, { info: emit, warning: emit, error: emit, debug: emit, setSecret() {} }, { maskSecrets: false });
+  log.setWorkspace(initial.metadata.workspace, [initial.job.root, initial.job.home, initial.job.runnerHome, process.env.RUNNER_TEMP ?? ""]);
+  log.useCompactRecords();
   for (const secret of initial.secrets) log.protect(secret);
   const api = options.api ?? (async (endpoint: string, options: any = {}) => {
     const response = await fetch(`https://api.github.com${endpoint}`, { method: options.method ?? "GET", signal: AbortSignal.timeout(20000),
       headers: { authorization: `Bearer ${process.env.REMOTE_DEV_PLATFORM_TOKEN}`, accept: "application/vnd.github+json" } });
-    requireValue(response.ok, "snapshot_retention_api_failed", "checkpoint");
+    if (!response.ok) throw Object.assign(new RunnerError("snapshot_retention_api_failed", "checkpoint"), {
+      status: response.status, response: { headers: { "x-github-request-id": response.headers.get("x-github-request-id") } },
+    });
     return response.status === 204 ? null : response.json();
   });
   const intervalMs = options.intervalMs ?? 60000;
-  let next = 0;
+  let next = 0, cycle = 0;
   try {
     for (;;) {
       const saved: SavedRun = JSON.parse(await readFile(path, "utf8"));
@@ -117,14 +121,18 @@ export async function watchSnapshots(path: string, options: {
       if (saved.control && saved.metadata.session_id && Date.now() >= next) {
         next = Date.now() + intervalMs;
         log.fields.session_id = saved.metadata.session_id;
+        log.fields.cycle = ++cycle;
+        const started = Date.now();
+        let outcome = "completed";
         try { await saveSnapshot(saved, log, api, options.upload); }
         catch (error) {
+          outcome = "failed";
           const previous = await latestSnapshot(saved.job);
           if (error instanceof RunnerError && error.reason === "snapshot_pause_deferred") {
             log.event("checkpoint.deferred", "WARN", { stage: error.stage, reason: error.reason, ...error.details,
               last_durable_checkpoint: previous, retry_interval_ms: intervalMs });
           } else log.failure(error, previous);
-        }
+        } finally { log.event("checkpoint.cycle", "INFO", { cycle, outcome, elapsed_ms: Date.now() - started }); }
       }
       await new Promise(resolve => setTimeout(resolve, 100));
     }

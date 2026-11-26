@@ -4,12 +4,12 @@ import { join, relative } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { configure, installSkillSource, installUserInstructions } from '../.build/setup.js';
-import { logCodexActivity, runCodex } from '../.build/codex.js';
+import { logCodexActivity, logCodexError, runCodex } from '../.build/codex.js';
 import { TaskGit } from '../.build/git.js';
 import { drive } from '../.build/driver.js';
 import { durableCheckpoint, exportCheckpoint } from '../.build/checkpoint.js';
 import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
-import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, repository, tool } from './helpers.mjs';
+import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, reasoning, repository, root, tool, updatePlan } from './helpers.mjs';
 
 const plan = 'Implement the supplied plan autonomously. Ask only when clarification is indispensable.';
 test('real Codex streams reads, edits and command failures without logging their output', async t => {
@@ -30,7 +30,7 @@ test('real Codex streams reads, edits and command failures without logging their
   assert.equal(commands[2].item_id, commands[3].item_id);
   assert.equal(commands[0].command_name, 'cat'); assert.equal(commands[2].command_name, 'printf');
   assert.equal(commands[1].exit_code, 0);
-  assert.equal(commands[3].exit_code, 7); assert.equal(commands[3].level, 'WARN');
+  assert.equal(commands[3].exit_code, 7); assert.equal(commands[3].level, 'INFO');
   const edits = records.filter(record => record.item_type === 'file_change');
   assert.deepEqual(edits.map(record => record.phase), ['started', 'completed']);
   assert.equal(edits[0].item_id, edits[1].item_id);
@@ -43,6 +43,29 @@ test('real Codex streams reads, edits and command failures without logging their
   }
   const logged = JSON.stringify(records);
   assert.doesNotMatch(logged, /Fixture repository|private-tool-output-9158|private-patch-content-7281|private-agent-message-1682|private-task-prompt-4197|private-inline-task-content-3982|fixture-api-credential-9374/);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('README.md')));
+  assert.doesNotMatch(f.lines.join('\n'), /private-tool-output-9158|private-inline-task-content-3982|fixture-api-credential-9374/);
+});
+
+test('real Codex folds reasoning while keeping the final reply in the result', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, [[reasoning('Inspect the fixture first.'),
+    updatePlan([{ step: 'Inspect the fixture', status: 'in_progress' }])], [message('Final fixture response.')]]);
+  await configure(f.job, api.config, f.log);
+  const result = await runCodex(f.job, r.cwd, 'Inspect the fixture.', f.log, 60000, 'readable');
+  assert.equal(result.result.trim(), 'Final fixture response.');
+  assert.ok(f.timeline.some(entry => entry.level === 'group' && entry.line === 'Thinking'));
+  assert.ok(f.lines.some(line => line.includes('Inspect the fixture first.')));
+  assert.doesNotMatch(f.lines.join('\n'), /Final fixture response\./);
+});
+
+test('Codex todo-list updates render the current plan', () => {
+  const { log, timeline, lines } = logger();
+  logCodexActivity(log, { type: 'item.updated', item: { id: 'plan-1', type: 'todo_list',
+    items: [{ text: 'Inspect the fixture', completed: false }, { text: 'Apply the change', completed: true }] } }, 'session-1', process.cwd());
+  assert.ok(timeline.some(entry => entry.level === 'group' && entry.line === 'Plan'));
+  assert.ok(lines.some(line => line.includes('[ ] Inspect the fixture')));
+  assert.ok(lines.some(line => line.includes('[x] Apply the change')));
 });
 test('native activity logs allowlisted metadata with bounded changes and no argument bodies', () => {
   const { log, records } = logger();
@@ -58,7 +81,7 @@ test('native activity logs allowlisted metadata with bounded changes and no argu
     item('file_change', { changes: [{ path: 'repo/private-path-fragment/' + 'x'.repeat(1000), kind: 'update' }], status: 'completed' }),
     item('file_change', { changes: Array.from({ length: 105 }, (_, index) => ({ path: `file-${index}`, kind: 'update', diff: 'private-diff' })), status: 'completed' }),
   ]) logCodexActivity(log, event, 'session-1');
-  assert.equal(records.length, 8); assert.equal(records[0].level, 'WARN');
+  assert.equal(records.length, 8); assert.equal(records[0].level, 'INFO');
   assert.equal(records[0].server, 'github'); assert.equal(records[0].tool, 'get_issue');
   assert.deepEqual(records[1].receiver_thread_ids, ['child-session']); assert.equal(records[1].tool, 'spawn_agent');
   assert.equal(records[2].action, 'search'); assert.equal(records[3].command_name, 'cat');
@@ -68,6 +91,28 @@ test('native activity logs allowlisted metadata with bounded changes and no argu
   for (const type of ['agent_message', 'reasoning', 'todo_list', 'error', 'unknown']) logCodexActivity(log, item(type, { text: 'private-text' }), 'session-1');
   logCodexActivity(log, { type: 'item.updated', item: { id: 'item-1', type: 'command_execution', command: 'private-update' } }, 'session-1');
   assert.equal(records.length, 8); assert.doesNotMatch(JSON.stringify(records), /private-/);
+});
+
+test('Codex error events use strict provider sanitization before logging', () => {
+  const { log, records } = logger();
+  log.protect('fixture-provider-secret-9257');
+  logCodexError(log, { type: 'error', message: 'HTTP 403 {"body":"private-provider-body-5891"}' });
+  logCodexError(log, { type: 'item.completed', item: { type: 'error', text: '{"token":"fixture-provider-secret-9257"}' } }, 'session-1');
+  assert.equal(records.length, 2);
+  assert.ok(records.every(record => record.event === 'runtime.provider' && record.level === 'ERROR'));
+  assert.equal(records[1].session_id, 'session-1');
+  assert.doesNotMatch(JSON.stringify(records), /private-provider-body-5891|fixture-provider-secret-9257/);
+});
+
+test('real Codex counts unparsed stdout without logging the raw line', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const binary = join(f.job.tools, 'node_modules/.bin/codex');
+  await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' 'unparsed-native-line-8192'\nexec '${join(root, 'node_modules/.bin/codex')}' "$@"\n`, { mode: 0o700 });
+  const api = await provider(t, [[message('Native stream complete.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Finish the fixture.', f.log, 60000, 'unparsed');
+  assert.ok(f.records.some(record => record.event === 'runtime.native_stream' && record.unparsed_stdout_lines === 1));
+  assert.doesNotMatch(f.lines.join('\n'), /unparsed-native-line-8192/);
 });
 async function driver(f, r, overrides = {}) {
   const git = new TaskGit(r.cwd, f.job.env, f.log), exports = []; let last = null, state;
@@ -258,7 +303,7 @@ for (const rejected of [false, true]) test(`native conversation is saved with ${
     assert.notEqual(await observed.git.head(), r.base);
     assert.equal(await observed.git.remoteHead(), r.base);
     const failed = f.records.find(record => record.event === 'runtime.tool' && record.command_name === 'git' && record.status === 'failed');
-    assert.equal(failed?.level, 'WARN');
+    assert.equal(failed?.level, 'INFO');
     assert.equal(failed.exit_code, 1);
     assert.equal(failed.session_id, observed.result.session);
   }

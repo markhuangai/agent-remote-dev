@@ -1,7 +1,1 @@
-{
-  "model": "claude-sonnet-4-6",
-  "effortLevel": "high",
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
-  }
-}
+{"model":"claude-sonnet-4-6","effortLevel":"high","env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}

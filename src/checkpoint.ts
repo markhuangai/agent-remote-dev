@@ -55,7 +55,9 @@ export async function durableCheckpoint(job: Job, input: CheckpointInput, log: D
     let result;
     try { result = await upload(exported.name, exported.files, exported.root); }
     catch (error) { throw new RunnerError("artifact_upload_failed", "checkpoint", "Snapshot upload failed; the previous artifact remains available.",
-      { cause_reason: error instanceof RunnerError ? error.reason : "artifact_transport_failed" }); }
+      { cause_reason: error instanceof RunnerError ? error.reason : "artifact_transport_failed",
+        cause_elapsed_ms: error instanceof RunnerError ? error.details.elapsed_ms : undefined,
+        cause_exit_code: error instanceof RunnerError ? error.details.exit_code : undefined }); }
     requireValue(Number.isSafeInteger(result.id) && result.id! > 0, "missing_artifact_receipt", "checkpoint");
     const receipt = { artifact_id: result.id!, checkpoint_sha: input.checkpoint_sha, sequence: exported.sequence };
     log.event("checkpoint.complete", "INFO", receipt);

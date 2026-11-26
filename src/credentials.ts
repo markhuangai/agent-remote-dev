@@ -1,26 +1,122 @@
-import { requireValue } from "./contracts.js";
+import { requireValue, RunnerError } from "./contracts.js";
+import { trivialCredential } from "./diagnostics.js";
 import type { Diagnostics } from "./diagnostics.js";
 
-export function protectConfiguration(value: unknown, log: Diagnostics, key = "") {
-  if (/\.(env_key|env_vars)$/.test(key)) return;
-  if (typeof value === "string" && (/key|token|secret|password|auth|credential|signature/i.test(key.split(".").at(-1)!) || /\.(?:http_headers|headers)\./i.test(key))) {
-    log.protect(value);
-    if (/\.(?:http_headers|headers)\.(?:proxy-)?authorization$/i.test(key)) {
-      const credentials = /^\s*(Bearer|Basic)\s+(\S+)\s*$/i.exec(value);
-      if (credentials) {
-        log.protect(credentials[2]);
-        if (credentials[1].toLowerCase() === "basic") {
-          const bytes = Buffer.from(credentials[2], "base64");
-          for (const encoding of ["utf8", "latin1"] as const) {
-            const pair = bytes.toString(encoding), separator = pair.indexOf(":");
-            if (separator >= 0) { log.protect(pair); log.protect(pair.slice(separator + 1)); }
-          }
-        }
+const credentialKey = /(?:^|[_-])(?:api[_-]?key|key|token|secret|password|passwd|auth|authorization|credential|signature)(?:$|[_-])/i;
+const publicHeaders = /^(?:accept|accept-encoding|accept-language|content-type|user-agent|host|connection|cache-control|pragma|referer|origin)$/i;
+
+function isCredentialKey(value: string) {
+  return credentialKey.test(value.replace(/([a-z0-9])([A-Z])/g, "$1_$2"));
+}
+
+function isEnvironmentReference(value: string) {
+  return /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\})$/.test(value.trim());
+}
+
+function looksLikeCredential(value: string) {
+  return /^(?:sk-(?:ant-|proj-|svcacct-)?[A-Za-z0-9_-]{12,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]+|npm_[A-Za-z0-9]+|pypi-[A-Za-z0-9_-]+|hf_[A-Za-z0-9]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.test(value);
+}
+
+export function registerCredential(value: string, log: Diagnostics, source: string, field: string, allowReference = true) {
+  if (allowReference && isEnvironmentReference(value)) return;
+  if (trivialCredential(value)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field });
+  log.protect(value);
+}
+
+function protectAuthorization(value: string, log: Diagnostics, source: string) {
+  if (/^\s*(?:Bearer|Basic|Token|Digest|ApiKey)\s*$/i.test(value)) {
+    throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "authorization" });
+  }
+  if (isEnvironmentReference(value)) return;
+  const match = /^\s*(\S+)\s+(.+?)\s*$/.exec(value);
+  if (!match) {
+    registerCredential(value, log, source, "authorization");
+    return;
+  }
+  const [, scheme, payload] = match;
+  if (isEnvironmentReference(payload)) return;
+  const components = [payload];
+  if (scheme.toLowerCase() === "basic") {
+    const bytes = Buffer.from(payload, "base64");
+    for (const encoding of ["utf8", "latin1"] as const) {
+      const pair = bytes.toString(encoding), separator = pair.indexOf(":");
+      if (separator >= 0) {
+        components.push(pair);
+        const password = pair.slice(separator + 1);
+        if (isEnvironmentReference(password)) return;
+        if (trivialCredential(password)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "basic_password" });
+        components.push(password);
       }
     }
-  } else if (value && typeof value === "object") {
-    for (const [childKey, child] of Object.entries(value)) protectConfiguration(child, log, key + "." + childKey);
   }
+  if (trivialCredential(payload)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "authorization" });
+  for (const component of components) log.protect(component);
+  log.protect(value);
+}
+
+function protectUrl(value: string, log: Diagnostics, source: string) {
+  let url: URL;
+  try { url = new URL(value); } catch { return; }
+  const credentials: string[] = [], composite: string[] = [];
+  const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@]*)@/i.exec(value)?.[1];
+  if (userinfo?.includes(":")) {
+    let password = url.password, combined = userinfo;
+    try { password = decodeURIComponent(password); combined = decodeURIComponent(userinfo); } catch {}
+    if (!isEnvironmentReference(password)) { credentials.push(password); composite.push(combined); }
+  } else if (userinfo) {
+    let token = userinfo;
+    try { token = decodeURIComponent(userinfo); } catch {}
+    if (!isEnvironmentReference(token)) credentials.push(token);
+  }
+  for (const [key, item] of url.searchParams) {
+    if (!isEnvironmentReference(item) && (isCredentialKey(key) || looksLikeCredential(item))) credentials.push(item);
+  }
+  for (const credential of credentials) {
+    if (trivialCredential(credential)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "url_credential" });
+  }
+  for (const credential of credentials) log.protect(credential);
+  for (const item of composite) log.protect(item);
+}
+
+export function protectConfiguration(value: unknown, log: Diagnostics, key = "", source = "configuration") {
+  const name = key.split(".").at(-1) ?? "";
+  const normalized = name.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+  if (/^(?:env_key|env_vars|api_key_helper|bearer_token_env_var|env_http_headers)$/i.test(normalized)) return;
+  if (Array.isArray(value)) {
+    let credentialArgument = false;
+    for (const item of value) {
+      if (typeof item !== "string") { protectConfiguration(item, log, key, source); continue; }
+      protectUrl(item, log, source);
+      if (credentialArgument && /^\s*(?:Bearer|Basic)\s+/i.test(item)) protectAuthorization(item, log, source);
+      else if (credentialArgument) registerCredential(item, log, source, "argument");
+      credentialArgument = /^--?[\w-]+$/.test(item) && isCredentialKey(item.replace(/^-+/, ""));
+      const assignment = /^--?([\w-]+)=(.*)$/.exec(item);
+      if (assignment) protectUrl(assignment[2], log, source);
+      if (assignment && /^\s*(?:Bearer|Basic)\s+/i.test(assignment[2])) protectAuthorization(assignment[2], log, source);
+      else if (assignment && isCredentialKey(assignment[1])) registerCredential(assignment[2], log, source, "argument");
+      const header = /^(?:--header|-H)=(?:proxy-)?authorization\s*:\s*(.*)$/i.exec(item);
+      if (header) protectAuthorization(header[1], log, source);
+      if (/^(?:proxy-)?authorization\s*:/i.test(item)) protectAuthorization(item.slice(item.indexOf(":") + 1), log, source);
+      if (/^\s*(?:Bearer|Basic)\s+/i.test(item)) protectAuthorization(item, log, source);
+    }
+    return;
+  }
+  if (typeof value === "string") {
+    const header = /\.(?:http_headers|headers)\./i.test(key);
+    if (header && publicHeaders.test(name)) return;
+    protectUrl(value, log, source);
+    if (header && /^(?:proxy-)?authorization$/i.test(name) || /^\s*(?:Bearer|Basic)\s+/i.test(value)) protectAuthorization(value, log, source);
+    else if (isCredentialKey(name)) registerCredential(value, log, source, header ? "header" : "credential");
+    else if (header && !trivialCredential(value)) log.protect(value);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [childKey, child] of Object.entries(value)) protectConfiguration(child, log, key + "." + childKey, source);
+  }
+}
+
+export function hasStandaloneJsonSyntaxLines(value: string) {
+  return value.split(/\r?\n/).some(line => /^[{}[\],]+$/.test(line.trim()));
 }
 export function inspectCredentials(value: unknown, log: Diagnostics, reason = "credential_in_checkpoint"): void {
   if (typeof value === "string" || value instanceof Uint8Array) {

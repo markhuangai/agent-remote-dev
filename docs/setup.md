@@ -78,6 +78,21 @@ Both the optional `MCP_CONFIG_JSON` Actions secret and the repository's root
 in the secret. Commit `.mcp.json` to the repository to add its own servers or
 replace specific servers from the selected secret.
 
+Store JSON Actions secrets on one line. GitHub can mask standalone braces from a
+multiline secret throughout the job log. To compact a local configuration while
+setting the corresponding repository secret, use:
+
+```bash
+jq -c . claude-settings.json | gh secret set CLAUDE_SETTINGS_JSON --repo OWNER/REPO
+jq -c . mcp-config.json | gh secret set MCP_CONFIG_JSON --repo OWNER/REPO
+```
+
+Setup rejects explicitly configured credentials that are shorter than four
+characters after trimming, contain only punctuation, or equal `true`, `false`,
+or `null`. The selected API key and GitHub token must also meet the existing
+eight-character minimum. Replace the indicated credential when the log reports
+`invalid_configured_credential`.
+
 GitHub supplies the organization secret when the repository has access to it.
 A repository secret with the same name replaces the entire organization value,
 including entries with distinct server names. Set an Actions **secret** for this
@@ -492,16 +507,15 @@ INFO records identify setup, dependency versions, selected skills, current confi
 hash, session/run identity and completed snapshots. WARN records identify failed
 snapshots and retention problems while preserving the prior artifact. ERROR
 records identify native failures, rejected archives and required operations.
-Commands emit a 60-second heartbeat. Credentials, raw prompts, secret configuration
-and provider response bodies are excluded from logs; truncation is marked.
-During execution, `runtime.tool` INFO records show command starts/completions,
-allowlisted command names such as `cat`, `git` and `npm`, and changed file paths
-with add/update/delete status. Unrecognized commands appear as `shell`; argument
-values and command bodies are omitted. MCP calls, agent delegation and web activity
-include their tool/action names;
-failed or declined tools produce WARN records with available exit codes. Records
-include session, item and run identity. Strings use the existing 512-character
-limit; file-change lists keep up to 100 paths and report the omitted count.
-Tool output, patch bodies, MCP arguments/results, assistant messages and reasoning
-are not printed. Use the saved conversation for the full interaction history.
+Commands emit a heartbeat after 60 seconds of silence. The execution log shows
+agent updates, safe command summaries and edited paths. Thinking and bounded edit
+diffs appear in collapsed groups. Diffs for sensitive files and paths outside the
+checkout are suppressed. Ordinary tool failures are INFO records with their status
+and available exit code. Declined tools and platform anomalies use WARN.
+
+Structured INFO diagnostics remain in collapsed groups at normal verbosity.
+WARN and ERROR records appear outside those groups. Records include run and session
+identity, and truncation is marked. Shell output, raw prompts, MCP arguments and
+results, secret configuration, and provider response bodies are excluded. The job
+summary includes a bounded Git edit history after the runner outcome.
 Preserve Actions logs, snapshot/result artifacts and CodeQL evidence.

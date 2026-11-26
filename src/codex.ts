@@ -8,10 +8,7 @@ import { object, RunnerError } from "./contracts.js";
 import { parse, stringify, type TomlTable } from "smol-toml";
 import { protectConfiguration } from "./credentials.js";
 import { readRepositoryMcpFile, type McpConfiguration } from "./mcp-config.js";
-
-// Command arguments can contain unpublished task content even after credential redaction.
-const commandNames = new Set(["cat", "head", "tail", "sed", "rg", "ls", "find", "pwd", "git", "gh", "npm", "npx", "node",
-  "python", "python3", "apply_patch", "make", "cargo", "go", "cd", "set", "printf", "echo", "test", "sleep", "curl", "wget"]);
+import { boundedLines, commandName, editForPath, parseApplyPatch, showEdit, summarizeCommand } from "./activity.js";
 
 export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
@@ -19,62 +16,115 @@ export function codexArgs(job: Job, cwd: string, output: string, session?: strin
   const base = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--trust", "-C", cwd, ...overrides, "--json", "--color", "never", "--output-last-message", output];
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
-export function logCodexActivity(log: Diagnostics, event: any, session: string) {
-  if (!["item.started", "item.completed"].includes(event?.type)) return;
+export function logCodexError(log: Diagnostics, event: any, session?: string) {
+  const item = event.type === "error" ? event : event.item;
+  log.event("runtime.provider", "ERROR", { stage: "codex", session_id: session,
+    native_cause: log.sanitize(String(item?.message ?? item?.text ?? "Native provider error")) });
+}
+export function logCodexActivity(log: Diagnostics, event: any, session: string, cwd?: string, started?: Map<string, number>) {
+  if (!["item.started", "item.completed"].includes(event?.type) && !(event?.type === "item.updated" && event?.item?.type === "todo_list")) return;
   const item = event.item;
   if (!item || typeof item.id !== "string") return;
   const fields: Record<string, unknown> = { session_id: session, item_id: item.id, item_type: item.type,
     phase: event.type.slice(5), status: item.status };
   switch (item.type) {
     case "command_execution": {
-      const name = typeof item.command === "string"
-        ? /^(?:\/(?:usr\/)?bin\/(?:bash|sh|zsh) -[a-z]*c ['"]?)?([a-z_][a-z0-9_-]*)(?=[\s'";]|$)/.exec(item.command)?.[1] : undefined;
-      fields.command_name = name && commandNames.has(name) ? name : "shell";
+      const command = typeof item.command === "string" ? item.command : "";
+      fields.command_name = commandName(command);
       fields.exit_code = item.exit_code;
+      if (event.type === "item.started") started?.set(item.id, Date.now());
+      if (event.type === "item.completed" && cwd) {
+        const elapsed = started?.has(item.id) ? Date.now() - started.get(item.id)! : undefined;
+        fields.elapsed_ms = elapsed;
+        const patch = parseApplyPatch(command, typeof item.aggregated_output === "string" ? item.aggregated_output : "", cwd);
+        if (patch) {
+          if (item.exit_code === 0 || item.status === "completed" && item.exit_code == null) for (const edit of patch) showEdit(log, edit);
+          else log.line(`[edit] failed (exit ${item.exit_code ?? "unknown"})`);
+        } else log.line(`[cmd] ${summarizeCommand(command, cwd)} (exit ${item.exit_code ?? "unknown"}${elapsed === undefined ? "" : `, ${elapsed} ms`})`);
+        started?.delete(item.id);
+      }
       break;
     }
     case "file_change": {
       const changes = Array.isArray(item.changes) ? item.changes : [];
-      fields.changes = changes.slice(0, 100).map((change: any) => ({ path: change.path, kind: change.kind }));
-      fields.omitted_changes = Math.max(0, changes.length - 100);
+      if (event.type === "item.completed" && item.status === "completed") {
+        fields.changes = changes.slice(0, 100).map((change: any) => ({ path: cwd && typeof change.path === "string" ? editForPath(change.path, change.kind, undefined, cwd).path : change.path, kind: change.kind }));
+        fields.omitted_changes = Math.max(0, changes.length - 100);
+      }
+      if (cwd && event.type === "item.completed") {
+        if (item.status === "completed") for (const change of changes.slice(0, 100)) {
+          if (typeof change.path === "string") showEdit(log, editForPath(change.path, change.kind ?? "update", typeof change.diff === "string" ? change.diff : undefined, cwd));
+        }
+        else log.line("[edit] failed");
+      }
       break;
     }
     case "mcp_tool_call":
       fields.server = item.server; fields.tool = item.tool;
+      if (cwd && event.type === "item.completed") log.line(`[mcp] ${item.server ?? "server"} / ${item.tool ?? "tool"} (${item.status ?? "completed"})`);
       break;
     case "collab_tool_call":
       fields.tool = item.tool;
       fields.receiver_thread_ids = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids.slice(0, 100) : [];
+      if (cwd && event.type === "item.completed") log.line(`[subagent] ${item.tool ?? "activity"} (${item.status ?? "completed"})`);
       break;
     case "web_search":
       fields.action = item.action?.type;
+      if (cwd && event.type === "item.completed") log.line(`[web] ${item.action?.type ?? "search"}`);
       break;
+    case "todo_list":
+      if (cwd && Array.isArray(item.items)) log.group("Plan", boundedLines(log.redact(item.items.map((entry: any) => `${entry.completed ? "[x]" : "[ ]"} ${entry.text ?? ""}`).join("\n"))), { untrusted: true });
+      return;
     default: return;
   }
-  log.event("runtime.tool", item.status === "failed" || item.status === "declined" || typeof item.exit_code === "number" && item.exit_code !== 0 ? "WARN" : "INFO", fields);
+  if (item.status === "failed" || typeof item.exit_code === "number" && item.exit_code !== 0) fields.status = "failed";
+  log.event("runtime.tool", item.status === "declined" ? "WARN" : "INFO", fields);
 }
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
-  let observed: string | undefined, identityChanged = false, terminal = false;
-  await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, output, session), {
+  let observed: string | undefined, identityChanged = false, terminal = false, pending: { id: string; text: string } | undefined;
+  let unparsed = 0;
+  const started = new Map<string, number>();
+  const flushMessage = () => { if (pending) { log.line(`[agent] ${pending.text}`); pending = undefined; } };
+  try { await command(join(job.tools, "node_modules/.bin/codex"), codexArgs(job, cwd, output, session), {
     cwd, env: job.env, stage: "codex", onControl, log, timeoutMs, stdin: prompt, collect: false,
     nativeSessionUnfinished: () => Boolean(observed) && !identityChanged && !terminal,
     onLine(line) {
       let value: any;
-      try { value = JSON.parse(line); } catch { return; }
+      try { value = JSON.parse(line); } catch { unparsed = Math.min(unparsed + 1, 1000000); return; }
+      if (pending && value.item && value.item.id !== pending.id) flushMessage();
+      if (value.type === "turn.completed") pending = undefined;
+      if (value.type === "turn.failed") flushMessage();
       if (value?.type === "turn.completed" || value?.type === "turn.failed") terminal = true;
+      if (value?.type === "error" || value?.type === "item.completed" && value.item?.type === "error") {
+        flushMessage();
+        logCodexError(log, value, observed ?? session);
+        return;
+      }
       if (value.type === "thread.started" && typeof value.thread_id === "string") {
         if (session && value.thread_id !== session || observed && value.thread_id !== observed) { identityChanged = true; return; }
         observed = value.thread_id;
         onSession?.(observed!);
         log.event("runtime.session", "INFO", { session_id: observed, outcome: session ? "resumed" : "created" });
       }
-      if (observed && !identityChanged) logCodexActivity(log, value, observed);
+      if (observed && !identityChanged) {
+        const item = value.item;
+        if (value.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") pending = { id: item.id, text: item.text };
+        else if (value.type === "item.completed" && item?.type === "reasoning" && typeof item.text === "string")
+          log.group("Thinking", boundedLines(log.redact(item.text)), { untrusted: true });
+        else logCodexActivity(log, value, observed, cwd, started);
+      }
     },
-  });
+  }); } catch (error) {
+    if (error instanceof RunnerError) error.details.unparsed_stdout_lines = unparsed;
+    throw error;
+  } finally {
+    flushMessage();
+    log.event("runtime.native_stream", "INFO", { stage: "codex", session_id: observed ?? session, unparsed_stdout_lines: unparsed });
+  }
   if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "codex", "Codex did not return the expected conversation identity.",
-    { expected_session: session ?? null, observed_session: observed ?? null });
+    { expected_session: session ?? null, observed_session: observed ?? null, unparsed_stdout_lines: unparsed });
   return { session: observed, result: await readFile(output, "utf8") };
 }
 
@@ -86,7 +136,7 @@ function parseCodexConfig(raw: string, source: "CODEX_CONFIG_TOML" | ".codex/con
   if (!object(mcpServers)) {
     throw new RunnerError("invalid_codex_config", "configuration", "Expected an mcp_servers table.", { source });
   }
-  protectConfiguration(config, log);
+  protectConfiguration(config, log, "", source);
   return { config, mcpServers };
 }
 

@@ -21,5 +21,6 @@ export async function drive(input: { job: Job; cwd: string; log: Diagnostics; pl
     try { response = await readFile(join(input.job.root, "result-native.txt"), "utf8"); } catch (readError: any) { if (readError.code !== "ENOENT") throw readError; }
   } finally { await input.state({ session: session ?? undefined, outcome }); }
   input.log.event("runtime.outcome", outcome === "completed" ? "INFO" : "WARN", { session_id: session, outcome, reason });
+  input.log.line(`[outcome] ${outcome} (${reason})`);
   return { session, outcome, reason, response };
 }

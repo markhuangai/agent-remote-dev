@@ -12,7 +12,7 @@ import { drive } from '../.build/driver.js';
 import { TaskGit } from '../.build/git.js';
 import { watchSnapshots } from '../.build/checkpoint-worker.js';
 import { checkpoint, exec, fixture, mcpProvider, repository, root, sessionId } from './helpers.mjs';
-import { call, claudeProvider, text } from './claude-provider.mjs';
+import { call, claudeProvider, text, thinking, redactedThinking } from './claude-provider.mjs';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor(probe) {
@@ -63,6 +63,34 @@ test('real Claude uses native tools to read, edit, commit and push with sanitize
   assert.ok(api.requests.some(request => request.messages.some(message => JSON.stringify(message).includes('Fixture repository'))));
   assert.ok(f.records.some(record => record.event === 'runtime.tool' && record.tool === 'Edit' && record.phase === 'completed'));
   assert.doesNotMatch(JSON.stringify(f.records), /private-task-9271|private-edited-value-9271/);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('README.md')));
+});
+
+test('real Claude folds thinking and bounded edits without forwarding signatures or the final reply', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  const api = await claudeProvider(t, [[thinking('Inspect the fixture.', 'private-thinking-signature-4192'),
+    redactedThinking('private-redacted-thinking-3192'),
+    call('Edit', { file_path: join(r.cwd, 'README.md'), old_string: 'Fixture repository', new_string: 'Edited fixture' }, 'edit')],
+  [text('Final reply from Claude.')]]);
+  await configure(f.job, api.config, f.log);
+  const result = await runClaude(f.job, r.cwd, 'Edit the fixture.', f.log, 90000, 'readable');
+  assert.equal(result.result, 'Final reply from Claude.');
+  assert.ok(f.timeline.some(entry => entry.level === 'group' && entry.line.includes('Thinking')));
+  assert.ok(f.lines.some(line => line.includes('Inspect the fixture.')));
+  assert.ok(f.lines.some(line => line.includes('Edited fixture')));
+  assert.doesNotMatch(f.lines.join('\n'), /private-thinking-signature-4192|private-redacted-thinking-3192|Final reply from Claude\./);
+});
+
+test('real Claude bounds a large Write event before sending it to the parent', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  const content = 'x'.repeat(1536 * 1024) + '\nvisible final line\n';
+  const api = await claudeProvider(t, [[call('Write', { file_path: join(r.cwd, 'large.txt'), content }, 'write')], [text('Large write completed.')]]);
+  await configure(f.job, api.config, f.log);
+  const result = await runClaude(f.job, r.cwd, 'Write the fixture.', f.log, 90000, 'large');
+  assert.equal(result.result, 'Large write completed.');
+  assert.equal((await readFile(join(r.cwd, 'large.txt'), 'utf8')).length, content.length);
+  assert.ok(f.lines.some(line => line.includes('[oversized line omitted]')));
+  assert.ok(f.lines.every(line => Buffer.byteLength(line) <= 64 * 1024));
 });
 for (const downloaded of [false, true]) test(`real Claude discovers user/repository skills and ${downloaded ? 'downloaded' : 'default'} attribution across resume`, async t => {
   const f = await fixture(t, 'claude'), r = await repository(f);

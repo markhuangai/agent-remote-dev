@@ -7,13 +7,14 @@ import type { ProcessControl } from "./process.js";
 import type { Job } from "./setup.js";
 import type { Diagnostics } from "./diagnostics.js";
 import type { McpConfiguration } from "./mcp-config.js";
+import { boundedLines, editForPath, showEdit } from "./activity.js";
 
 export async function configureClaude(job: Job, raw: string, log: Diagnostics, mcp: McpConfiguration) {
   let settings: unknown;
   try { settings = JSON.parse(raw); }
   catch { throw new RunnerError("invalid_claude_config", "configuration", "Claude settings JSON could not be parsed; contents withheld."); }
   requireValue(object(settings), "invalid_claude_config", "configuration");
-  protectConfiguration(settings, log);
+  protectConfiguration(settings, log, "", "CLAUDE_SETTINGS_JSON");
   requireValue(settings.env === undefined || object(settings.env) && Object.values(settings.env).every(value => typeof value === "string"), "invalid_claude_environment", "configuration");
   const environment: Record<string, string> = {};
   for (const [key, value] of Object.entries(settings.env ?? {})) {
@@ -36,27 +37,50 @@ export async function runClaude(job: Job, cwd: string, prompt: string, log: Diag
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
   let observed: string | undefined, identityChanged = false, terminal = false, failure: string | undefined;
-  await command(process.execPath, [join(import.meta.dirname, "claude-worker.js"), output, session ?? ""], {
-    cwd, env: job.env, stage: "claude", onControl, log, timeoutMs, stdin: prompt, collect: false,
+  let unparsed = 0;
+  try { await command(process.execPath, [join(import.meta.dirname, "claude-worker.js"), output, session ?? ""], {
+    cwd, env: job.env, stage: "claude", onControl, log, timeoutMs, stdin: JSON.stringify({ prompt, secrets: log.protectedValues }), collect: false,
     nativeSessionUnfinished: () => Boolean(observed) && !identityChanged && !terminal,
     onLine(line) {
-      let event: any; try { event = JSON.parse(line); } catch { return; }
+      let event: any; try { event = JSON.parse(line); } catch { unparsed = Math.min(unparsed + 1, 1000000); return; }
       if (event.type === "session" && typeof event.session === "string") {
         if (session && event.session !== session || observed && event.session !== observed) { identityChanged = true; return; }
         observed = event.session; onSession?.(observed!);
         log.event("runtime.session", "INFO", { session_id: observed, outcome: session ? "resumed" : "created" });
       }
-      if (event.type === "tool" && observed && !identityChanged) log.event("runtime.tool", event.failed ? "WARN" : "INFO", {
-        session_id: observed, item_id: event.id, tool: event.tool, phase: event.phase, status: event.failed ? "failed" : event.phase,
-      });
+      if (event.type === "thinking" && typeof event.text === "string") log.group(event.parent ? "Subagent thinking" : "Thinking", boundedLines(log.redact(event.text)), { untrusted: true });
+      if (event.type === "text" && typeof event.text === "string") log.line(`${event.parent ? "[subagent]" : "[agent]"} ${event.text}`);
+      if (event.type === "tool" && observed && !identityChanged) {
+        log.event("runtime.tool", "INFO", { session_id: observed, item_id: event.id, tool: event.tool, phase: event.phase,
+          status: event.failed ? "failed" : event.phase, exit_code: event.exit_code, elapsed_ms: event.elapsed_ms, parent_tool_use_id: event.parent });
+        if (event.phase === "completed") {
+          if (["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(event.tool)) {
+            if (event.failed) log.line("[edit] failed");
+            else if (typeof event.path === "string") {
+              const edit = editForPath(event.path, "update", typeof event.diff === "string" ? event.diff : undefined, cwd);
+              if (event.suppressed) { edit.suppressed = event.suppressed; delete edit.diff; }
+              showEdit(log, edit);
+            }
+          } else if (event.tool === "Bash") log.line(`[cmd] ${event.command ?? "shell"} (${event.failed ? "failed" : "completed"}, exit ${event.exit_code ?? "unknown"}, ${event.elapsed_ms ?? 0} ms)`);
+          else if (typeof event.plan === "string") log.group("Plan", boundedLines(log.redact(event.plan)), { untrusted: true });
+          else if (/^(?:Agent|Task)$/.test(event.tool)) log.line(`[subagent] ${event.failed ? "failed" : "completed"}`);
+          else if (/^mcp__/i.test(event.tool)) log.line(`[mcp] ${event.tool} (${event.failed ? "failed" : "completed"})`);
+          else if (/^Web(?:Search|Fetch)$/.test(event.tool)) log.line(`[web] ${event.tool} (${event.failed ? "failed" : "completed"})`);
+        }
+      }
       if (event.type === "provider_error") log.event("runtime.provider", "ERROR", { stage: "claude", session_id: observed ?? session,
         native_reason: event.reason, corrective_action: "Check the selected provider credentials, model and endpoint before resuming." });
       if (event.type === "provider_retry") log.event("runtime.provider", "WARN", { stage: "claude", session_id: observed ?? session,
         native_reason: event.reason, attempt: event.attempt, max_retries: event.max_retries, retry_delay_ms: event.retry_delay_ms, http_status: event.http_status });
       if (event.type === "result") { terminal = true; if (!event.success) failure = event.reason; }
     },
-  });
-  requireValue(!identityChanged && observed && (!session || observed === session), "conversation_identity_changed", "claude");
-  if (!terminal || failure) throw new RunnerError("claude_native_failure", "claude", "Claude did not return a successful native result.", { native_reason: failure ?? "missing_result" });
+  }); } catch (error) {
+    if (error instanceof RunnerError) error.details.unparsed_stdout_lines = unparsed;
+    throw error;
+  } finally {
+    log.event("runtime.native_stream", "INFO", { stage: "claude", session_id: observed ?? session, unparsed_stdout_lines: unparsed });
+  }
+  if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "claude", "Claude did not return the expected conversation identity.", { unparsed_stdout_lines: unparsed });
+  if (!terminal || failure) throw new RunnerError("claude_native_failure", "claude", "Claude did not return a successful native result.", { native_reason: failure ?? "missing_result", unparsed_stdout_lines: unparsed });
   return { session: observed, result: await readFile(output, "utf8") };
 }
