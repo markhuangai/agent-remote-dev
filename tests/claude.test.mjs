@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { configure, installSkillSource, installTools, installUserInstructions, safeTree } from '../.build/setup.js';
@@ -12,7 +12,7 @@ import { drive } from '../.build/driver.js';
 import { TaskGit } from '../.build/git.js';
 import { watchSnapshots } from '../.build/checkpoint-worker.js';
 import { checkpoint, exec, fixture, mcpProvider, repository, root, sessionId } from './helpers.mjs';
-import { call, claudeProvider, text, thinking, redactedThinking } from './claude-provider.mjs';
+import { call, claudeProvider, text, thinking, redactedThinking, simulateSdkMessages } from './claude-provider.mjs';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor(probe) {
@@ -91,6 +91,59 @@ test('real Claude bounds a large Write event before sending it to the parent', a
   assert.equal((await readFile(join(r.cwd, 'large.txt'), 'utf8')).length, content.length);
   assert.ok(f.lines.some(line => line.includes('[oversized line omitted]')));
   assert.ok(f.lines.every(line => Buffer.byteLength(line) <= 64 * 1024));
+});
+
+test('real Claude rejects sensitive symlink edits without logging their content', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  await mkdir(join(r.cwd, 'config'));
+  await writeFile(join(r.cwd, 'config/development.env'), 'old-unregistered-secret-8712\n');
+  await symlink('config/development.env', join(r.cwd, '.env'));
+  const api = await claudeProvider(t, [[call('Read', { file_path: join(r.cwd, '.env') }, 'sensitive-read')],
+    [call('Edit', { file_path: join(r.cwd, '.env'), old_string: 'old-unregistered-secret-8712',
+      new_string: 'new-unregistered-secret-8712' }, 'sensitive-edit')], [text('Finished the edit.')]]);
+  await configure(f.job, api.config, f.log);
+  await runClaude(f.job, r.cwd, 'Edit the fixture.', f.log, 90000, 'sensitive-symlink');
+  assert.equal(await readFile(join(r.cwd, '.env'), 'utf8'), 'old-unregistered-secret-8712\n');
+  assert.ok(f.lines.some(line => line.includes('[edit] failed')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-8712|new-unregistered-secret-8712/);
+});
+
+test('Claude worker suppresses successful edit events for a sensitive symlink path', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  await mkdir(join(r.cwd, 'config'));
+  await writeFile(join(r.cwd, 'config/development.env'), 'old-unregistered-secret-8712\n');
+  await symlink('config/development.env', join(r.cwd, '.env'));
+  await configure(f.job, JSON.stringify({ model: 'fixture' }), f.log);
+  const path = join(r.cwd, '.env');
+  await simulateSdkMessages(f, [
+    { type: 'system', subtype: 'init', session_id: 'fixture-session-8712' },
+    { type: 'assistant', parent_tool_use_id: null, message: { id: 'message-1', content: [call('Edit', { file_path: path,
+      old_string: 'old-unregistered-secret-8712', new_string: 'new-unregistered-secret-8712' }, 'edit')] } },
+    { type: 'user', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', tool_use_id: 'edit', is_error: false }] },
+      tool_use_result: { filePath: path, structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1,
+        lines: ['-old-unregistered-secret-8712', '+new-unregistered-secret-8712'] }] } },
+    { type: 'result', subtype: 'success', is_error: false, result: 'Fixture completed.' },
+  ]);
+  await runClaude(f.job, r.cwd, 'Edit the fixture.', f.log, 90000, 'sensitive-symlink-event');
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('sensitive file')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-8712|new-unregistered-secret-8712/);
+});
+
+test('Claude identity failures retain expected and observed session IDs', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  await configure(f.job, JSON.stringify({ model: 'fixture' }), f.log);
+  const expected = 'expected-session-1492', observed = 'observed-session-2492';
+  await simulateSdkMessages(f, [
+    { type: 'system', subtype: 'init', session_id: observed },
+    { type: 'result', subtype: 'success', is_error: false, result: 'fixture complete' },
+  ]);
+  await assert.rejects(runClaude(f.job, r.cwd, 'Continue the fixture.', f.log, 90000, 'identity', expected), error => {
+    assert.equal(error.reason, 'conversation_identity_changed');
+    assert.equal(error.details.expected_session, expected); assert.equal(error.details.observed_session, observed);
+    f.log.failure(error); return true;
+  });
+  const failure = f.records.find(record => record.reason === 'conversation_identity_changed');
+  assert.equal(failure.expected_session, expected); assert.equal(failure.observed_session, observed);
 });
 for (const downloaded of [false, true]) test(`real Claude discovers user/repository skills and ${downloaded ? 'downloaded' : 'default'} attribution across resume`, async t => {
   const f = await fixture(t, 'claude'), r = await repository(f);

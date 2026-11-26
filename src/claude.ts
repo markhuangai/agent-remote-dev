@@ -36,7 +36,7 @@ export async function configureClaude(job: Job, raw: string, log: Diagnostics, m
 export async function runClaude(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
   const output = join(job.root, `result-${ordinal}.txt`);
-  let observed: string | undefined, identityChanged = false, terminal = false, failure: string | undefined;
+  let observed: string | undefined, conflictingSession: string | undefined, identityChanged = false, terminal = false, failure: string | undefined;
   let unparsed = 0;
   try { await command(process.execPath, [join(import.meta.dirname, "claude-worker.js"), output, session ?? ""], {
     cwd, env: job.env, stage: "claude", onControl, log, timeoutMs, stdin: JSON.stringify({ prompt, secrets: log.protectedValues }), collect: false,
@@ -44,7 +44,9 @@ export async function runClaude(job: Job, cwd: string, prompt: string, log: Diag
     onLine(line) {
       let event: any; try { event = JSON.parse(line); } catch { unparsed = Math.min(unparsed + 1, 1000000); return; }
       if (event.type === "session" && typeof event.session === "string") {
-        if (session && event.session !== session || observed && event.session !== observed) { identityChanged = true; return; }
+        if (session && event.session !== session || observed && event.session !== observed) {
+          identityChanged = true; conflictingSession ??= event.session; return;
+        }
         observed = event.session; onSession?.(observed!);
         log.event("runtime.session", "INFO", { session_id: observed, outcome: session ? "resumed" : "created" });
       }
@@ -75,12 +77,17 @@ export async function runClaude(job: Job, cwd: string, prompt: string, log: Diag
       if (event.type === "result") { terminal = true; if (!event.success) failure = event.reason; }
     },
   }); } catch (error) {
-    if (error instanceof RunnerError) error.details.unparsed_stdout_lines = unparsed;
+    if (error instanceof RunnerError) {
+      error.details.unparsed_stdout_lines = unparsed;
+      if (identityChanged) Object.assign(error.details, { expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? null });
+    }
     throw error;
   } finally {
     log.event("runtime.native_stream", "INFO", { stage: "claude", session_id: observed ?? session, unparsed_stdout_lines: unparsed });
   }
-  if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "claude", "Claude did not return the expected conversation identity.", { unparsed_stdout_lines: unparsed });
+  if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "claude", "Claude did not return the expected conversation identity.", {
+    expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? observed ?? null, unparsed_stdout_lines: unparsed,
+  });
   if (!terminal || failure) throw new RunnerError("claude_native_failure", "claude", "Claude did not return a successful native result.", { native_reason: failure ?? "missing_result", unparsed_stdout_lines: unparsed });
   return { session: observed, result: await readFile(output, "utf8") };
 }

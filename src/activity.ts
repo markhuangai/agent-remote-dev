@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Diagnostics } from "./diagnostics.js";
 
@@ -11,24 +11,32 @@ const dataExtension = /^\.(?:json|ya?ml|toml|ini|env|txt|cfg|conf)$/i;
 
 function existingPath(path: string) {
   let current = path;
-  while (!existsSync(current)) {
-    const parent = dirname(current);
-    if (parent === current) return path;
-    current = parent;
+  const remaining: string[] = [];
+  for (;;) {
+    try { return resolve(realpathSync.native(current), ...remaining); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      const parent = dirname(current);
+      if (parent === current) return undefined;
+      remaining.unshift(basename(current));
+      current = parent;
+    }
   }
-  try { return resolve(realpathSync(current), relative(current, path)); }
-  catch { return path; }
 }
 
 export function activityPath(path: string, cwd: string, base = cwd) {
-  const root = existingPath(resolve(cwd));
-  const absolute = existingPath(resolve(base, path));
-  const name = relative(root, absolute);
-  const outside = name === ".." || name.startsWith(".." + sep) || isAbsolute(name);
-  const segments = name.split(/[\\/]/);
-  const file = basename(name);
-  const sensitive = segments.some(segment => [".ssh", ".aws", ".gnupg"].includes(segment.toLowerCase())) ||
-    sensitiveNames.test(file) || sensitiveExtension.test(file) || sensitiveData.test(file) && (!extname(file) || dataExtension.test(extname(file)));
+  const root = existingPath(cwd);
+  const raw = isAbsolute(path) ? path : `${base}${sep}${path}`;
+  const absolute = existingPath(raw);
+  const name = relative(resolve(cwd), resolve(base, path));
+  const physical = root && absolute ? relative(root, absolute) : "..";
+  const escapes = (value: string) => value === ".." || value.startsWith(".." + sep) || isAbsolute(value);
+  const outside = escapes(name) || escapes(physical);
+  const sensitive = [raw, physical].some(candidate => {
+    const segments = candidate.split(/[\\/]/), file = basename(candidate);
+    return segments.some(segment => [".ssh", ".aws", ".gnupg"].includes(segment.toLowerCase())) ||
+      sensitiveNames.test(file) || sensitiveExtension.test(file) || sensitiveData.test(file) && (!extname(file) || dataExtension.test(extname(file)));
+  });
   return { path: outside ? "<outside-workspace>" : name || ".", outside, sensitive };
 }
 

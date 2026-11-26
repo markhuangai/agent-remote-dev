@@ -761,6 +761,28 @@ test("patch moves suppress diff bodies when either path is sensitive or outside 
   assert.match(safe[0].diff, /unregistered-sensitive-value/);
 });
 
+test("activity paths protect sensitive symlink names and resolve symlink traversal before checking the workspace", async t => {
+  const f = await fixture(t), r = await repository(f);
+  await mkdir(join(r.cwd, "config"));
+  await writeFile(join(r.cwd, "config/development.env"), "unregistered-sensitive-value\n");
+  await symlink("config/development.env", join(r.cwd, ".env"));
+  const logical = activityPath(".env", r.cwd);
+  assert.equal(logical.path, ".env"); assert.equal(logical.outside, false); assert.equal(logical.sensitive, true);
+  const patch = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: .env\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch\nPATCH";
+  const edits = parseApplyPatch(patch, "", r.cwd);
+  assert.equal(edits[0].suppressed, "sensitive file"); assert.equal(edits[0].diff, undefined);
+
+  await writeFile(join(r.cwd, "config/.env"), "sensitive target\n");
+  await symlink("config/.env", join(r.cwd, "settings"));
+  assert.equal(activityPath("settings", r.cwd).sensitive, true);
+  const outside = join(f.temporary, "outside"), child = join(outside, "child");
+  await mkdir(child, { recursive: true });
+  await writeFile(join(outside, "external.txt"), "outside\n");
+  await symlink(child, join(r.cwd, "link"));
+  assert.equal(activityPath("link/../external.txt", r.cwd).outside, true);
+  assert.equal(activityPath("link/../missing.txt", r.cwd).outside, true);
+});
+
 test("Git summary parses renamed and untracked paths with NUL delimiters", async t => {
   const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
   await r.git("mv", "README.md", "renamed & file.md");

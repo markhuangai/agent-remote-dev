@@ -1,10 +1,35 @@
 import { createServer } from 'node:http';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
 export const text = value => ({ type: 'text', text: value });
 export const thinking = (value, signature = 'fixture-thinking-signature') => ({ type: 'thinking', thinking: value, signature });
 export const redactedThinking = data => ({ type: 'redacted_thinking', data });
 export const call = (name, input, id = 'tool-1') => ({ type: 'tool_use', name, input, id });
+export async function simulateSdkMessages(fixture, messages) {
+  const sdk = `
+    export function query() {
+      return (async function* () {
+        for (const message of ${JSON.stringify(messages)}) yield message;
+      })();
+    }
+  `;
+  const target = 'data:text/javascript,' + encodeURIComponent(sdk);
+  const hook = `
+    import { registerHooks } from 'node:module';
+    const target = ${JSON.stringify(target)};
+    registerHooks({
+      resolve(specifier, context, next) {
+        if (specifier === '@anthropic-ai/claude-agent-sdk') return { url: target, shortCircuit: true };
+        return next(specifier, context);
+      },
+    });
+  `;
+  const path = join(fixture.temporary, 'sdk-message-hook.mjs');
+  await writeFile(path, hook, { mode: 0o600 });
+  fixture.job.env.NODE_OPTIONS = `--import=${path}`;
+}
 export async function claudeProvider(t, replies) {
   const requests = [];
   const server = createServer(async (request, response) => {
