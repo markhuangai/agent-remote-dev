@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { appendFile, chmod, cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
@@ -286,6 +287,22 @@ test("non-secret environment flags permit export while configured MCP credential
   await writeFile(path,await readFile(path,"utf8")+JSON.stringify({type:"response_item",payload:{text:secret}})+"\n");
   await assert.rejects(exportCheckpoint(f.job,checkpoint({previous:{sequence:1,artifact_id:4,checkpoint_sha:"a".repeat(40)}}),f.log),{reason:"credential_in_checkpoint"});
 });
+test("undelimited MCP environment credentials are protected without rejecting ordinary settings", async t => {
+  const f = await fixture(t), secret = "fixture-postgres-password-6218";
+  const mcp = value => JSON.stringify({ mcpServers: { postgres: { command: "node", env: {
+    PGPASSWORD: value, MONKEY: "x", TOKENIZERS_PARALLELISM: "false", KEYBOARD: "us",
+  } } } });
+  await assert.rejects(configure(f.job, 'model="gpt-5.1"', f.log, mcp("x!")), { reason: "invalid_configured_credential" });
+  assert.ok(!f.log.protectedValues.includes("x!"));
+  await configure(f.job, 'model="gpt-5.1"', f.log, mcp(secret));
+  assert.ok(f.log.protectedValues.includes(secret));
+  for (const value of ["x", "false", "us"]) assert.ok(!f.log.protectedValues.includes(value));
+  f.log.line(`Fixture output: ${secret}`);
+  assert.doesNotMatch(f.lines.join("\n"), /fixture-postgres-password-6218/);
+  await history(f, secret);
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+  assert.throws(() => inspectCredentials(secret, f.log, "credential_in_result"), { reason: "credential_in_result" });
+});
 test("upload failures, missing sessions, drift and size limits never advance the last durable receipt", async (t) => {
   const f = await fixture(t); await history(f);
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log, 1), { reason: "checkpoint_size_limit" });
@@ -408,6 +425,32 @@ test("environment references and benign URL query values remain usable", async t
   assert.ok(!f.log.protectedValues.includes("enabled"));
 });
 
+test("credential headers in MCP command arguments are validated and protected", async t => {
+  const f = await fixture(t), secret = "fixture-header-password-7264";
+  for (const argument of [value => ["--header", `X-API-Key: ${value}`], value => ["-H", `X-API-Key: ${value}`],
+    value => [`--header=X-API-Key: ${value}`], value => [`-HX-API-Key: ${value}`]]) {
+    const mcp = value => JSON.stringify({ mcpServers: { fixture: { command: "curl", args: argument(value) } } });
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("x!")), { reason: "invalid_configured_credential" });
+    await configure(f.job, 'model="fixture"', f.log, mcp(secret));
+  }
+  assert.ok(f.log.protectedValues.includes(secret));
+  assert.ok(!f.log.protectedValues.includes("x!"));
+  await history(f, secret);
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
+test("URL-encoded configured credentials cannot pass checkpoint or result inspection", async t => {
+  const f = await fixture(t);
+  const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http",
+    url: "https://fixture:p%40%73sword@example.invalid/mcp?token=spaced%20%6bey" } } });
+  await configure(f.job, 'model="fixture"', f.log, mcp);
+  assert.ok(f.log.protectedValues.includes("p@ssword"));
+  assert.ok(f.log.protectedValues.includes("spaced key"));
+  await history(f, "fixture p%40%73sword");
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+  assert.throws(() => inspectCredentials("fixture spaced%20%6bey", f.log, "credential_in_result"), { reason: "credential_in_result" });
+});
+
 test("real Actions masking filters syntax lines and rejected composite credentials", async () => {
   const diagnostics = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
   const credentials = JSON.stringify(new URL("../.build/credentials.js", import.meta.url).href);
@@ -502,6 +545,100 @@ test("real setup reports an invalid primary credential before exposing a state p
     assert.ok(!error.stdout.includes("state-path"));
     return true;
   });
+});
+
+test("real fresh setup rejects composite credentials before launch or export", async t => {
+  const f = await fixture(t), output = join(f.temporary, "fresh-output");
+  await writeFile(output, "");
+  const payload = Buffer.from("user:!?").toString("base64");
+  const mcp = JSON.stringify({ mcpServers: { fixture: { command: "node", env: { DEBUG: "1" },
+    headers: { Authorization: `Basic ${payload}` } } } });
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import {main} from ${main}; await main({github:{request(){throw new Error('Unexpected API call');}}});`;
+  const env = { ...process.env, REMOTE_DEV_RUNNER: "codex", REMOTE_DEV_GITHUB_TOKEN: "fixture-github-token-9382",
+    CODEX_API_KEY: "fixture-api-key-7242", CODEX_CONFIG_TOML: 'model="fixture"', MCP_CONFIG_JSON: mcp,
+    GITHUB_OUTPUT: output, GITHUB_RUN_ID: "13", GITHUB_RUN_ATTEMPT: "2" };
+  await assert.rejects(exec(process.execPath, ["--input-type=module", "-e", script], { env }), error => {
+    assert.equal(error.code, 1);
+    const failure = error.stdout.split("\n").find(line => line.startsWith("::error::") && line.includes('"event":"runtime.failed"'));
+    const record = JSON.parse(failure.slice(failure.indexOf("{")));
+    assert.equal(record.reason, "invalid_configured_credential"); assert.equal(record.stage, "configuration");
+    assert.equal(record.source, "MCP_CONFIG_JSON"); assert.equal(record.field, "basic_password");
+    assert.equal(record.run_id, "13"); assert.equal(record.run_attempt, "2");
+    assert.doesNotMatch(error.stdout, /user:!\?|user:%21%3F/); assert.ok(!error.stdout.includes(payload));
+    const masks = error.stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
+    assert.ok(masks.every(line => !line.includes("!?") && !line.includes("%21%3F")));
+    assert.ok(!error.stdout.includes('"stage":"tools"')); return true;
+  });
+  assert.equal(await readFile(output, "utf8"), "");
+});
+
+test("real resumed setup rejects restored composite credentials before launch or export", async t => {
+  const f = await fixture(t), repo = await repository(f);
+  const payload = Buffer.from("user:!?").toString("base64");
+  const bad = JSON.stringify({ mcpServers: { fixture: { command: "node", env: { DEBUG: "1" },
+    headers: { Authorization: `Basic ${payload}` } } } });
+  await writeFile(join(repo.cwd, ".mcp.json"), bad);
+  await repo.git("add", ".mcp.json"); await repo.git("commit", "-m", "Configure fixture"); await repo.git("push", "origin", "HEAD");
+  await history(f);
+  const git = new TaskGit(repo.cwd, f.job.env, f.log);
+  const exported = await exportCheckpoint(f.job, checkpoint({ ...await git.snapshot(), workspace: repo.cwd }), f.log);
+  const archive = join(f.temporary, "setup-checkpoint.zip");
+  await exec("python3", ["-c", `import json,sys,zipfile
+with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
+ for name in json.loads(sys.argv[3]): z.write(name,name[len(sys.argv[2])+1:])`, archive, exported.root, JSON.stringify(exported.files)]);
+  const workspace = join(f.temporary, "workspace"), target = join(workspace, "target"), bin = join(f.temporary, "fixture-bin");
+  await mkdir(workspace); await mkdir(bin);
+  await exec("git", ["clone", "--branch", "main", repo.remote, target], { env: f.job.env });
+  await exec("git", ["remote", "set-url", "origin", "https://github.com/fixture/repo"], { cwd: target, env: f.job.env });
+  await copyFile(process.execPath, join(bin, "node"), constants.COPYFILE_FICLONE);
+  await writeFile(join(bin, "git"), `#!/bin/sh\nif [ "$1" = fetch ]; then exec /usr/bin/git -c 'url.file://${repo.remote}.insteadOf=https://github.com/fixture/repo' "$@"; fi\nexec /usr/bin/git "$@"\n`, { mode: 0o700 });
+  const output = join(f.temporary, "resume-output"); await writeFile(output, "");
+  const info = { full_name: "fixture/repo" };
+  const parent = { id: 13, run_attempt: 1, workflow_id: lineage.workflow_id, path: lineage.workflow_path, head_sha: lineage.workflow_sha,
+    repository: info, head_repository: info, head_branch: "main", event: "workflow_dispatch", status: "completed", conclusion: "failure" };
+  const current = { ...parent, id: 20, status: "in_progress" };
+  const bytes = await readFile(archive), artifact = { id: 55, name: `remote-dev-session-r13-a1-${exported.manifest.sequence}`,
+    workflow_run: { id: 13 }, size_in_bytes: bytes.length, expired: false, expires_at: "2099-01-01T00:00:00Z" };
+  const config = Buffer.from("allowed-actors: [Z-M-Huang]\nskills: []\n");
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import {main} from ${main};
+    const parent=${JSON.stringify(parent)}, current=${JSON.stringify(current)}, artifact=${JSON.stringify(artifact)};
+    const github={request:async route=>{const [method,path]=route.split(' '); if(method!=='GET') throw new Error('Unexpected export');
+      if(path.endsWith('/actions/runs/20')) return {data:current}; if(path.endsWith('/actions/runs/13')) return {data:parent};
+      if(path.includes('/actions/runs/13/artifacts?')) return {data:{artifacts:[artifact]}};
+      if(path.endsWith('/actions/artifacts/55/zip')) return {data:Buffer.from(${JSON.stringify(bytes.toString("base64"))},'base64')};
+      if(path.endsWith('/actions/artifacts/55')) return {data:artifact};
+      if(path==='/repos/fixture/repo') return {data:{default_branch:'main'}};
+      if(path.includes('/commits/main')) return {data:{sha:'a'.repeat(40)}};
+      if(path.includes('/collaborators/')) return {data:{permission:'write'}};
+      if(path.includes('/contents/.remote-dev.yml?')) return {data:{type:'file',encoding:'base64',size:${config.length},content:${JSON.stringify(config.toString("base64"))}}};
+      throw new Error('Unexpected fixture route');}}; await main({github});`;
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: f.temporary, GITHUB_WORKSPACE: workspace,
+    GITHUB_REPOSITORY: "fixture/repo", GITHUB_RUN_ID: "20", GITHUB_RUN_ATTEMPT: "1", GITHUB_ACTOR: "Z-M-Huang",
+    TRIGGERING_ACTOR: "Z-M-Huang", GITHUB_REF: "refs/heads/main", GITHUB_OUTPUT: output,
+    REMOTE_DEV_RUNNER: "codex", REMOTE_DEV_GITHUB_TOKEN: "fixture-github-token-9382", CODEX_API_KEY: "fixture-api-key-7242",
+    CODEX_CONFIG_TOML: 'model="fixture"', MCP_CONFIG_JSON: "", REMOTE_DEV_RESUME_RUN_ID: "13", REMOTE_DEV_PLAN: "Continue" };
+  await assert.rejects(exec(join(bin, "node"), ["--input-type=module", "-e", script], { env, timeout: 60000 }), error => {
+    assert.equal(error.code, 1);
+    let depth = 0, contexts = 0, failure;
+    for (const line of error.stdout.split("\n")) {
+      if (line.startsWith("::group::")) depth++;
+      if (line.startsWith("::endgroup::")) depth--;
+      if (line.includes('"event":"runtime.context"')) { assert.ok(depth > 0); contexts++; }
+      if (line.startsWith("::error::") && line.includes('"event":"runtime.failed"')) { assert.equal(depth, 0); failure = JSON.parse(line.slice(line.indexOf("{"))); }
+    }
+    assert.equal(contexts, 1); assert.equal(failure.reason, "invalid_configured_credential");
+    assert.equal(failure.stage, "configuration"); assert.equal(failure.source, ".mcp.json"); assert.equal(failure.field, "basic_password");
+    assert.equal(failure.run_id, "20"); assert.equal(failure.run_attempt, "1");
+    assert.doesNotMatch(error.stdout, /user:!\?|user:%21%3F/); assert.ok(!error.stdout.includes(payload));
+    const masks = error.stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
+    assert.ok(masks.every(line => !line.includes("!?") && !line.includes("%21%3F")));
+    assert.ok(!error.stdout.includes('"stage":"tools"')); return true;
+  });
+  assert.equal(await readFile(output, "utf8"), "");
+  assert.equal(await readFile(join(target, ".mcp.json"), "utf8"), bad);
+  assert.equal((await exec("git", ["rev-parse", "HEAD"], { cwd: target })).stdout.trim(), exported.manifest.checkpoint_sha);
 });
 
 test("real Actions commands preserve group balance, warning visibility and safe diagnostics", async () => {
@@ -640,6 +777,26 @@ test("real Actions output reconstructs a deferred checkpoint and worker failure"
   assert.doesNotMatch(lines.join("\n"), /fixture-capture-secret-7284/);
 });
 
+test("real Actions logger replays a partial UTF-8 checkpoint from its committed offset", async t => {
+  const f = await fixture(t), path = join(f.job.root, "snapshots.log");
+  const diagnostic = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import assert from 'node:assert/strict'; import {writeFile,appendFile,readFile} from 'node:fs/promises'; import {join} from 'node:path';
+    import {Diagnostics} from ${diagnostic}; import {SnapshotLogTailer} from ${main};
+    const root=process.argv[1], path=join(root,'snapshots.log'), commits=[];
+    const log=new Diagnostics({run_id:'13',run_attempt:'2'}), tailer=new SnapshotLogTailer(root,log,0,async offset=>commits.push(offset));
+    const first=Buffer.from(JSON.stringify({schema_version:1,event:'checkpoint.export',level:'INFO',cycle:1,marker:'café'})+'\\n');
+    const split=first.indexOf(Buffer.from('é'))+1;
+    await writeFile(path,first.subarray(0,split)); await tailer.flush(true); assert.equal(commits.length,0);
+    await appendFile(path,first.subarray(split)); await appendFile(path,JSON.stringify({schema_version:1,event:'checkpoint.cycle',level:'INFO',cycle:1})+'\\n');
+    await tailer.flush(true,true); const offset=Number(await readFile(join(root,'snapshots.offset'),'utf8'));
+    assert.equal(offset,commits.at(-1)); const resumed=new SnapshotLogTailer(root,log,offset,async()=>{},true); await resumed.flush(true,true);`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, f.job.root]);
+  const records = stdout.split("\n").filter(line => line.includes('"event":"checkpoint.export"'));
+  assert.equal(records.length, 1); assert.equal(JSON.parse(records[0].slice(records[0].indexOf("{"))).marker, "café");
+  assert.equal(Number(await readFile(join(f.job.root, "snapshots.offset"), "utf8")), (await readFile(path)).length);
+});
+
 test("an incomplete checkpoint cycle flushes when it becomes stale", async t => {
   const f = await fixture(t), path = join(f.job.root, "snapshots.log"), offsets = [];
   const tailer = new SnapshotLogTailer(f.job.root, f.log, 0, async offset => offsets.push(offset), false, 0);
@@ -718,6 +875,8 @@ test("patch parsing limits edits to the executable and suppresses sensitive or o
   const patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-before\n+after\n*** Update File: .env\n@@\n-password\n+secret\n*** End Patch";
   assert.equal(parseApplyPatch("rg apply_patch", "", r.cwd), null);
   assert.equal(parseApplyPatch("cat tests/cli.test.mjs", "", r.cwd), null);
+  const fallback = parseApplyPatch('apply_patch <<< "$PATCH"', 'Success. Updated the following files:\nM README.md\n', r.cwd);
+  assert.equal(fallback[0].path, "README.md"); assert.equal(fallback[0].kind, "update");
   const edits = parseApplyPatch(`cd . && apply_patch <<'PATCH'\n${patch}\nPATCH`, "", r.cwd);
   assert.equal(edits[0].path, "README.md"); assert.match(edits[0].diff, /\+after/);
   assert.equal(edits[1].suppressed, "sensitive file"); assert.equal(edits[1].diff, undefined);
@@ -725,6 +884,16 @@ test("patch parsing limits edits to the executable and suppresses sensitive or o
   assert.equal(activityPath("src/credentials.ts", r.cwd).sensitive, false);
   assert.equal(summarizeCommand("git commit -m 'private task'", r.cwd), "git commit");
   assert.equal(summarizeCommand("node --test tests/runtime.test.mjs", r.cwd), "node --test tests/runtime.test.mjs");
+});
+
+test("patch detection ignores heredoc data and binds patches to their executable", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const body = name => `*** Begin Patch\n*** Update File: ${name}\n@@\n-before\n+after\n*** End Patch`;
+  const fake = body("fake.txt").replace("*** End Patch", "*** Update File: fake2.txt\n@@\n-before\n+after\n*** End Patch");
+  const data = `cat <<'EOF'\napply_patch <<'PATCH'\n${fake}\nPATCH\nEOF`;
+  assert.equal(parseApplyPatch(data, "", r.cwd), null);
+  const edits = parseApplyPatch(`${data}\napply_patch <<'PATCH'\n${body("real.txt")}\nPATCH`, "", r.cwd);
+  assert.equal(edits.length, 1); assert.equal(edits[0].suppressed, "working directory unknown");
 });
 
 test("patch parsing suppresses diffs when the effective shell directory is outside or uncertain", async t => {
@@ -758,7 +927,7 @@ test("patch moves suppress diff bodies when either path is sensitive or outside 
   }
   const safe = parseApplyPatch(command("config.txt", "renamed.txt"), "", r.cwd);
   assert.equal(safe[0].path, "config.txt -> renamed.txt");
-  assert.match(safe[0].diff, /unregistered-sensitive-value/);
+  assert.equal(safe[0].suppressed, "original source path unverified"); assert.equal(safe[0].diff, undefined);
 });
 
 test("activity paths protect sensitive symlink names and resolve symlink traversal before checking the workspace", async t => {
@@ -794,6 +963,17 @@ test("Git summary parses renamed and untracked paths with NUL delimiters", async
   assert.ok(summary.changes.some(change => change.previous === "README.md" && change.path === "renamed & file.md"));
   assert.ok(summary.untracked.includes("untracked & file.txt"));
   assert.equal(summary.unpushed, 1);
+});
+
+test("Git summary handles unavailable or unrelated bases and bounds path results", async t => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
+  const unrelated = await r.git("commit-tree", `${r.base}^{tree}`, "-m", "Unrelated fixture");
+  assert.equal((await git.summary("f".repeat(40))).base, null);
+  assert.equal((await git.summary(unrelated)).base, null);
+  await Promise.all(Array.from({ length: 105 }, (_, index) => writeFile(join(r.cwd, `untracked-${index}.txt`), "work\n")));
+  const summary = await git.summary(r.base);
+  assert.equal(summary.changes.length + summary.untracked.length, 100);
+  assert.equal(summary.omitted, 5);
 });
 
 async function finalization(t, { host, denyCleanup = false, lost = [], failResult = false, conflicting = null, protectResult = false,
@@ -1046,11 +1226,14 @@ test("final edit history escapes Git content and redacts configured secrets", as
   assert.ok(!result.summary.includes(secret));
 });
 
-test("Git summary failure remains visible without failing final export", async t => {
+for (const failure of ["status", "merge-base", "cat-file", "object-check-stderr"]) test(`Git summary ${failure} failure remains visible without failing final export`, async t => {
   const result = await finalization(t, { host: "github-hosted", prepareRepo: async f => {
     const bin = join(f.temporary, "git-summary-failure");
     await mkdir(bin);
-    await writeFile(join(bin, "git"), '#!/bin/sh\ncase "$*" in *--untracked-files=normal*) exit 37 ;; esac\nexec /usr/bin/git "$@"\n', { mode: 0o700 });
+    const pattern = { status: "*--untracked-files=normal*", "merge-base": "*merge-base*", "cat-file": "*'cat-file -e'*",
+      "object-check-stderr": "*--batch-check*" }[failure];
+    const action = failure === "object-check-stderr" ? "read -r object; printf '%s missing\\n' \"$object\"; printf 'object access error\\n' >&2; exit 0" : "exit 128";
+    await writeFile(join(bin, "git"), `#!/bin/sh\ncase "$*" in ${pattern}) ${action} ;; esac\nexec /usr/bin/git "$@"\n`, { mode: 0o700 });
     f.job.env.PATH = `${bin}:${f.job.env.PATH}`;
   } });
   assert.equal(result.code, 0);
@@ -1062,6 +1245,16 @@ test("the post-escape summary credential gate fails before writing the summary",
   const result = await finalization(t, { host: "github-hosted", prepareRepo: async (f, repo) => {
     f.log.protect("amp;");
     await writeFile(join(repo.cwd, "work & notes.txt"), "work\n");
+  } });
+  assert.equal(result.code, 1);
+  assert.equal(result.exportFailure.reason, "credential_in_summary");
+  assert.equal(result.summary, "");
+});
+
+test("the pre-escape summary credential gate catches values spanning static and Git text", async t => {
+  const result = await finalization(t, { host: "github-hosted", prepareRepo: async (f, repo) => {
+    f.log.protect("Untracked <fixture-note");
+    await writeFile(join(repo.cwd, "<fixture-note>.txt"), "work\n");
   } });
   assert.equal(result.code, 1);
   assert.equal(result.exportFailure.reason, "credential_in_summary");

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -70,6 +70,39 @@ test('real Codex suppresses a patch moved into a sensitive file', async t => {
   assert.equal(await readFile(join(r.cwd, '.env'), 'utf8'), 'new-unregistered-secret-6249\n');
   assert.ok(f.lines.some(line => line.includes('[edit]')));
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-6249|new-unregistered-secret-6249/);
+});
+
+test('real Codex suppresses a moved symlink diff after its sensitive target becomes unobservable', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-4398\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const patch = '*** Begin Patch\n*** Update File: settings\n*** Move to: config.txt\n@@\n-old-unregistered-secret-4398\n+new-unregistered-secret-4398\n*** End Patch';
+  const command = `/bin/bash -c "cd . && apply_patch <<'PATCH'\n${patch}\nPATCH"`;
+  const api = await provider(t, [[tool(command, 'symlink-move')], [message('Finished moving the file.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Move the fixture file.', f.log, 60000, 'symlink-move');
+  assert.equal(await readFile(join(r.cwd, 'config.txt'), 'utf8'), 'new-unregistered-secret-4398\n');
+  await assert.rejects(readFile(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('working directory unknown')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-4398|new-unregistered-secret-4398/);
+});
+
+test('Codex command events suppress the diff after a real symlink move', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-4398\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  const binary = join(f.temporary, 'apply_patch'); await symlink(native, binary);
+  const patch = '*** Begin Patch\n*** Update File: settings\n*** Move to: config.txt\n@@\n-old-unregistered-secret-4398\n+new-unregistered-secret-4398\n*** End Patch';
+  const { stdout } = await exec(binary, [patch], { cwd: r.cwd, env: f.job.env });
+  assert.equal(await readFile(join(r.cwd, 'config.txt'), 'utf8'), 'new-unregistered-secret-4398\n');
+  await assert.rejects(readFile(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  const event = { type: 'item.completed', item: { id: 'symlink-move', type: 'command_execution', status: 'completed', exit_code: 0,
+    command: `apply_patch <<'PATCH'\n${patch}\nPATCH`, aggregated_output: stdout } };
+  logCodexActivity(f.log, event, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('original source path unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-4398|new-unregistered-secret-4398/);
 });
 
 test('Codex command events suppress move diffs for sensitive destinations', () => {

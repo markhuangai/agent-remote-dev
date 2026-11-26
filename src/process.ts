@@ -10,7 +10,7 @@ import { Diagnostics } from "./diagnostics.js";
 export type ProcessControl = { directory: string; nonce: string; freeze<T>(copy: () => Promise<T>): Promise<T> };
 export type CommandOptions = { cwd: string; env: NodeJS.ProcessEnv; stage: string; log?: Diagnostics; timeoutMs?: number;
   onControl?: (control: ProcessControl) => void; stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown>;
-  nativeSessionUnfinished?: () => boolean };
+  nativeSessionUnfinished?: () => boolean; rejectStderr?: boolean };
 export async function command(executable: string, args: string[], options: CommandOptions) {
   if (options.env.REMOTE_DEV_TASK_CANCELLED === "1") throw new RunnerError("command_cancelled", options.stage, "Task cancellation is latched; no new operation was started.");
   const started = Date.now();
@@ -76,7 +76,7 @@ export async function command(executable: string, args: string[], options: Comma
       throw new RunnerError("native_worker_sigkill", options.stage, "SIGKILL interrupted the native session after it started. The supervisor confirmed all descendants exited.",
         { worker_exit_code: receipt.exit_code, exit_code: code, signal: "SIGKILL", quiescent: true, output_closed: drained, elapsed_ms: Date.now() - started });
     }
-    if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained) {
+    if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained || options.rejectStderr && stderr.trim()) {
       let cause = spawnError?.message ?? stderr;
       if (options.diagnosticStdout) {
         cause = [cause, stdout].filter(Boolean).join("\n");

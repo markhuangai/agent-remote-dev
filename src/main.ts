@@ -315,7 +315,7 @@ export async function main({ github }: { github: any }) {
     core.setOutput("session-id", result.session ?? ''); core.setOutput("status", result.outcome);
     if (result.outcome !== 'completed') core.setFailed(`Native invocation ${result.outcome}; inspect the saved session and diagnostics.`);
   } catch (error) {
-    if (!contextEmitted) log.emitContext();
+    if (!contextEmitted) { log.ensureGroup("Setup & environment (continued)"); log.emitContext(); }
     log.failure(error, saved?.latest);
     if (saved) {
       saved.metadata.outcome = "failed";

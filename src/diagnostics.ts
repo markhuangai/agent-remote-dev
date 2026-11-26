@@ -109,6 +109,8 @@ export class Diagnostics {
     this.sink.startGroup?.(this.redact(title).replace(/\n/g, " "));
   }
 
+  ensureGroup(title: string) { if (!this.activeGroup) this.beginGroup(title); }
+
   endGroup() {
     if (this.activeGroup) this.sink.endGroup?.();
     this.activeGroup = null;

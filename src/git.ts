@@ -9,7 +9,9 @@ export type GitSummary = { branch: string | null; head: string; base: string | n
 
 export class TaskGit {
   constructor(public cwd: string, public env: NodeJS.ProcessEnv, public log: Diagnostics, public branch: string | null = null) {}
-  async run(args: string[]) { return command("git", args, { cwd: this.cwd, env: { ...this.env, GIT_OPTIONAL_LOCKS: "0" }, stage: "git", log: this.log }); }
+  async run(args: string[], options: { stdin?: string; rejectStderr?: boolean } = {}) {
+    return command("git", args, { cwd: this.cwd, env: { ...this.env, GIT_OPTIONAL_LOCKS: "0" }, stage: "git", log: this.log, ...options });
+  }
   async head() { return (await this.run(["rev-parse", "HEAD"])).trim(); }
   async currentBranch() {
     const branch = (await this.run(["branch", "--show-current"])).trim() || null;
@@ -31,17 +33,24 @@ export class TaskGit {
     return { branch: this.branch, checkpoint_sha: sha, omitted_work: local[0] !== sha || Boolean(await this.changedPaths()) };
   }
   async summary(baseSha?: string): Promise<GitSummary> {
-    const git = (args: string[]) => this.run(["-c", "core.quotepath=false", ...args]);
+    const git = (args: string[], options?: { stdin?: string; rejectStderr?: boolean }) => this.run(["-c", "core.quotepath=false", ...args], options);
     const succeeds = async (args: string[]) => {
       try { await git(args); return true; }
       catch (error) {
-        if (error instanceof RunnerError && error.reason === "command_failed" && [1, 128].includes(Number(error.details.exit_code))) return false;
+        if (error instanceof RunnerError && error.reason === "command_failed" && Number(error.details.exit_code) === 1) return false;
         throw error;
       }
     };
     const head = await this.head(), branch = await this.currentBranch();
-    const validBase = Boolean(baseSha && shaPattern.test(baseSha) && await succeeds(["cat-file", "-e", `${baseSha}^{commit}`]) &&
-      await succeeds(["merge-base", "--is-ancestor", baseSha, head]));
+    let validBase = false;
+    if (baseSha && shaPattern.test(baseSha)) {
+      const object = `${baseSha}^{commit}`;
+      const checked = (await git(["cat-file", "--batch-check=%(objectname) %(objecttype)"], { stdin: object + "\n", rejectStderr: true })).trim();
+      if (checked !== `${object} missing`) {
+        requireValue(checked === `${baseSha} commit`, "invalid_git_summary", "summary");
+        validBase = await succeeds(["cat-file", "-e", object]) && await succeeds(["merge-base", "--is-ancestor", baseSha, head]);
+      }
+    }
     const base = validBase ? baseSha! : null;
     const range = base ? [`${base}..${head}`] : [head, "--not", "--remotes=origin"];
     const count = Number((await git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"])).trim());

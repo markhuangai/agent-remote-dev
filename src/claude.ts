@@ -43,6 +43,7 @@ export async function runClaude(job: Job, cwd: string, prompt: string, log: Diag
     nativeSessionUnfinished: () => Boolean(observed) && !identityChanged && !terminal,
     onLine(line) {
       let event: any; try { event = JSON.parse(line); } catch { unparsed = Math.min(unparsed + 1, 1000000); return; }
+      if (event.type === "omitted") log.event("runtime.native_stream", "INFO", { stage: "claude", reason: "event_exceeded_output_limit", truncated: true });
       if (event.type === "session" && typeof event.session === "string") {
         if (session && event.session !== session || observed && event.session !== observed) {
           identityChanged = true; conflictingSession ??= event.session; return;

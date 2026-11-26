@@ -15,8 +15,7 @@ async function main() {
   const emit = (value: Record<string, unknown>) => {
     let encoded = JSON.stringify(value);
     if (Buffer.byteLength(encoded) > 64 * 1024) {
-      encoded = JSON.stringify({ type: value.type, id: value.id, tool: value.tool, phase: value.phase,
-        failed: value.failed, omitted: "event exceeded output limit" });
+      encoded = JSON.stringify({ type: "omitted", reason: "event_exceeded_output_limit" });
     }
     process.stdout.write(encoded + "\n");
   };

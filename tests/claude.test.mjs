@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { cp, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -91,6 +93,29 @@ test('real Claude bounds a large Write event before sending it to the parent', a
   assert.equal((await readFile(join(r.cwd, 'large.txt'), 'utf8')).length, content.length);
   assert.ok(f.lines.some(line => line.includes('[oversized line omitted]')));
   assert.ok(f.lines.every(line => Buffer.byteLength(line) <= 64 * 1024));
+});
+
+test('Claude worker bounds serialized events with oversized tool metadata', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  await configure(f.job, JSON.stringify({ model: 'fixture' }), f.log);
+  await simulateSdkMessages(f, [
+    { type: 'system', subtype: 'init', session_id: 'fixture-session-8712' },
+    { type: 'assistant', parent_tool_use_id: null, message: { id: 'message-1', content: [
+      call('Read', {}, 'i'.repeat(70 * 1024)), call('n'.repeat(70 * 1024), {}, 'tool-2'),
+    ] } },
+    { type: 'result', subtype: 'success', is_error: false, result: 'Fixture completed.' },
+  ]);
+  const child = spawn(process.execPath, [join(root, '.build/claude-worker.js'), join(f.temporary, 'worker-result.txt'), ''],
+    { cwd: r.cwd, env: f.job.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '', errors = '';
+  child.stdout.setEncoding('utf8'); child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { errors += chunk; });
+  child.stdin.end(JSON.stringify({ prompt: 'Run the fixture.', secrets: [] }));
+  const [code] = await once(child, 'close');
+  assert.equal(code, 0, errors);
+  const lines = output.trim().split('\n');
+  assert.ok(lines.every(line => Buffer.byteLength(line) <= 64 * 1024));
+  assert.equal(lines.map(line => JSON.parse(line)).filter(event => event.type === 'omitted').length, 2);
 });
 
 test('real Claude rejects sensitive symlink edits without logging their content', async t => {

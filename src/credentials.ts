@@ -3,6 +3,7 @@ import { trivialCredential } from "./diagnostics.js";
 import type { Diagnostics } from "./diagnostics.js";
 
 const credentialKey = /(?:^|[_-])(?:api[_-]?key|key|token|secret|password|passwd|auth|authorization|credential|signature)(?:$|[_-])/i;
+const environmentCredentialSuffix = /(?:api[_-]?key|token|secret|password|passwd|authorization|credential|signature)$/i;
 const publicHeaders = /^(?:accept|accept-encoding|accept-language|content-type|user-agent|host|connection|cache-control|pragma|referer|origin)$/i;
 
 function isCredentialKey(value: string) {
@@ -57,24 +58,29 @@ function protectAuthorization(value: string, log: Diagnostics, source: string) {
 function protectUrl(value: string, log: Diagnostics, source: string) {
   let url: URL;
   try { url = new URL(value); } catch { return; }
-  const credentials: string[] = [], composite: string[] = [];
+  const credentials: { decoded: string; encoded: string }[] = [], composite: string[] = [];
   const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@]*)@/i.exec(value)?.[1];
   if (userinfo?.includes(":")) {
     let password = url.password, combined = userinfo;
     try { password = decodeURIComponent(password); combined = decodeURIComponent(userinfo); } catch {}
-    if (!isEnvironmentReference(password)) { credentials.push(password); composite.push(combined); }
+    if (!isEnvironmentReference(password)) { credentials.push({ decoded: password, encoded: userinfo.slice(userinfo.indexOf(":") + 1) }); composite.push(combined); }
   } else if (userinfo) {
     let token = userinfo;
     try { token = decodeURIComponent(userinfo); } catch {}
-    if (!isEnvironmentReference(token)) credentials.push(token);
+    if (!isEnvironmentReference(token)) credentials.push({ decoded: token, encoded: userinfo });
   }
-  for (const [key, item] of url.searchParams) {
-    if (!isEnvironmentReference(item) && (isCredentialKey(key) || looksLikeCredential(item))) credentials.push(item);
+  for (const part of url.search.slice(1).split("&")) {
+    if (!part) continue;
+    const entry = new URLSearchParams(part).entries().next().value;
+    if (!entry) continue;
+    const [key, item] = entry, separator = part.indexOf("=");
+    if (!isEnvironmentReference(item) && (isCredentialKey(key) || looksLikeCredential(item)))
+      credentials.push({ decoded: item, encoded: separator < 0 ? "" : part.slice(separator + 1) });
   }
-  for (const credential of credentials) {
-    if (trivialCredential(credential)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "url_credential" });
+  for (const { decoded } of credentials) {
+    if (trivialCredential(decoded)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "url_credential" });
   }
-  for (const credential of credentials) log.protect(credential);
+  for (const { decoded, encoded } of credentials) { log.protect(decoded); log.protect(encoded); }
   for (const item of composite) log.protect(item);
 }
 
@@ -83,13 +89,19 @@ export function protectConfiguration(value: unknown, log: Diagnostics, key = "",
   const normalized = name.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
   if (/^(?:env_key|env_vars|api_key_helper|bearer_token_env_var|env_http_headers)$/i.test(normalized)) return;
   if (Array.isArray(value)) {
-    let credentialArgument = false;
+    let credentialArgument = false, headerArgument = false;
     for (const item of value) {
       if (typeof item !== "string") { protectConfiguration(item, log, key, source); continue; }
       protectUrl(item, log, source);
+      const headerValue = headerArgument ? item : /^(?:--header=|-H=?)(.+)$/i.exec(item)?.[1];
+      const namedHeader = headerValue && /^\s*([^\s:]+)\s*:\s*(.*)$/.exec(headerValue);
+      if (namedHeader && /^(?:proxy-)?authorization$/i.test(namedHeader[1])) protectAuthorization(namedHeader[2], log, source);
+      else if (namedHeader && !publicHeaders.test(namedHeader[1]) && isCredentialKey(namedHeader[1]))
+        registerCredential(namedHeader[2], log, source, "header");
       if (credentialArgument && /^\s*(?:Bearer|Basic)\s+/i.test(item)) protectAuthorization(item, log, source);
       else if (credentialArgument) registerCredential(item, log, source, "argument");
       credentialArgument = /^--?[\w-]+$/.test(item) && isCredentialKey(item.replace(/^-+/, ""));
+      headerArgument = /^(?:--header|-H)$/i.test(item);
       const assignment = /^--?([\w-]+)=(.*)$/.exec(item);
       if (assignment) protectUrl(assignment[2], log, source);
       if (assignment && /^\s*(?:Bearer|Basic)\s+/i.test(assignment[2])) protectAuthorization(assignment[2], log, source);
@@ -106,7 +118,8 @@ export function protectConfiguration(value: unknown, log: Diagnostics, key = "",
     if (header && publicHeaders.test(name)) return;
     protectUrl(value, log, source);
     if (header && /^(?:proxy-)?authorization$/i.test(name) || /^\s*(?:Bearer|Basic)\s+/i.test(value)) protectAuthorization(value, log, source);
-    else if (isCredentialKey(name)) registerCredential(value, log, source, header ? "header" : "credential");
+    else if (isCredentialKey(name) || /\.env\./i.test(key) && environmentCredentialSuffix.test(name))
+      registerCredential(value, log, source, header ? "header" : "credential");
     else if (header && !trivialCredential(value)) log.protect(value);
     return;
   }
@@ -120,7 +133,11 @@ export function hasStandaloneJsonSyntaxLines(value: string) {
 }
 export function inspectCredentials(value: unknown, log: Diagnostics, reason = "credential_in_checkpoint"): void {
   if (typeof value === "string" || value instanceof Uint8Array) {
-    for (const secret of log.protectedValues) requireValue(!Buffer.from(value).includes(Buffer.from(secret)), reason, "checkpoint");
+    const data = Buffer.from(value);
+    for (const secret of log.protectedValues) {
+      const forms = [secret, encodeURIComponent(secret), new URLSearchParams([["value", secret]]).toString().slice(6)];
+      for (const form of forms) requireValue(!data.includes(Buffer.from(form)), reason, "checkpoint");
+    }
     if (typeof value === "string" && /^[\s]*[\[{"]/.test(value)) {
       let decoded: unknown;
       try { decoded = JSON.parse(value); } catch { return; }
