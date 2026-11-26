@@ -17,6 +17,54 @@ import { runnerInputs } from "./runners.js";
 
 export type SavedRun = { control?: { directory: string; nonce: string }; watcher_pid?: number; job: Job; metadata: CheckpointInput;
   secrets: string[]; response: string; latest: DurableCheckpoint | null; skip_final_snapshot?: boolean };
+const summaryReplyBytes = 900 * 1024;
+const summaryByteLimit = 1024 * 1024;
+const omittedReplyMarker = "\n\n[... middle omitted from this summary; open the full result artifact for the complete reply ...]\n\n";
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, character => {
+    switch (character) {
+      case "&": return "&amp;";
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case '"': return "&quot;";
+      default: return "&#39;";
+    }
+  });
+}
+
+function escapedByteLength(value: string) {
+  let bytes = 0;
+  for (let index = 0; index < value.length;) {
+    const codePoint = value.codePointAt(index)!;
+    bytes += codePoint === 0x26 ? 5 : codePoint === 0x3c || codePoint === 0x3e ? 4 : codePoint === 0x22 ? 6 : codePoint === 0x27 ? 5 :
+      codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    index += codePoint > 0xffff ? 2 : 1;
+  }
+  return bytes;
+}
+
+function replyPreview(reply: string) {
+  if (escapedByteLength(reply) <= summaryReplyBytes) return escapeHtml(reply);
+  const sourceWindow = Math.floor(summaryReplyBytes / 12);
+  let prefixEnd = Math.min(sourceWindow, reply.length);
+  if (prefixEnd < reply.length && /[\uD800-\uDBFF]/.test(reply[prefixEnd - 1]) && /[\uDC00-\uDFFF]/.test(reply[prefixEnd])) prefixEnd--;
+  let suffixStart = Math.max(0, reply.length - sourceWindow);
+  if (suffixStart > 0 && /[\uDC00-\uDFFF]/.test(reply[suffixStart]) && /[\uD800-\uDBFF]/.test(reply[suffixStart - 1])) suffixStart++;
+  return escapeHtml(reply.slice(0, prefixEnd)) + omittedReplyMarker + escapeHtml(reply.slice(suffixStart));
+}
+
+function actionsSummary(saved: SavedRun, resultArtifactId: number) {
+  const { repository, lineage, session_id } = saved.metadata;
+  const executionURL = `https://github.com/${repository}/actions/runs/${lineage.run_id}/attempts/${lineage.run_attempt}`;
+  const artifactURL = `https://github.com/${repository}/actions/runs/${lineage.run_id}/artifacts/${resultArtifactId}`;
+  const checkpoint = saved.latest;
+  const reply = saved.response ? `<pre>${replyPreview(saved.response)}</pre>` : `No final reply was saved. Inspect the [execution log](${executionURL}) for details.`;
+  const checkpointLine = checkpoint ? `[artifact ${checkpoint.artifact_id}](https://github.com/${repository}/actions/runs/${lineage.run_id}/artifacts/${checkpoint.artifact_id})` : "unavailable";
+  const resume = checkpoint ? `## How to resume\n\nOpen **Run workflow** and select:\n\n- \`runner\`: \`${saved.job.runner}\`\n- \`resume-run-id\`: \`${lineage.run_id}\`\n- \`plan\`: answer the question or add the requested context\n` : "";
+  return `## Agent’s final reply\n\n${reply}\n\n## Runner outcome\n\n- **Runner:** \`${saved.job.runner}\`\n- **Outcome:** \`${saved.metadata.outcome}\`\n- **Session:** \`${session_id || "unavailable"}\`\n- **Saved checkpoint:** ${checkpointLine}\n- **Full result:** [artifact ${resultArtifactId}](${artifactURL})\n- **Execution log:** [run ${lineage.run_id}, attempt ${lineage.run_attempt}](${executionURL})\n\n${resume}`;
+}
+
 export async function main({ github }: { github: any }) {
   let saved: SavedRun | undefined, pendingJob: Job | undefined;
   const log = new Diagnostics({ repository: process.env.GITHUB_REPOSITORY, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT });
@@ -145,7 +193,9 @@ export async function finish({ github, statePath }: { github: any; statePath: st
     const result = await uploadSnapshot(saved.job, `remote-dev-result-r${lineage.run_id}-a${lineage.run_attempt}`, [file], saved.job.exports,
       log, undefined, { ...uploadContext, kind: "record" });
     resultArtifactId = result.id;
-    await core.summary.addTable([["Outcome", "Session", "Saved artifact"], [saved.metadata.outcome, saved.metadata.session_id || "unavailable", String(saved.latest?.artifact_id ?? "unavailable")]]).write();
+    const summary = actionsSummary(saved, resultArtifactId);
+    requireValue(Buffer.byteLength(summary) < summaryByteLimit, "summary_size_limit", "final_export");
+    await core.summary.addRaw(summary).write();
     exportSucceeded = true;
   } catch (error) {
     const failure = error instanceof RunnerError ? error : null;

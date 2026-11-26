@@ -15,9 +15,15 @@ import { exec, executionSource, checkpoint, sessionId, fixture, logger, portable
 
 const plan = "Implement the fixture plan.\n";
 async function history(f, content = "completed turn") {
-  await mkdir(join(f.job.runnerHome, "sessions"));
-  const data = JSON.stringify({ type: "session_meta", payload: { id: sessionId, session_id: sessionId } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
-  await writeFile(join(f.job.runnerHome, "sessions/rollout.jsonl"), data);
+  if (f.job.runner === "claude") {
+    const project = join(f.job.runnerHome, "projects", f.job.env.CLAUDE_CODE_PROJECT_DIR_NAME);
+    await mkdir(project, { recursive: true });
+    await writeFile(join(project, sessionId + ".jsonl"), JSON.stringify({ sessionId, type: "user", message: content }) + "\n");
+  } else {
+    await mkdir(join(f.job.runnerHome, "sessions"));
+    const data = JSON.stringify({ type: "session_meta", payload: { id: sessionId, session_id: sessionId } }) + "\n" + JSON.stringify({ type: "response_item", payload: { text: content } }) + "\n";
+    await writeFile(join(f.job.runnerHome, "sessions/rollout.jsonl"), data);
+  }
 }
 test("configuration is isolated, rejects invalid TOML, and prevents permission and storage overrides", async (t) => {
   const f = await fixture(t);
@@ -365,17 +371,19 @@ test("the real Actions logger retains required failure evidence after DEBUG filt
   assert.equal(evidence.stage,"checkpoint");assert.equal(evidence.expected_sha,"a".repeat(40));assert.equal(evidence.observed_sha,"b".repeat(40));assert.equal(evidence.last_durable_checkpoint.artifact_id,17);
 });
 
-async function finalization(t, { host, denyCleanup = false, lost = [], failResult = false, conflicting = null, protectResult = false }) {
+async function finalization(t, { host, denyCleanup = false, lost = [], failResult = false, conflicting = null, protectResult = false,
+  response = "fixture-result-private-content-8147", checkpointSaved = true, runner = "codex" }) {
   assert.notEqual(process.geteuid(), 0);
-  const f = await fixture(t), repo = await repository(f);
+  const f = await fixture(t, runner), repo = await repository(f);
   await history(f);
   await readOnlyCache(f.job.home);
   const previous = { artifact_id: 72, sequence: 3, checkpoint_sha: repo.base };
-  const payload = "fixture-result-private-content-8147";
+  const payload = response;
   const statePath = join(f.job.root, "state.json");
-  await writeFile(join(f.job.root, "latest.json"), JSON.stringify(previous));
-  await writeFile(statePath, JSON.stringify({ job: f.job, metadata: checkpoint({ outcome: "completed", workspace: repo.cwd }),
-    secrets: [...f.log.protectedValues, ...(protectResult ? [payload] : [])], response: payload, latest: previous }), { mode: 0o600 });
+  if (checkpointSaved) await writeFile(join(f.job.root, "latest.json"), JSON.stringify(previous));
+  await writeFile(statePath, JSON.stringify({ job: f.job, metadata: checkpoint({ outcome: "completed", workspace: repo.cwd,
+    session_id: checkpointSaved ? sessionId : "" }), secrets: [...f.log.protectedValues, ...(protectResult ? [payload] : [])], response: payload,
+    latest: checkpointSaved ? previous : null }), { mode: 0o600 });
   const outputFile = join(f.temporary, "actions-output"), summaryFile = join(f.temporary, "actions-summary");
   await writeFile(outputFile, "");
   await writeFile(summaryFile, "");
@@ -468,7 +476,7 @@ async function finalization(t, { host, denyCleanup = false, lost = [], failResul
     if (denyCleanup) await chmod(f.temporary, 0o700);
   }
   const lines = stdout.split("\n").filter(line => !line.startsWith("::debug::") && !line.startsWith("::add-mask::"));
-  assert.ok(lines.every(line => !line.includes(f.temporary) && !line.includes(payload) &&
+  assert.ok(lines.every(line => !line.includes(f.temporary) && (!payload || !line.includes(payload)) &&
     f.log.protectedValues.every(secret => !line.includes(secret))));
   const records = lines.filter(line => line.includes('"schema_version":1')).map(line => JSON.parse(line.slice(line.indexOf("{"))));
   const cleanup = records.find(record => record.reason === "job_cleanup_failed");
@@ -476,7 +484,7 @@ async function finalization(t, { host, denyCleanup = false, lost = [], failResul
   const reconciled = records.filter(record => record.event === "artifact.reconcile");
   if (denyCleanup) assert.deepEqual(await readdir(f.job.root), []);
   else await assert.rejects(lstat(f.job.root), { code: "ENOENT" });
-  return { code, cleanup, exportFailure, reconciled, attempts, lookups, assets, records, previous };
+  return { code, cleanup, exportFailure, reconciled, attempts, lookups, assets, records, previous, summary: await readFile(summaryFile, "utf8") };
 }
 
 test("final cleanup removes the Go cache after successful uploads", async t => {
@@ -485,6 +493,58 @@ test("final cleanup removes the Go cache after successful uploads", async t => {
   assert.equal(result.cleanup, undefined);
   assert.deepEqual(result.attempts, [80, 81]);
   assert.deepEqual(result.lookups, []);
+  assert.ok(result.summary.startsWith("## Agent’s final reply\n\n<pre>fixture-result-private-content-8147</pre>"));
+  assert.match(result.summary, /- \*\*Full result:\*\* \[artifact 81\]\(https:\/\/github\.com\/fixture\/repo\/actions\/runs\/13\/artifacts\/81\)/);
+  assert.match(result.summary, /## How to resume[\s\S]*- `runner`: `codex`[\s\S]*- `resume-run-id`: `13`[\s\S]*- `plan`: answer the question or add the requested context/);
+});
+
+for (const runner of ["codex", "claude"]) test(`final summary shows an ordinary ${runner} completion`, async t => {
+  const response = "Implemented the change.\n\nValidation passed.";
+  const { code, summary } = await finalization(t, { host: "github-hosted", response, runner });
+  assert.equal(code, 0);
+  assert.ok(summary.startsWith(`## Agent’s final reply\n\n<pre>${response}</pre>`));
+  assert.ok(summary.includes(`- **Runner:** \`${runner}\``));
+});
+
+test("final summary preserves a closing question at the start of the result", async t => {
+  const response = "The implementation is ready.\n\nWhich branch should receive the follow-up?";
+  const { code, summary } = await finalization(t, { host: "github-hosted", response });
+  assert.equal(code, 0);
+  assert.ok(summary.startsWith("## Agent’s final reply"));
+  assert.match(summary, /Which branch should receive the follow-up\?<\/pre>\n\n## Runner outcome/);
+});
+
+test("final summary links the execution log when no reply was saved", async t => {
+  const { code, summary } = await finalization(t, { host: "github-hosted", response: "" });
+  assert.equal(code, 0);
+  assert.match(summary, /No final reply was saved\. Inspect the \[execution log\]\(https:\/\/github\.com\/fixture\/repo\/actions\/runs\/13\/attempts\/1\) for details\./);
+  assert.doesNotMatch(summary, /<pre><\/pre>/);
+});
+
+test("final summary renders reply markup as escaped text", async t => {
+  const response = "Completed <script>alert(\"x\")</script> & **markdown**.";
+  const { code, summary } = await finalization(t, { host: "github-hosted", response });
+  assert.equal(code, 0);
+  assert.match(summary, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt; &amp; \*\*markdown\*\*\./);
+  assert.doesNotMatch(summary, /Completed <script>/);
+});
+
+test("final summary truncates an oversized reply while preserving its opening, closing question, and artifact", async t => {
+  const response = `Opening context 😀\n${"x".repeat(1024 * 1024)}\nShould the release include the migration?`;
+  const { code, summary } = await finalization(t, { host: "github-hosted", response });
+  assert.equal(code, 0);
+  assert.ok(Buffer.byteLength(summary) < 1024 * 1024);
+  assert.match(summary, /<pre>Opening context 😀\n/);
+  assert.match(summary, /middle omitted from this summary; open the full result artifact/);
+  assert.match(summary, /\nShould the release include the migration\?<\/pre>/);
+  assert.match(summary, /\[artifact 81\]\(https:\/\/github\.com\/fixture\/repo\/actions\/runs\/13\/artifacts\/81\)/);
+});
+
+test("final summary omits resume instructions when no checkpoint was saved", async t => {
+  const { code, summary } = await finalization(t, { host: "github-hosted", checkpointSaved: false });
+  assert.equal(code, 0);
+  assert.match(summary, /- \*\*Saved checkpoint:\*\* unavailable/);
+  assert.doesNotMatch(summary, /## How to resume|resume-run-id/);
 });
 
 for (const host of ["github-hosted", "self-hosted", undefined]) test(`final cleanup reports a real denied rmdir on ${host ?? "an unknown runner"}`, async t => {
@@ -536,6 +596,7 @@ test("final credential validation stops before attempting or reconciling the res
   assert.deepEqual(result.attempts, [80]);
   assert.deepEqual(result.lookups, []);
   assert.equal(result.exportFailure.reason, "credential_in_result");
+  assert.doesNotMatch(result.summary, /fixture-result-private-content-8147/);
 });
 
 test("final artifact recovery leaves SDK file validation failed even when the exact artifact already exists", async t => {
