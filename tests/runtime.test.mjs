@@ -495,6 +495,10 @@ test("final cleanup removes the Go cache after successful uploads", async t => {
   assert.deepEqual(result.lookups, []);
   assert.ok(result.summary.startsWith("## Agent’s final reply\n\n<pre>fixture-result-private-content-8147</pre>"));
   assert.match(result.summary, /- \*\*Full result:\*\* \[artifact 81\]\(https:\/\/github\.com\/fixture\/repo\/actions\/runs\/13\/artifacts\/81\)/);
+  assert.ok(result.summary.includes(`- **Outcome:** \`completed\``));
+  assert.ok(result.summary.includes(`- **Session:** \`${sessionId}\``));
+  assert.ok(result.summary.includes(`- **Saved checkpoint:** [artifact 80](https://github.com/fixture/repo/actions/runs/13/artifacts/80)`));
+  assert.ok(result.summary.includes(`- **Execution log:** [run 13, attempt 1](https://github.com/fixture/repo/actions/runs/13/attempts/1)`));
   assert.match(result.summary, /## How to resume[\s\S]*- `runner`: `codex`[\s\S]*- `resume-run-id`: `13`[\s\S]*- `plan`: answer the question or add the requested context/);
 });
 
