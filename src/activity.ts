@@ -30,6 +30,8 @@ export function activityPath(path: string, cwd: string, base = cwd) {
   const root = existingPath(cwd);
   const raw = isAbsolute(path) ? path : `${base}${sep}${path}`;
   const absolute = existingPath(raw);
+  let present = true;
+  try { lstatSync(raw); } catch { present = false; }
   const name = relative(resolve(cwd), resolve(base, path));
   const physical = root && absolute ? relative(root, absolute) : "..";
   const escapes = (value: string) => value === ".." || value.startsWith(".." + sep) || isAbsolute(value);
@@ -39,7 +41,7 @@ export function activityPath(path: string, cwd: string, base = cwd) {
     return segments.some(segment => [".ssh", ".aws", ".gnupg"].includes(segment.toLowerCase())) ||
       sensitiveNames.test(file) || sensitiveExtension.test(file) || sensitiveData.test(file) && (!extname(file) || dataExtension.test(extname(file)));
   });
-  return { path: outside ? "<outside-workspace>" : name || ".", outside, sensitive };
+  return { path: outside ? "<outside-workspace>" : name || ".", outside, sensitive, present };
 }
 
 function unwrapCommand(command: string) {
@@ -59,6 +61,11 @@ function commandSegments(command: string, separators?: string[], bodies?: Map<nu
     if (character === "\\" && quote !== "'") { escaped = true; continue; }
     if (quote) { if (character === quote) quote = ""; continue; }
     if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === "#" && (index === start || /[\s;&|()]/.test(command[index - 1]))) {
+      const end = command.indexOf("\n", index);
+      if (end < 0) break;
+      index = end - 1; continue;
+    }
     if (character === "<" && command[index + 1] === "<") {
       if (command[index + 2] === "<") { index += 2; continue; }
       const match = /^<<(-)?[ \t]*(?:'([^'\n]*)'|"([^"$`\\\n]*)"|([\w./-]+))(?=[\s;&|<>]|$)/.exec(command.slice(index));
@@ -68,10 +75,11 @@ function commandSegments(command: string, separators?: string[], bodies?: Map<nu
       index += match[0].length - 1;
       continue;
     }
-    if (character === "\n" || character === ";" || character === "&" && command[index + 1] === "&") {
+    if (character === "\n" || character === ";" || character === "&" || character === "|") {
       result.push(command.slice(start, index).trim());
-      separators?.push(character === "&" ? "&&" : character);
-      if (character === "&") index++;
+      const doubled = (character === "&" || character === "|") && command[index + 1] === character;
+      separators?.push(doubled ? character + character : character);
+      if (doubled) index++;
       start = index + 1;
       if (character === "\n" && heredocs.length) {
         let cursor = start;
@@ -134,7 +142,7 @@ export type ActivityEdit = { path: string; kind: string; diff?: string; suppress
 export function editForPath(path: string, kind: string, diff: string | undefined, cwd: string, base = cwd): ActivityEdit {
   const result = activityPath(path, cwd, base);
   return { path: result.path, kind, ...(result.outside ? { suppressed: "outside workspace" }
-    : result.sensitive ? { suppressed: "sensitive file" } : diff ? { diff } : {}) };
+    : result.sensitive ? { suppressed: "sensitive file" } : diff && !result.present ? { suppressed: "original path unverified" } : diff ? { diff } : {}) };
 }
 
 export function parseApplyPatch(command: string, output: string, cwd: string): ActivityEdit[] | null {
@@ -142,14 +150,27 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
   const separators: string[] = [];
   const bodies = new Map<number, HereDocument[]>();
   let base: string | undefined = cwd, found = false, changedDirectory = false;
-  let patchSource = "", expansion = false;
+  let patchSource = "", expansion = false, unverified = false;
   const doubleWrapped = /^\s*(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+"/.test(command);
-  for (const [index, segment] of commandSegments(unwrapped, separators, bodies).entries()) {
+  const segments = commandSegments(unwrapped, separators, bodies);
+  for (const [index, segment] of segments.entries()) {
     if (/^apply_patch(?:\s|$)/.test(segment)) {
       const documents = bodies.get(index) ?? [];
+      let last = segments.length - 1;
+      while (last > index && !segments[last]) last--;
+      const before = separators.slice(0, index);
+      let boundary = -1;
+      for (const [position, separator] of before.entries()) if ([";", "\n", "&"].includes(separator)) boundary = position;
+      if (before.slice(boundary + 1).some(separator => ["||", "|"].includes(separator)) ||
+        ["||", "|", "&"].includes(separators[index]) ||
+        segments.slice(index + 1).some(next => next.length > 0) &&
+          separators.slice(index, last).some(separator => separator !== "&&")) return null;
       found = true; patchSource = [segment, ...documents.map(document => document.text)].join("\n");
       expansion = documents.some(document => document.expands && /[$`\\]/.test(document.text)) ||
         !documents.length && /[$`\\]/.test(segment) || doubleWrapped && /[$`\\]/.test(patchSource);
+      const direct = /^apply_patch[ \t]+<<-?[ \t]*(?:'[^'\n]*'|"[^"$`\\\n]*"|[\w./-]+)[ \t]*$/.test(segment) ||
+        /^apply_patch[ \t]+'[^']*'[ \t]*$/.test(segment) || /^apply_patch[ \t]+"[^"$`\\]*"[ \t]*$/.test(segment);
+      unverified = !direct || segments.slice(index + 1).some(next => next.length > 0);
       break;
     }
     const changeDirectory = /^cd\s+(?:--\s+)?(?:'([^']*)'|"([^"$`\\]*)"|([\w./-]+))$/.exec(segment);
@@ -158,20 +179,24 @@ export function parseApplyPatch(command: string, output: string, cwd: string): A
       const option = directory.startsWith("-") && !/^cd\s+--\s+/.test(segment);
       base = directory === "-" || option ? undefined : isAbsolute(directory) ? resolve(directory) : base ? resolve(base, directory) : undefined;
       changedDirectory = true;
-    } else if (!/^(?:true|false|:|pwd|echo|printf|test)(?:\s|$)/.test(segment) || /[|<>]/.test(segment)) {
+    } else if (!/^(?:true|false|:|pwd)$/.test(segment)) {
       base = undefined;
     }
     if (changedDirectory && separators[index] !== "&&") base = undefined;
   }
   if (!found) return null;
   const patch = /\*\*\* Begin Patch\r?\n([\s\S]*?)\r?\n\*\*\* End Patch/.exec(patchSource)?.[1];
-  const edit = (path: string, kind: string, diff?: string) => patch && expansion
-    ? { path: "<outside-workspace>", kind, suppressed: "shell expansion unresolved" }
-    : base ? editForPath(path, kind, diff, cwd, base)
-      : { path: "<outside-workspace>", kind, suppressed: "working directory unknown" };
+  const sections = patch?.split(/(?=^\*\*\* (?:Add|Update|Delete) File: )/m) ?? [];
+  if (sections.length > 1 && sections.some(section => /^\*\*\* (?:Delete File|Move to): /m.test(section))) unverified = true;
+  const edit = (path: string, kind: string, diff?: string) => {
+    if (patch && expansion) return { path: "<outside-workspace>", kind, suppressed: "shell expansion unresolved" };
+    if (!base) return { path: "<outside-workspace>", kind, suppressed: "working directory unknown" };
+    const result = editForPath(path, kind, unverified ? undefined : diff, cwd, base);
+    if (patch && unverified && !result.suppressed) result.suppressed = "post-patch state unverified";
+    return result;
+  };
   const edits: ActivityEdit[] = [];
   if (patch) {
-    const sections = patch.split(/(?=^\*\*\* (?:Add|Update|Delete) File: )/m);
     for (const section of sections) {
       const header = /^\*\*\* (Add|Update|Delete) File: ([^\r\n]+)/.exec(section);
       if (!header) continue;

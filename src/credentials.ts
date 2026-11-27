@@ -4,6 +4,7 @@ import type { Diagnostics } from "./diagnostics.js";
 
 const credentialKey = /(?:^|[_-])(?:api[_-]?key|key|token|secret|password|passwd|auth|authorization|credential|signature)(?:$|[_-])/i;
 const environmentCredentialSuffix = /(?:api[_-]?key|token|secret|password|passwd|authorization|credential|signature)$/i;
+const authorizationScheme = /^\s*(?:Bearer|Basic|Token|Digest|ApiKey)(?:\s|$)/i;
 const publicHeaders = /^(?:accept|accept-encoding|accept-language|content-type|user-agent|host|connection|cache-control|pragma|referer|origin)$/i;
 
 function isCredentialKey(value: string) {
@@ -97,13 +98,13 @@ export function protectConfiguration(value: unknown, log: Diagnostics, key = "",
       if (namedHeader && /^(?:proxy-)?authorization$/i.test(namedHeader[1])) protectAuthorization(namedHeader[2], log, source);
       else if (namedHeader && !publicHeaders.test(namedHeader[1]) && isCredentialKey(namedHeader[1]))
         registerCredential(namedHeader[2], log, source, "header");
-      if (credentialArgument && /^\s*(?:Bearer|Basic)\s+/i.test(item)) protectAuthorization(item, log, source);
+      if (credentialArgument && authorizationScheme.test(item)) protectAuthorization(item, log, source);
       else if (credentialArgument) registerCredential(item, log, source, "argument");
       credentialArgument = /^--?[\w-]+$/.test(item) && isCredentialKey(item.replace(/^-+/, ""));
       headerArgument = /^(?:--header|-H)$/i.test(item);
       const assignment = /^--?([\w-]+)=(.*)$/.exec(item);
       if (assignment) protectUrl(assignment[2], log, source);
-      if (assignment && /^\s*(?:Bearer|Basic)\s+/i.test(assignment[2])) protectAuthorization(assignment[2], log, source);
+      if (assignment && isCredentialKey(assignment[1]) && authorizationScheme.test(assignment[2])) protectAuthorization(assignment[2], log, source);
       else if (assignment && isCredentialKey(assignment[1])) registerCredential(assignment[2], log, source, "argument");
       const header = /^(?:--header|-H)=(?:proxy-)?authorization\s*:\s*(.*)$/i.exec(item);
       if (header) protectAuthorization(header[1], log, source);
@@ -116,7 +117,8 @@ export function protectConfiguration(value: unknown, log: Diagnostics, key = "",
     const header = /\.(?:http_headers|headers)\./i.test(key);
     if (header && publicHeaders.test(name)) return;
     protectUrl(value, log, source);
-    if (header && /^(?:proxy-)?authorization$/i.test(name) || /^\s*(?:Bearer|Basic)\s+/i.test(value)) protectAuthorization(value, log, source);
+    if (header && /^(?:proxy-)?authorization$/i.test(name) || /^\s*(?:Bearer|Basic)\s+/i.test(value) ||
+      isCredentialKey(name) && authorizationScheme.test(value)) protectAuthorization(value, log, source);
     else if (isCredentialKey(name) || /\.env\./i.test(key) && environmentCredentialSuffix.test(name))
       registerCredential(value, log, source, header ? "header" : "credential");
     else if (header && !trivialCredential(value)) log.protect(value);

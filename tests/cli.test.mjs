@@ -139,6 +139,87 @@ test('Codex command events suppress diffs when a patch leaves a dangling symlink
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-3926|new-unregistered-secret-3926/);
 });
 
+test('Codex command events suppress update diffs when the patched alias is deleted', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-3726\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  const binary = join(f.temporary, 'apply_patch'); await symlink(native, binary);
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-3726\n+new-unregistered-secret-3726\n*** Delete File: settings\n*** End Patch';
+  const { stdout } = await exec(binary, [patch], { cwd: r.cwd, env: f.job.env });
+  await assert.rejects(lstat(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'deleted-alias', type: 'command_execution', status: 'completed',
+    exit_code: 0, command: `apply_patch <<'PATCH'\n${patch}\nPATCH`, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('post-patch state unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-3726|new-unregistered-secret-3726/);
+});
+
+test('Codex command events suppress diffs after the patched alias is replaced', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-2983\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-2983\n+new-unregistered-secret-2983\n*** End Patch';
+  const command = `apply_patch <<'PATCH' && rm settings && printf ordinary > settings\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env: { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.ok((await lstat(join(r.cwd, 'settings'))).isFile());
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'replaced-alias', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('post-patch state unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-2983|new-unregistered-secret-2983/);
+});
+
+test('Codex command events suppress diffs after process substitution replaces the alias', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-9183\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-9183\n+new-unregistered-secret-9183\n*** End Patch';
+  const command = `apply_patch <<'PATCH' > >(python3 -c 'import os,sys; sys.stdin.read(); os.unlink("settings"); open("settings","w").write("ordinary")')\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env: { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.ok((await lstat(join(r.cwd, 'settings'))).isFile());
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'substitution', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('post-patch state unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-9183|new-unregistered-secret-9183/);
+});
+
+test('Codex command events do not report skipped or failed background patches as applied', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: README.md\n@@\n-missing fixture content\n+replacement\n*** End Patch';
+  const env = { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` };
+  for (const command of [`true || apply_patch <<'PATCH'\n${patch}\nPATCH`, `apply_patch <<'PATCH' &\n${patch}\nPATCH`]) {
+    const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env });
+    logCodexActivity(f.log, { type: 'item.completed', item: { id: 'not-applied', type: 'command_execution', status: 'completed',
+      exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  }
+  assert.equal(await readFile(join(r.cwd, 'README.md'), 'utf8'), 'Fixture repository\n');
+  assert.ok(!f.lines.some(line => line.includes('[edit]')));
+});
+
+test('Codex command events report a successful patch after an independent condition', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: README.md\n@@\n-Fixture repository\n+Updated fixture\n*** End Patch';
+  const command = `false || true; apply_patch <<'PATCH'\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env: { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.equal(await readFile(join(r.cwd, 'README.md'), 'utf8'), 'Updated fixture\n');
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'applied', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('README.md')));
+  assert.ok(f.lines.some(line => line.includes('+Updated fixture')));
+});
+
 test('Codex command events suppress patch diffs after option-only cd', async t => {
   const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'home');
   await mkdir(outside); await writeFile(join(outside, 'config.txt'), 'old-unregistered-secret-1948\n');

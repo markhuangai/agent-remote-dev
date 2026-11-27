@@ -439,6 +439,25 @@ test("credential headers in MCP command arguments are validated and protected", 
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
 });
 
+test("authorization flags validate and protect every supported scheme payload", async t => {
+  const f = await fixture(t), secret = "fixture-scheme-token-8294";
+  const ordinary = JSON.stringify({ mcpServers: { fixture: { command: "curl", args: ["--label=Token abc", "--label=Bearer abc"] } } });
+  await configure(f.job, 'model="fixture"', f.log, ordinary);
+  assert.ok(!f.log.protectedValues.includes("abc"));
+  for (const scheme of ["Token", "Digest", "ApiKey"]) {
+    for (const args of [value => ["--authorization", `${scheme} ${value}`], value => [`--authorization=${scheme} ${value}`]]) {
+      const mcp = value => JSON.stringify({ mcpServers: { fixture: { command: "curl", args: args(value) } } });
+      await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("abc")), { reason: "invalid_configured_credential" });
+      assert.ok(!f.log.protectedValues.includes(`${scheme} abc`));
+      await configure(f.job, 'model="fixture"', f.log, mcp(secret));
+      assert.ok(f.log.protectedValues.includes(secret)); assert.ok(f.log.protectedValues.includes(`${scheme} ${secret}`));
+      assert.throws(() => inspectCredentials(secret, f.log, "credential_in_result"), { reason: "credential_in_result" });
+    }
+  }
+  await history(f, secret);
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
 test("decoded Basic passwords resembling environment references are treated as literals", async t => {
   const f = await fixture(t);
   const config = password => JSON.stringify({ mcpServers: { fixture: { type: "http", url: "https://example.invalid/mcp",
@@ -905,6 +924,10 @@ test("patch parsing limits edits to the executable and suppresses sensitive or o
   assert.equal(activityPath("src/credentials.ts", r.cwd).sensitive, false);
   assert.equal(summarizeCommand("git commit -m 'private task'", r.cwd), "git commit");
   assert.equal(summarizeCommand("node --test tests/runtime.test.mjs", r.cwd), "node --test tests/runtime.test.mjs");
+  const missing = parseApplyPatch("apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: missing.txt\n@@\n-before\n+after\n*** End Patch\nPATCH", "", r.cwd);
+  assert.equal(missing[0].path, "missing.txt"); assert.equal(missing[0].suppressed, "original path unverified");
+  assert.equal(parseApplyPatch(`apply_patch <<'PATCH' | cat\n${patch}\nPATCH`, "", r.cwd), null);
+  assert.equal(parseApplyPatch(`true # comment; apply_patch <<'PATCH'\n${patch}\nPATCH`, "", r.cwd), null);
 });
 
 test("patch detection ignores heredoc data and binds patches to their executable", async t => {
@@ -919,6 +942,7 @@ test("patch detection ignores heredoc data and binds patches to their executable
 
 test("patch parsing suppresses unresolved shell expansion while preserving quoted heredocs", async t => {
   const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, "$TARGET"), "before\n");
   const patch = '*** Begin Patch\n*** Update File: $TARGET\n@@\n-before\n+after\n*** End Patch';
   const command = marker => `apply_patch <<${marker}\n${patch}\nPATCH`;
   const expanded = parseApplyPatch(command('PATCH'), "", r.cwd);
@@ -938,17 +962,20 @@ test("patch parsing suppresses diffs when the effective shell directory is outsi
   assert.equal(external[0].path, "<outside-workspace>");
   assert.equal(external[0].suppressed, "outside workspace");
   assert.equal(external[0].diff, undefined);
-  for (const prefix of ['cd "$TARGET"', "cd -P", "cd -L", "cd /tmp/private && cd /missing || true", "cd /tmp/private && echo done; true"]) {
+  for (const prefix of ['cd "$TARGET"', "cd -P", "cd -L", "cd /tmp/private && echo done; true"]) {
     const edits = parseApplyPatch(command(prefix), "", r.cwd);
     assert.equal(edits[0].path, "<outside-workspace>");
     assert.equal(edits[0].suppressed, "working directory unknown");
     assert.equal(edits[0].diff, undefined);
   }
+  assert.equal(parseApplyPatch(command("cd /tmp/private && cd /missing || true"), "", r.cwd), null);
   await mkdir(join(r.cwd, "sub directory"));
+  await writeFile(join(r.cwd, "sub directory/config.txt"), "before\n");
   const inside = parseApplyPatch(command(`cd '/tmp' && cd '${join(r.cwd, "sub directory")}'`), "", r.cwd);
   assert.equal(inside[0].path, "sub directory/config.txt");
   assert.match(inside[0].diff, /unregistered-sensitive-value/);
   await mkdir(join(r.cwd, "-P"));
+  await writeFile(join(r.cwd, "-P/config.txt"), "before\n");
   const explicit = parseApplyPatch(command("cd -- -P"), "", r.cwd);
   assert.equal(explicit[0].path, "-P/config.txt"); assert.match(explicit[0].diff, /unregistered-sensitive-value/);
 });
