@@ -1,4 +1,4 @@
-import { invariant, positiveId, validateManifest, validateProducer } from './checkpoint-policy.mjs';
+import { invariant, positiveId, recoveryReasons, validateManifest, validateProducer } from './checkpoint-policy.mjs';
 import { readArtifact } from './artifact-io.mjs';
 import { pages } from './sources.mjs';
 import { authorizeActors } from './project-config.mjs';
@@ -23,7 +23,7 @@ export function nativeTimedOut(job) {
     (['timed_out', 'cancelled'].includes(native.conclusion) || native.conclusion === 'failure' && !laterStepRan);
 }
 
-function recoveryTrigger(run, job) {
+export function recoveryTrigger(run, job) {
   if (run.conclusion === 'cancelled') return null;
   if (nativeTimedOut(job)) return 'native_timeout';
   if (job.status !== 'completed' || job.conclusion !== 'failure') return null;
@@ -33,14 +33,30 @@ function recoveryTrigger(run, job) {
   if (native.length === 1 && final.length === 1 &&
     native[0].status === 'completed' && native[0].started_at && native[0].conclusion === 'failure' &&
     final[0].status === 'completed' && final[0].started_at && final[0].conclusion === 'success' && final[0].number > native[0].number) {
-    return 'native_worker_sigkill';
+    return 'native_failure_checkpoint';
   }
   return null;
 }
 
-function checkpointCanContinue(trigger, manifest) {
-  if (trigger === 'native_timeout') return ['running', 'cancelled'].includes(manifest.outcome);
-  return trigger === 'native_worker_sigkill' && manifest.outcome === 'failed' && manifest.recovery_reason === trigger;
+export function resolveRecoveryReason(trigger, manifest) {
+  if (trigger === 'native_timeout') return ['running', 'cancelled'].includes(manifest.outcome) ? trigger : null;
+  return trigger === 'native_failure_checkpoint' && manifest.outcome === 'failed' && recoveryReasons.includes(manifest.recovery_reason)
+    ? manifest.recovery_reason : null;
+}
+
+const transientCooldowns = [30_000, 60_000, 120_000, 240_000, 300_000];
+export function recoveryCooldownMs(reason, autoCount = 0) {
+  if (reason !== 'native_provider_transient') return 0;
+  return transientCooldowns[Math.min(Math.max(0, autoCount), transientCooldowns.length - 1)];
+}
+
+function defaultWait(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, ms);
+    const abort = () => { clearTimeout(timer); reject(Object.assign(new Error('cooldown_cancelled'), { name: 'AbortError' })); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
 }
 
 async function latestCheckpoint(api, repository, run) {
@@ -77,11 +93,12 @@ export async function prepareExecution({ api, repository, runId, attempt, actor,
   let restored, automaticRecovery, operator = actor, autoCount = 0;
   if (resumeRunId) restored = await loadRunCheckpoint(api, repository, resumeRunId, root, runnerVersion, runner);
   if (actor === 'github-actions[bot]') {
-    invariant(triggeringActor === actor && Number(attempt) === 1 && restored && restored.run.workflow_id === run.workflow_id &&
+    invariant(plan === '' && triggeringActor === actor && Number(attempt) === 1 && restored && restored.run.workflow_id === run.workflow_id &&
       Number(restored.run.run_attempt) === 1, 'untrusted_automatic_resume');
-    automaticRecovery = recoveryTrigger(restored.run, await executionJob(api, repository, restored.run));
-    invariant(automaticRecovery, 'untrusted_automatic_resume');
-    invariant(checkpointCanContinue(automaticRecovery, restored.manifest), 'checkpoint_not_automatically_resumable');
+    const trigger = recoveryTrigger(restored.run, await executionJob(api, repository, restored.run));
+    invariant(trigger, 'untrusted_automatic_resume');
+    automaticRecovery = resolveRecoveryReason(trigger, restored.manifest);
+    invariant(automaticRecovery, 'checkpoint_not_automatically_resumable');
     operator = restored.manifest.operator;
     autoCount = restored.manifest.auto_count + 1;
   }
@@ -98,9 +115,13 @@ export async function prepareExecution({ api, repository, runId, attempt, actor,
     auto_count: autoCount, automatic_recovery: automaticRecovery, operator, lineage: { run_id: String(runId), run_attempt: String(attempt), workflow_id: run.workflow_id,
       workflow_path: run.path, workflow_sha: run.head_sha, branch: config.branch }, restored };
 }
-export async function recoverExecution({ api, repository, runId, attempt, root, core, env = process.env }) {
+export async function recoverExecution({ api, repository, runId, attempt, root, core, env = process.env, wait = defaultWait }) {
   const started = Date.now();
-  const evidence = { stage: 'continuation', repository, run_id: runId, run_attempt: attempt, parent_run_id: runId, parent_attempt: attempt };
+  const evidence = { stage: 'continuation', repository, run_id: runId, run_attempt: attempt, parent_run_id: runId, parent_attempt: attempt,
+    workflow_id: null, parent_job_id: null, parent_head_sha: null, job_conclusion: null, native_conclusion: null, final_save_conclusion: null,
+    artifact_id: null, checkpoint_sha: null, session_id: null, runner: null, runner_version: null, root_run_id: null, activation_run_id: null, operator: null,
+    trigger: null, native_outcome: null, recovery_reason: null, auto_continue: null, continuation_count: null, max_continuations: null,
+    cooldown_ms: 0, cooldown_elapsed_ms: 0, cooldown_outcome: 'skipped', post_cooldown_rechecked: false };
   const report = (level, fields) => logEvent(core, 'continuation.dispatch', level, { ...evidence, ...fields, elapsed_ms: Date.now() - started }, env);
   const stop = reason => { report('INFO', { reason, outcome: 'stopped' }); return { dispatched: false, reason }; };
   let dispatchAttempted = false;
@@ -110,44 +131,95 @@ export async function recoverExecution({ api, repository, runId, attempt, root, 
     const run = await api(runPath);
     if (String(run.id) !== String(runId) || Number(run.run_attempt) !== Number(attempt)) return stop('parent_attempt_changed');
     const job = await executionJob(api, repository, run);
-    const trigger = recoveryTrigger(run, job);
-    Object.assign(evidence, { workflow_id: run.workflow_id, parent_job_id: job.id, job_conclusion: job.conclusion,
-      native_conclusion: job.steps.find(step => step.name === 'Execute agent')?.conclusion,
-      final_save_conclusion: job.steps.find(step => step.name === 'Save final session')?.conclusion, trigger });
-    if (!trigger) return stop('native_not_recoverable');
+    const jobTrigger = recoveryTrigger(run, job);
+    Object.assign(evidence, { workflow_id: run.workflow_id, parent_job_id: job.id, parent_head_sha: run.head_sha, job_conclusion: job.conclusion ?? null,
+      native_conclusion: job.steps.find(step => step.name === 'Execute agent')?.conclusion ?? null,
+      final_save_conclusion: job.steps.find(step => step.name === 'Save final session')?.conclusion ?? null, trigger: jobTrigger });
+    if (!jobTrigger) return stop('native_not_recoverable');
 
-    const loaded = await loadRunCheckpoint(api, repository, runId, root);
+    let loaded;
+    try { loaded = await loadRunCheckpoint(api, repository, runId, root); }
+    catch (error) {
+      if (jobTrigger === 'native_failure_checkpoint' && error?.reason === 'run_checkpoint_unavailable') return stop('run_checkpoint_unavailable');
+      throw error;
+    }
     invariant(loaded.run.run_attempt === run.run_attempt && loaded.run.head_sha === run.head_sha, 'parent_execution_changed');
     const { manifest } = loaded;
     Object.assign(evidence, { artifact_id: loaded.artifact.id, checkpoint_sha: manifest.checkpoint_sha,
       session_id: manifest.session_id, runner: manifest.runner, runner_version: manifest.runner_version,
-      native_outcome: manifest.outcome, recovery_reason: manifest.recovery_reason, continuation_count: manifest.auto_count });
-    if (!checkpointCanContinue(trigger, manifest)) return stop(trigger === 'native_timeout' ? 'native_already_finished' : 'native_interruption_unconfirmed');
-    const config = await authorizeActors(api, repository, manifest.operator);
+      root_run_id: manifest.root_run_id, activation_run_id: manifest.activation_run_id,
+      native_outcome: manifest.outcome, recovery_reason: manifest.recovery_reason ?? null, continuation_count: manifest.auto_count });
+    const resolvedReason = resolveRecoveryReason(jobTrigger, manifest);
+    if (!resolvedReason) return stop(jobTrigger === 'native_timeout' ? 'native_already_finished' : 'native_interruption_unconfirmed');
+    evidence.trigger = resolvedReason;
+    let config = await authorizeActors(api, repository, manifest.operator);
     invariant(run.head_branch === config.branch, 'untrusted_parent_run');
     const { auto_continue, max_continuations } = config.settings;
     Object.assign(evidence, { operator: manifest.operator, auto_continue, max_continuations });
     if (!auto_continue) return stop('automatic_continuation_disabled');
     if (manifest.auto_count >= max_continuations) return stop('continuation_limit_exceeded');
 
+    const cooldownMs = recoveryCooldownMs(resolvedReason, manifest.auto_count);
+    evidence.cooldown_ms = cooldownMs;
+    if (cooldownMs > 0) {
+      const controller = new AbortController();
+      const onSignal = () => controller.abort();
+      const cooldownStarted = Date.now();
+      const cooldown = (level, fields) => logEvent(core, 'continuation.cooldown', level,
+        { ...evidence, ...fields, elapsed_ms: Date.now() - started }, env);
+      process.once('SIGTERM', onSignal);
+      process.once('SIGINT', onSignal);
+      try {
+        cooldown('INFO', { outcome: 'started', reason: null });
+        await wait(cooldownMs, controller.signal);
+        if (controller.signal.aborted) {
+          evidence.cooldown_outcome = 'cancelled';
+          evidence.cooldown_elapsed_ms = Date.now() - cooldownStarted;
+          cooldown('WARN', { outcome: 'cancelled', reason: 'cooldown_cancelled' });
+          return stop('cooldown_cancelled');
+        }
+        evidence.cooldown_outcome = 'completed';
+        evidence.cooldown_elapsed_ms = Date.now() - cooldownStarted;
+        cooldown('INFO', { outcome: 'completed', reason: null });
+      } catch (error) {
+        if (!controller.signal.aborted) throw error;
+        evidence.cooldown_outcome = 'cancelled';
+        evidence.cooldown_elapsed_ms = Date.now() - cooldownStarted;
+        cooldown('WARN', { outcome: 'cancelled', reason: 'cooldown_cancelled' });
+        return stop('cooldown_cancelled');
+      } finally {
+        process.removeListener('SIGTERM', onSignal);
+        process.removeListener('SIGINT', onSignal);
+      }
+      evidence.post_cooldown_rechecked = true;
+    }
     const latestRun = await api(runPath);
     invariant(latestRun.id === run.id && latestRun.run_attempt === run.run_attempt && latestRun.head_sha === run.head_sha, 'parent_execution_changed');
+    if (latestRun.conclusion === 'cancelled') return stop('parent_run_cancelled');
     const latestJob = await executionJob(api, repository, latestRun);
-    invariant(latestJob.id === job.id && recoveryTrigger(latestRun, latestJob) === trigger, 'parent_execution_changed');
-    if (trigger === 'native_worker_sigkill') {
+    invariant(latestJob.id === job.id && recoveryTrigger(latestRun, latestJob) === jobTrigger, 'parent_execution_changed');
+    if (jobTrigger === 'native_failure_checkpoint') {
       const candidate = await latestCheckpoint(api, repository, latestRun);
       invariant(candidate.id === loaded.artifact.id && candidate.name === loaded.artifact.name &&
         !candidate.expired && Date.parse(candidate.expires_at) > Date.now(), 'recovery_checkpoint_changed');
+    }
+    if (cooldownMs > 0) {
+      config = await authorizeActors(api, repository, manifest.operator);
+      invariant(latestRun.head_branch === config.branch, 'untrusted_parent_run');
+      Object.assign(evidence, { auto_continue: config.settings.auto_continue, max_continuations: config.settings.max_continuations });
+      if (!config.settings.auto_continue) return stop('automatic_continuation_disabled');
+      if (manifest.auto_count >= config.settings.max_continuations) return stop('continuation_limit_exceeded');
     }
 
     // An uncertain dispatch response is never retried automatically.
     dispatchAttempted = true;
     await api(`/repos/${repository}/actions/workflows/${run.workflow_id}/dispatches`, { method: 'POST', ref: config.branch,
       inputs: { runner: manifest.runner, 'resume-run-id': String(runId), plan: '' } });
-    report('INFO', { reason: trigger, continuation_count: manifest.auto_count + 1, outcome: 'requested' });
+    report('INFO', { reason: resolvedReason, continuation_count: manifest.auto_count + 1, outcome: 'requested' });
     return { dispatched: true };
   } catch (error) {
-    report('ERROR', { ...safeError(error), dispatch_attempted: dispatchAttempted, outcome: dispatchAttempted ? 'unconfirmed' : 'blocked' });
+    report('ERROR', { ...safeError(error), dispatch_attempted: dispatchAttempted, outcome: dispatchAttempted ? 'unconfirmed' : 'blocked',
+      corrective_action: dispatchAttempted ? 'Inspect workflow runs before manually retrying the uncertain dispatch.' : 'Inspect the recovery failure before resuming the session.' });
     throw error;
   }
 }

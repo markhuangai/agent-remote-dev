@@ -13,12 +13,64 @@ import { saveSnapshot, uploadSnapshot, watchSnapshots } from "../.build/checkpoi
 import { TaskGit } from "../.build/git.js";
 import { command } from "../.build/process.js";
 import { Diagnostics } from "../.build/diagnostics.js";
-import { SnapshotLogTailer } from "../.build/main.js";
+import { SnapshotLogTailer, recordRecoveryReason, resumedPrompt } from "../.build/main.js";
+import { classifyCodexError, classifyClaudeError, classifyFailure, hasLimitPrefix } from "../.build/provider-errors.js";
 import { activityPath, boundedLines, parseApplyPatch, summarizeCommand } from "../.build/activity.js";
 import { restoreCheckpoint, validateCheckpoint } from "../.build/resume.js";
 import { exec, executionSource, checkpoint, sessionId, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
 
 const plan = "Implement the fixture plan.\n";
+test("provider classification gives permanent failures precedence over transient wrappers", () => {
+  for (const message of ["HTTP 503 upstream failure", "status 529 overloaded", "HTTP 408 timeout", "HTTP 429 rate limited",
+    "stream disconnected before completion: upstream stream closed before a terminal event (last event: response.output_item.added)",
+    "stream disconnected before completion: Transport error: network error: error decoding response body",
+    "websocket idle timeout", "connection reset by peer"]) assert.equal(classifyCodexError(message).transient, true, message);
+  for (const message of ["HTTP 401 unauthorized", "HTTP 403 forbidden", "HTTP 400 invalid request", "HTTP 404 model not found",
+    "HTTP 429 insufficient_quota", "stream disconnected before completion: HTTP 503 billing error", "maximum context window exceeded",
+    "upstream stream closed before a terminal event: context_length_exceeded", "HTTP 429 usage_limit_error", "HTTP 503 upstream; HTTP 401",
+    "stream disconnected before completion:"]) assert.equal(classifyCodexError(message).transient, false, message);
+  assert.equal(classifyCodexError("HTTP 503 upstream; HTTP 401").http_status, 401);
+  assert.equal(classifyClaudeError({ reason: "server_error" }).transient, true);
+  assert.equal(classifyClaudeError({ reason: "overloaded" }).transient, true);
+  assert.equal(classifyClaudeError({ reason: "rate_limit" }).transient, false);
+  assert.equal(classifyClaudeError({ reason: "rate_limit", retryHint: true }).transient, true);
+  assert.equal(classifyClaudeError({ reason: "rate_limit", status: 429, rateLimitRejected: true }).transient, false);
+  assert.equal(classifyClaudeError({ reason: "server_error", terminalReason: "budget_exhausted" }).transient, false);
+  assert.equal(classifyClaudeError({ reason: "server_error", startupFailure: "proxy_invalid" }).transient, false);
+  assert.equal(classifyClaudeError({ reason: "unknown" }).transient, false);
+  assert.equal(hasLimitPrefix("You've hit your limit", ["You've hit your"], []), true);
+  const transient = classifyCodexError("HTTP 503 unavailable");
+  for (const [state, reason] of [[{ observed: false, identityChanged: false }, "session_not_started"],
+    [{ observed: true, identityChanged: true }, "conversation_identity_changed"],
+    [{ observed: true, identityChanged: false, completed: true }, "turn_already_completed"],
+    [{ observed: true, identityChanged: false, writesLost: true }, "session_writes_lost"],
+    [{ observed: true, identityChanged: false, quiescent: false }, "non_quiescent_or_signal_exit"]]) {
+    assert.equal(classifyFailure(transient, state).auto_continue_rejection_reason, reason);
+  }
+  assert.equal(classifyFailure(transient, { observed: true, identityChanged: false }).recovery_reason, "native_provider_transient");
+});
+
+test("automatic recovery prompt gives static side-effect guidance", () => {
+  const prompt = resumedPrompt({ checkpoint_sha: "a".repeat(40), omitted_work: true }, "native_provider_transient", "");
+  assert.match(prompt, /Verify published work and any external effects/);
+  assert.match(prompt, /Uncommitted or unpushed work/);
+  assert.doesNotMatch(prompt, /provider response/i);
+});
+
+test("final checkpoint metadata records only eligible failures with a session", () => {
+  for (const [outcome, session, reason, skipped, expected] of [
+    ["failed", sessionId, "native_provider_transient", false, "native_provider_transient"],
+    ["failed", sessionId, "native_worker_sigkill", false, "native_worker_sigkill"],
+    ["failed", null, "native_provider_transient", false, undefined],
+    ["completed", sessionId, "native_provider_transient", false, undefined],
+    ["failed", sessionId, "native_provider_transient", true, undefined],
+    ["failed", sessionId, "command_failed", false, undefined],
+  ]) {
+    const metadata = checkpoint({ recovery_reason: "native_worker_sigkill" });
+    recordRecoveryReason(metadata, { outcome, session, reason }, skipped);
+    assert.equal(metadata.recovery_reason, expected);
+  }
+});
 async function history(f, content = "completed turn") {
   if (f.job.runner === "claude") {
     const project = join(f.job.runnerHome, "projects", f.job.env.CLAUDE_CODE_PROJECT_DIR_NAME);
@@ -1364,10 +1416,13 @@ test("final summary truncates an oversized reply while preserving its opening, c
 });
 
 test("final summary omits resume instructions when no checkpoint was saved", async t => {
-  const { code, summary } = await finalization(t, { host: "github-hosted", checkpointSaved: false });
+  const { code, summary, records } = await finalization(t, { host: "github-hosted", checkpointSaved: false });
   assert.equal(code, 0);
   assert.match(summary, /- \*\*Saved checkpoint:\*\* unavailable/);
   assert.doesNotMatch(summary, /## How to resume|resume-run-id/);
+  const final = records.find(record => record.event === "checkpoint.final");
+  assert.equal(final.reason, "session_not_started"); assert.equal(final.session_id, null);
+  assert.equal(final.native_outcome, "completed"); assert.equal(final.recovery_reason, null);
 });
 
 for (const host of ["github-hosted", "self-hosted", undefined]) test(`final cleanup reports a real denied rmdir on ${host ?? "an unknown runner"}`, async t => {

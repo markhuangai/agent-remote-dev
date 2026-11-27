@@ -11,6 +11,52 @@ import { hash, versions, projectStorageKey } from "../.build/contracts.js";
 
 export const root = resolve(import.meta.dirname, "..");
 export const exec = promisify(execFile);
+export function actionsRecords(output) {
+  let depth = 0;
+  const records = [];
+  for (const line of output.split('\n')) {
+    if (line.startsWith('::debug::') || line.startsWith('::add-mask::')) continue;
+    if (line.startsWith('::group::')) depth++;
+    if (line.startsWith('::endgroup::')) { depth--; assert.ok(depth >= 0); }
+    if (line.startsWith('::warning::') || line.startsWith('::error::')) assert.equal(depth, 0, line);
+    const start = line.indexOf('{');
+    if (start !== -1) {
+      try { const value = JSON.parse(line.slice(start)); if (value.event) records.push(value); } catch {}
+    }
+  }
+  assert.equal(depth, 0);
+  return records;
+}
+export async function actionsProviderRun(f, cwd) {
+  const script = `
+    import { Diagnostics } from './.build/diagnostics.js';
+    import { drive } from './.build/driver.js';
+    import { durableCheckpoint } from './.build/checkpoint.js';
+    import { versions } from './.build/contracts.js';
+    import { recordRecoveryReason } from './.build/main.js';
+    import { checkpoint } from './tests/helpers.mjs';
+    const job = JSON.parse(process.argv[1]), cwd = process.argv[2];
+    const log = new Diagnostics({ repository: 'fixture/repo', run_id: '13', run_attempt: '1', session_id: null,
+      root_run_id: '13', continuation_count: 0, runner: job.runner, runner_version: versions[job.runner] });
+    log.protect(job.env.CODEX_API_KEY || job.env.ANTHROPIC_API_KEY);
+    log.protect(job.env.GH_TOKEN);
+    log.beginGroup('Runtime');
+    log.emitContext();
+    const result = await drive({ job, cwd, log, plan: 'Exercise failure diagnostics.',
+      state: async value => { if (value.session) log.fields.session_id = value.session; } });
+    if (result.session) {
+      const metadata = checkpoint({ session_id: result.session, workspace: cwd, outcome: result.outcome });
+      recordRecoveryReason(metadata, result, false);
+      await durableCheckpoint(job, metadata, log, async () => ({ id: 55 }));
+    }
+    log.endGroup();
+  `;
+  const env = { ...process.env };
+  delete env.ACTIONS_STEP_DEBUG;
+  const { stdout, stderr } = await exec(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(f.job), cwd],
+    { cwd: root, env, maxBuffer: 4 * 1024 * 1024 });
+  return { stdout, stderr, records: actionsRecords(stdout) };
+}
 export function logger() {
   const records = [], timeline = [], lines = [], warnings = [];
   const sink = Object.fromEntries(["info", "warning", "error", "debug"].map((level) => [level, (value) => {
@@ -115,9 +161,11 @@ export async function provider(t, replies) {
     if (next.status) { response.writeHead(next.status, { "content-type": "application/json" }); response.end(JSON.stringify(next.body)); return; }
     response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
     const id = `resp-${requests.length}`;
-    const events = [{ type: "response.created", response: { id } }, ...next, { type: "response.completed", response: { id,
-      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: null, output_tokens_details: null } } }];
+    const events = [{ type: "response.created", response: { id } }, ...(next.disconnect ? next.events ?? [] : next)];
+    if (!next.disconnect) events.push({ type: "response.completed", response: { id,
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: null, output_tokens_details: null } } });
     for (const event of events) response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    if (next.disconnect) { setTimeout(() => response.destroy(), 10); return; }
     response.end();
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));

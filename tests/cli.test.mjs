@@ -9,9 +9,107 @@ import { TaskGit } from '../.build/git.js';
 import { drive } from '../.build/driver.js';
 import { durableCheckpoint, exportCheckpoint } from '../.build/checkpoint.js';
 import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
-import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, reasoning, repository, root, tool, updatePlan } from './helpers.mjs';
+import { actionsProviderRun, exec, checkpoint, fixture, logger, mcpProvider, message, provider, reasoning, repository, root, tool, updatePlan } from './helpers.mjs';
 
 const plan = 'Implement the supplied plan autonomously. Ask only when clarification is indispensable.';
+test('Codex failure events classify only current eligible main-turn failures', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const binary = join(f.job.tools, 'node_modules/.bin/codex');
+  const started = { type: 'thread.started', thread_id: 'fixture-session-8712' };
+  const failure = message => ({ type: 'turn.failed', error: { message } });
+  const cases = [
+    { name: 'transient-zero', events: [started, failure('HTTP 503 service unavailable')], exit: 0, reason: 'native_provider_transient' },
+    { name: 'transient-nonzero', events: [started, { type: 'error', message: 'HTTP 503 service unavailable' }, failure('HTTP 503 service unavailable')], exit: 1, reason: 'native_provider_transient' },
+    { name: 'quota', events: [started, failure('HTTP 429 insufficient_quota')], exit: 0, reason: 'codex_native_failure', rejection: 'permanent_provider_error' },
+    { name: 'pre-session', events: [failure('HTTP 503 service unavailable')], exit: 1, reason: 'command_failed', rejection: 'session_not_started' },
+    { name: 'completed', events: [started, failure('HTTP 503 service unavailable'), { type: 'turn.completed' }], exit: 1, reason: 'command_failed', rejection: 'turn_already_completed' },
+    { name: 'progress', events: [started, { type: 'error', message: 'HTTP 503 service unavailable' }, { type: 'item.started', item: { id: 'tool-1', type: 'command_execution' } }], exit: 1, reason: 'command_failed', rejection: 'unclassified_native_failure' },
+    { name: 'stderr-only', events: [started], exit: 1, reason: 'command_failed', rejection: 'unclassified_native_failure' },
+    { name: 'signal', events: [started, failure('HTTP 503 service unavailable')], signal: 'TERM', reason: 'command_failed', rejection: 'non_quiescent_or_signal_exit' },
+    { name: 'missing-message', events: [started, { type: 'turn.failed' }], exit: 0, reason: 'codex_native_failure', rejection: 'unclassified_native_failure' },
+  ];
+  for (const entry of cases) {
+    f.records.length = 0;
+    const lines = entry.events.map(event => JSON.stringify(event)).join('\n');
+    const termination = entry.signal ? `kill -${entry.signal} $$` : `exit ${entry.exit}`;
+    await writeFile(binary, `#!/bin/sh\ncat <<'EVENTS'\n${lines}\nEVENTS\nprintf '%s' 'HTTP 503 stderr-only fixture' >&2\n${termination}\n`, { mode: 0o700 });
+    await assert.rejects(runCodex(f.job, r.cwd, 'Continue the fixture.', f.log, 30000, entry.name), error => {
+      assert.equal(error.reason, entry.reason, entry.name);
+      if (entry.rejection) assert.equal(error.details.auto_continue_rejection_reason, entry.rejection, entry.name);
+      else assert.equal(error.details.auto_continue_eligible, true);
+      return true;
+    });
+    if (entry.name === 'transient-nonzero') assert.equal(f.records.filter(record => record.event === 'runtime.provider').length, 1);
+    if (entry.name === 'missing-message') assert.equal(f.records.filter(record => record.event === 'runtime.provider').length, 1);
+  }
+});
+
+for (const scenario of ['503', '529', '429', '401', '403', '400', 'quota', 'disconnect']) test(`real Codex classifies ${scenario} provider response`, async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, () => scenario === 'disconnect'
+    ? { disconnect: true, events: [{ type: 'response.output_item.added', item: { id: 'm1', type: 'message', role: 'assistant', content: [], status: 'in_progress' } }] }
+    : { status: scenario === 'quota' ? 429 : Number(scenario), body: { error: {
+      type: scenario === '400' ? 'invalid_request_error' : 'fixture_error',
+      code: scenario === 'quota' ? 'insufficient_quota' : scenario === '400' ? 'invalid_request' : 'fixture_error', message: 'private-provider-body-5891' } } });
+  await configure(f.job, api.config + `\nrequest_max_retries = ${scenario === '529' ? 1 : 0}\nstream_max_retries = 0\n`, f.log);
+  let observed;
+  await assert.rejects(runCodex(f.job, r.cwd, 'Exercise the provider failure.', f.log, 60000, scenario, undefined, id => { observed = id; }), error => {
+    const transient = ['503', '529', '429', 'disconnect'].includes(scenario);
+    if (transient) assert.equal(error.reason, 'native_provider_transient');
+    else {
+      assert.ok(['command_failed', 'codex_native_failure'].includes(error.reason));
+      assert.equal(error.details.provider_error_class, 'permanent_provider_error');
+      assert.equal(error.details.auto_continue_rejection_reason, 'permanent_provider_error');
+      assert.equal(error.details.http_status, ['quota', '400'].includes(scenario) ? null : Number(scenario));
+    }
+    assert.equal(error.details.auto_continue_eligible, transient);
+    f.log.failure(error);
+    return true;
+  });
+  assert.ok(observed, 'the real provider failure must occur after session startup');
+  assert.ok(api.requests.length > 0);
+  if (scenario === '529') assert.ok(api.requests.length >= 2, 'Codex must exhaust a retry');
+  assert.doesNotMatch(f.lines.join('\n'), /private-provider-body-5891|fixture-api-credential-9374/);
+});
+
+for (const scenario of ['503', '401', 'quota', 'pre-session']) test(`Actions diagnostics reconstruct Codex ${scenario} failure`, async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, () => ({ status: scenario === 'quota' ? 429 : scenario === '401' ? 401 : 503,
+    body: { error: { code: scenario === 'quota' ? 'insufficient_quota' : 'fixture_error', message: 'private-codex-response-8427' } } }));
+  await configure(f.job, api.config + '\nrequest_max_retries = 0\nstream_max_retries = 0\n', f.log);
+  if (scenario === 'pre-session') await writeFile(join(f.job.tools, 'node_modules/.bin/codex'),
+    '#!/bin/sh\nprintf \'%s\\n\' \'{"type":"error","message":"HTTP 503 service unavailable"}\'\nexit 1\n', { mode: 0o700 });
+  const captured = await actionsProviderRun(f, r.cwd);
+  const output = captured.stdout.split('\n').filter(line => !line.startsWith('::add-mask::') && !line.startsWith('::debug::')).join('\n');
+  assert.doesNotMatch(output + captured.stderr, /private-codex-response-8427|fixture-api-credential-9374|fixture-github-credential-6241/);
+  const failed = captured.records.find(record => record.event === 'runtime.failed');
+  const outcome = captured.records.find(record => record.event === 'runtime.outcome');
+  assert.equal(failed.repository, 'fixture/repo'); assert.equal(failed.run_id, '13');
+  assert.equal(failed.run_attempt, '1'); assert.equal(failed.root_run_id, '13'); assert.equal(failed.continuation_count, 0);
+  assert.equal(failed.runner, 'codex'); assert.ok(failed.runner_version);
+  for (const key of ['session_id', 'provider_error_class', 'transient', 'http_status', 'cause_code', 'exit_code',
+    'native_cause', 'recovery_reason', 'auto_continue_rejection_reason', 'corrective_action']) {
+    assert.ok(Object.hasOwn(failed, key), key); assert.notEqual(failed[key], undefined, key);
+  }
+  assert.equal(failed.auto_continue_eligible, scenario === '503');
+  assert.equal(failed.provider_error_class, scenario === '401' || scenario === 'quota' ? 'permanent_provider_error' : 'transient_provider_error');
+  assert.equal(failed.transient, scenario === '503' || scenario === 'pre-session');
+  assert.equal(failed.http_status, { '503': 503, '401': 401, quota: null, 'pre-session': 503 }[scenario]);
+  assert.equal(failed.cause_code, null);
+  assert.equal(failed.auto_continue_rejection_reason, scenario === '503' ? null : scenario === 'pre-session' ? 'session_not_started' : 'permanent_provider_error');
+  assert.equal(outcome.reason, failed.reason); assert.equal(outcome.recovery_reason, failed.recovery_reason);
+  assert.equal(outcome.auto_continue_eligible, failed.auto_continue_eligible);
+  assert.ok(failed.corrective_action);
+  const providerRecord = captured.records.find(record => record.event === 'runtime.provider');
+  for (const key of ['provider_error_class', 'transient', 'http_status', 'cause_code', 'native_cause', 'corrective_action']) assert.ok(Object.hasOwn(providerRecord, key));
+  if (scenario === 'pre-session') { assert.equal(failed.auto_continue_rejection_reason, 'session_not_started'); assert.equal(failed.session_id, null); }
+  if (scenario === '503') {
+    const exported = captured.records.find(record => record.event === 'checkpoint.export');
+    assert.equal(exported.native_outcome, 'failed'); assert.equal(exported.recovery_reason, 'native_provider_transient');
+    const completed = captured.records.find(record => record.event === 'checkpoint.complete');
+    assert.equal(completed.recovery_reason, 'native_provider_transient'); assert.equal(completed.artifact_id, 55);
+  }
+});
 test('real Codex activity redacts outside paths for direct runner callers', async t => {
   const f = await fixture(t), r = await repository(f);
   const api = await provider(t, [[reasoning(`Inspect /outside/private.txt and ${join(r.cwd, 'README.md')} via /v1/messages.`),

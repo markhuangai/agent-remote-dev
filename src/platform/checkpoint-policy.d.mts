@@ -1,4 +1,5 @@
 export const checkpointSchema: number;
+export const recoveryReasons: readonly string[];
 export const checkpointBytes: number;
 export const instructionBytes: number;
 export const databases: string[];

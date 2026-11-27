@@ -42,8 +42,10 @@ on the latest successful upload, so a 60-second interval does not guarantee
 only 60 seconds of lost progress.
 
 Automatic continuation is optional and disabled by default. When enabled,
-a separate job can resume the selected runner after a native execution timeout
-or a verified unexpected native worker kill with a saved final checkpoint.
+a separate job can resume the selected runner after a native execution timeout,
+a verified unexpected native worker kill, or a classified transient provider or
+transport failure with a saved final checkpoint. Provider failures use a bounded
+cooldown before the job rechecks the parent and continuation policy.
 The default limit is three automatic continuations. Manual resume by run ID
 starts a new allowance.
 

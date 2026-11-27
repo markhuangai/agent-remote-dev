@@ -9,6 +9,7 @@ import { parse, stringify, type TomlTable } from "smol-toml";
 import { protectConfiguration } from "./credentials.js";
 import { readRepositoryMcpFile, type McpConfiguration } from "./mcp-config.js";
 import { boundedLines, commandName, editForPath, parseApplyPatch, showEdit, summarizeCommand } from "./activity.js";
+import { classifyCodexError, classifyFailure, safeProviderCause } from "./provider-errors.js";
 
 export function codexArgs(job: Job, cwd: string, output: string, session?: string) {
   const overrides = ["-c", 'approval_policy="never"', "-c", "allow_login_shell=false",
@@ -17,9 +18,12 @@ export function codexArgs(job: Job, cwd: string, output: string, session?: strin
   return session ? [...base, "resume", session, "-"] : [...base, "-"];
 }
 export function logCodexError(log: Diagnostics, event: any, session?: string) {
-  const item = event.type === "error" ? event : event.item;
-  log.event("runtime.provider", "ERROR", { stage: "codex", session_id: session,
-    native_cause: log.sanitize(String(item?.message ?? item?.text ?? "Native provider error")) });
+  const item = event.type === "error" ? event : event.type === "turn.failed" ? event.error : event.item;
+  const cause = String(item?.message ?? item?.text ?? "Native provider error");
+  const classification = classifyCodexError(cause);
+  log.event("runtime.provider", "ERROR", { stage: "codex", session_id: session ?? null,
+    ...classification, native_cause: safeProviderCause(classification),
+    corrective_action: "Inspect provider status and session diagnostics before resuming." });
 }
 export function logCodexActivity(log: Diagnostics, event: any, session: string, cwd?: string, started?: Map<string, number>) {
   if (!["item.started", "item.completed"].includes(event?.type) && !(event?.type === "item.updated" && event?.item?.type === "todo_list")) return;
@@ -85,6 +89,7 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
   log.ensureWorkspace(cwd);
   const output = join(job.root, `result-${ordinal}.txt`);
   let observed: string | undefined, conflictingSession: string | undefined, identityChanged = false, terminal = false, pending: { id: string; text: string } | undefined;
+  let lastTurnFailedError: string | undefined, lastStreamError: string | undefined, sawTurnCompleted = false, sawTurnFailed = false;
   let unparsed = 0;
   const started = new Map<string, number>();
   const flushMessage = () => { if (pending) { log.line(`[agent] ${pending.text}`); pending = undefined; } };
@@ -95,14 +100,21 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
       let value: any;
       try { value = JSON.parse(line); } catch { unparsed = Math.min(unparsed + 1, 1000000); return; }
       if (pending && value.item && value.item.id !== pending.id) flushMessage();
-      if (value.type === "turn.completed") pending = undefined;
-      if (value.type === "turn.failed") flushMessage();
+      if (value.type === "turn.started") { terminal = false; sawTurnCompleted = false; sawTurnFailed = false; lastTurnFailedError = undefined; lastStreamError = undefined; }
+      if (value.type === "turn.completed") { pending = undefined; sawTurnCompleted = true; sawTurnFailed = false; lastTurnFailedError = undefined; lastStreamError = undefined; }
+      if (value.type === "turn.failed") {
+        flushMessage(); sawTurnFailed = true;
+        lastTurnFailedError = typeof value.error?.message === "string" ? value.error.message : undefined;
+        if (lastTurnFailedError === undefined || lastTurnFailedError !== lastStreamError) logCodexError(log, value, observed ?? session);
+      }
       if (value?.type === "turn.completed" || value?.type === "turn.failed") terminal = true;
       if (value?.type === "error" || value?.type === "item.completed" && value.item?.type === "error") {
         flushMessage();
+        if (value.type === "error" && typeof value.message === "string") lastStreamError = value.message;
         logCodexError(log, value, observed ?? session);
         return;
       }
+      if (["item.started", "item.completed"].includes(value.type) && value.item?.type !== "error") lastStreamError = undefined;
       if (value.type === "thread.started" && typeof value.thread_id === "string") {
         if (session && value.thread_id !== session || observed && value.thread_id !== observed) {
           identityChanged = true; conflictingSession ??= value.thread_id; return;
@@ -123,6 +135,13 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
     if (error instanceof RunnerError) {
       error.details.unparsed_stdout_lines = unparsed;
       if (identityChanged) Object.assign(error.details, { expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? null });
+      if (error.reason === "command_failed") {
+        const cause = lastTurnFailedError ?? lastStreamError;
+        const classification = classifyFailure(classifyCodexError(cause ?? ""), { observed: Boolean(observed), identityChanged,
+          completed: sawTurnCompleted, quiescent: error.details.quiescent === true && error.details.signal === null });
+        Object.assign(error.details, classification);
+        if (classification.auto_continue_eligible) throw new RunnerError("native_provider_transient", "codex", cause ?? error.nativeCause, error.details);
+      }
     }
     throw error;
   } finally {
@@ -130,7 +149,14 @@ export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagn
     log.event("runtime.native_stream", "INFO", { stage: "codex", session_id: observed ?? session, unparsed_stdout_lines: unparsed });
   }
   if (identityChanged || !observed || session && observed !== session) throw new RunnerError("conversation_identity_changed", "codex", "Codex did not return the expected conversation identity.",
-    { expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? observed ?? null, unparsed_stdout_lines: unparsed });
+    { ...classifyFailure(classifyCodexError(lastTurnFailedError ?? lastStreamError ?? ""), { observed: Boolean(observed), identityChanged }),
+      expected_session: session ?? observed ?? null, observed_session: conflictingSession ?? observed ?? null, unparsed_stdout_lines: unparsed });
+  if (sawTurnFailed && !sawTurnCompleted) {
+    const cause = lastTurnFailedError ?? lastStreamError ?? "Codex did not complete the native turn.";
+    const classification = classifyFailure(classifyCodexError(cause), { observed: Boolean(observed), identityChanged, completed: sawTurnCompleted });
+    throw new RunnerError(classification.auto_continue_eligible ? "native_provider_transient" : "codex_native_failure", "codex", cause,
+      { ...classification, exit_code: 0, unparsed_stdout_lines: unparsed });
+  }
   return { session: observed, result: await readFile(output, "utf8") };
 }
 
