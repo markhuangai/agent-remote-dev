@@ -130,7 +130,8 @@ export class Diagnostics {
       try { const parsed = new URL(url); return `${parsed.protocol}//${parsed.host}${parsed.pathname}`; }
       catch { return "[url omitted]"; }
     }).split("\n").map(line => {
-      if (/authorization\s*:|bearer\s|^\s*[\[{]|api[_-]?key\s*[:=]/i.test(line)) return "[sensitive diagnostic line omitted]";
+      const content = line.replace(/^(?:\s*\[redacted\])+/, "");
+      if (/authorization\s*:|bearer\s|api[_-]?key\s*[:=]/i.test(line) || /^\s*[\[{]/.test(content)) return "[sensitive diagnostic line omitted]";
       return line.replace(/(\b(?:(?:unexpected\s+)?status|HTTP)\s+\d{3}(?:\s+[A-Za-z][A-Za-z ]*)?)\s*:\s*.*?(?=,\s*url\s*:|$)/gi,
         "$1: [provider response omitted]").replace(/\{.*$/, "[structured provider diagnostic omitted]");
     }).join("\n");

@@ -604,14 +604,20 @@ test("registered credential forms are masked and excluded from exports", async (
     for (const form of ${JSON.stringify(loggedForms)}) log.line(form);
     log.line('fixture+private+password+9284 1 + 2 = 3; a+b; scope=read+write; +line');
     log.group('fixture+private+password+9284', ['fixture+private+password+9284']);
-    log.failure(new RunnerError('fixture_failure', 'runtime', ${JSON.stringify(forms.at(-1))}));`;
+    for (const form of ${JSON.stringify(loggedForms)}) log.failure(new RunnerError('fixture_failure', 'runtime', form));
+    log.failure(new RunnerError('fixture_failure', 'runtime', '[redacted] {"body":"private-provider-body"}'));`;
   const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
   assert.ok(stdout.includes("::add-mask::fixture+private+password+9284"));
   const output = stdout.split("\n").filter(line => !line.startsWith("::add-mask::")).join("\n");
   assert.doesNotMatch(output, /fixture(?:\+|%20| )private/);
   for (const form of loggedForms) assert.ok(!output.includes(form));
   assert.ok((output.match(/\[redacted\]/g) ?? []).length >= loggedForms.length + 3);
-  assert.match(output, /"event":"runtime.failed"/);
+  const failures = output.split("\n").filter(line => line.includes('"event":"runtime.failed"'))
+    .map(line => JSON.parse(line.slice(line.indexOf("{"))));
+  assert.equal(failures.length, loggedForms.length + 1);
+  for (const failure of failures.slice(0, -1)) assert.equal(failure.native_cause, "[redacted]");
+  assert.equal(failures.at(-1).native_cause, "[sensitive diagnostic line omitted]");
+  assert.doesNotMatch(output, /private-provider-body/);
   assert.match(output, /1 \+ 2 = 3; a\+b; scope=read\+write; \+line/);
 });
 
