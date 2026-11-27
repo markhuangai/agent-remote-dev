@@ -1,6 +1,9 @@
 export function githubAPI(github: any): (path: string, options?: any) => Promise<any>;
 export function executionJob(api: any, repository: string, run: any): Promise<any>;
 export function nativeTimedOut(job: any): boolean;
+export function recoveryTrigger(run: any, job: any): string | null;
+export function resolveRecoveryReason(trigger: string | null, manifest: any): string | null;
+export function recoveryCooldownMs(reason: string, autoCount?: number): number;
 export function loadRunCheckpoint(api: any, repository: string, runId: string, root: string, runnerVersion?: string, runner?: string): Promise<any>;
 export function pruneSnapshots(api: any, repository: string, runId: string, attempt: string, keep?: number): Promise<void>;
 export function prepareExecution(input: any): Promise<any>;

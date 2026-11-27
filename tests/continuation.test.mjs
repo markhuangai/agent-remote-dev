@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { exportCheckpoint } from '../.build/checkpoint.js';
 import { unpackArchive, validateCheckpoint } from '../.build/resume.js';
 import { checkpointName, validateManifest, validateProducer } from '../src/platform/checkpoint-policy.mjs';
-import { loadRunCheckpoint, nativeTimedOut, prepareExecution, pruneSnapshots, recoverExecution } from '../src/platform/continuation-policy.mjs';
+import { loadRunCheckpoint, nativeTimedOut, prepareExecution, pruneSnapshots, recoverExecution, recoveryCooldownMs } from '../src/platform/continuation-policy.mjs';
 import { workflowCommand } from '../src/platform/control.mjs';
-import { exec, checkpoint, fixture, sessionId } from './helpers.mjs';
+import { actionsRecords, exec, checkpoint, fixture, root as projectRoot, sessionId } from './helpers.mjs';
 
 const repository = 'fixture/repo';
 async function archive(f, entries) {
@@ -220,6 +223,165 @@ for (const change of ['newer-attempt', 'failed-save', 'newer-checkpoint', 'ambig
   });
 }
 
+test('transient cooldown is clamped and other recovery reasons have no delay', () => {
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 100].map(count => recoveryCooldownMs('native_provider_transient', count)),
+    [30000, 60000, 120000, 240000, 300000, 300000, 300000]);
+  assert.equal(recoveryCooldownMs('native_worker_sigkill', 3), 0);
+  assert.equal(recoveryCooldownMs('native_timeout', 3), 0);
+});
+
+for (const runner of ['codex', 'claude']) test(`verified ${runner} transient failure waits, fences, and admits a continuation`, async t => {
+  const x = await transport(t, runner, { outcome: 'failed', recovery_reason: 'native_provider_transient' });
+  interruptedJob(x.state.job);
+  let delay;
+  const result = await recoverExecution({ api: x.api, repository, runId: '13', attempt: '1', root: await x.root(), core: x.core,
+    wait: async ms => { delay = ms; } });
+  assert.equal(delay, 30000); assert.equal(result.dispatched, true);
+  const decision = x.records.find(record => record.event === 'continuation.dispatch');
+  assert.equal(decision.recovery_reason, 'native_provider_transient');
+  assert.equal(decision.post_cooldown_rechecked, true);
+  assert.equal(decision.cooldown_outcome, 'completed');
+  assert.deepEqual(x.records.filter(record => record.event === 'continuation.cooldown').map(record => record.outcome), ['started', 'completed']);
+  x.state.parent.status = 'in_progress';
+  assert.equal((await x.prepare(bot)).automatic_recovery, 'native_provider_transient');
+  await assert.rejects(x.prepare({ ...bot, plan: 'untrusted instructions' }), /untrusted_automatic_resume/);
+});
+
+for (const scenario of ['cancelled', 'disabled', 'limit', 'permission', 'changed-parent', 'missing-checkpoint']) {
+  test(`transient recovery fences ${scenario} after cooldown`, async t => {
+    const x = await transport(t, 'codex', { outcome: 'failed', recovery_reason: 'native_provider_transient' });
+    interruptedJob(x.state.job);
+    const wait = async () => {
+      if (scenario === 'cancelled') x.state.parent.conclusion = 'cancelled';
+      if (scenario === 'disabled') x.state.config = x.state.config.replace('auto-continue: true', 'auto-continue: false');
+      if (scenario === 'limit') x.state.config += 'max-continuations: 0\n';
+      if (scenario === 'permission') x.state.permission = 'read';
+      if (scenario === 'changed-parent') x.state.parent = { ...x.state.parent, run_attempt: 2 };
+      if (scenario === 'missing-checkpoint') x.state.artifacts = [];
+    };
+    const recovery = recoverExecution({ api: x.api, repository, runId: '13', attempt: '1', root: await x.root(), core: x.core, wait });
+    if (scenario === 'changed-parent' || scenario === 'missing-checkpoint' || scenario === 'permission') {
+      const reason = { 'changed-parent': 'parent_execution_changed', 'missing-checkpoint': 'run_checkpoint_unavailable', permission: 'operator_write_permission_required' }[scenario];
+      await assert.rejects(recovery, error => error.reason === reason);
+      assert.equal(x.records.at(-1).reason, reason); assert.equal(x.records.at(-1).outcome, 'blocked');
+    }
+    else {
+      const result = await recovery;
+      assert.equal(result.dispatched, false);
+      assert.equal(result.reason, { cancelled: 'parent_run_cancelled', disabled: 'automatic_continuation_disabled', limit: 'continuation_limit_exceeded' }[scenario]);
+    }
+    assert.ok(!x.state.calls.some(call => call.options?.method === 'POST'));
+    assert.equal(x.records.at(-1).post_cooldown_rechecked, true);
+  });
+}
+
+test('transient recovery stops before waiting when the checkpoint or policy is unavailable', async t => {
+  for (const scenario of ['missing', 'disabled', 'limit']) {
+    const x = await transport(t, 'codex', { outcome: 'failed', recovery_reason: 'native_provider_transient' });
+    interruptedJob(x.state.job);
+    if (scenario === 'missing') x.state.artifacts = [];
+    if (scenario === 'disabled') x.state.config = x.state.config.replace('auto-continue: true', 'auto-continue: false');
+    if (scenario === 'limit') x.state.config += 'max-continuations: 0\n';
+    const result = await recoverExecution({ api: x.api, repository, runId: '13', attempt: '1', root: await x.root(), core: x.core,
+      wait: async () => assert.fail('wait must not run') });
+    assert.equal(result.reason, { missing: 'run_checkpoint_unavailable', disabled: 'automatic_continuation_disabled', limit: 'continuation_limit_exceeded' }[scenario]);
+    assert.ok(!x.state.calls.some(call => call.options?.method === 'POST'));
+  }
+});
+
+test('a signal cancels the cooldown without dispatch and restores signal listeners', async t => {
+  const x = await transport(t, 'codex', { outcome: 'failed', recovery_reason: 'native_provider_transient' });
+  interruptedJob(x.state.job);
+  const before = [process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')];
+  const result = await recoverExecution({ api: x.api, repository, runId: '13', attempt: '1', root: await x.root(), core: x.core,
+    wait: async (_ms, signal) => { process.emit('SIGTERM'); assert.equal(signal.aborted, true); throw new Error('aborted'); } });
+  assert.equal(result.reason, 'cooldown_cancelled');
+  assert.deepEqual([process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')], before);
+  assert.equal(x.records.find(record => record.event === 'continuation.cooldown' && record.outcome === 'cancelled').level, 'WARN');
+  assert.ok(!x.state.calls.some(call => call.options?.method === 'POST'));
+});
+
+for (const scenario of ['policy-drift', 'signal', 'permanent', 'uncertain-dispatch']) {
+  test(`real Actions logger explains recovery ${scenario}`, async t => {
+    const metadata = scenario === 'permanent' ? { outcome: 'failed' } : { outcome: 'failed', recovery_reason: 'native_provider_transient' };
+    const x = await transport(t, 'codex', metadata);
+    interruptedJob(x.state.job);
+    let configReads = 0;
+    const server = createServer(async (request, response) => {
+      const chunks = []; for await (const chunk of request) chunks.push(chunk);
+      const { path, options } = JSON.parse(Buffer.concat(chunks).toString());
+      if (path.includes('/contents/.remote-dev.yml?') && ++configReads === 2 && scenario === 'policy-drift')
+        x.state.config = x.state.config.replace('auto-continue: true', 'auto-continue: false');
+      if (path.endsWith('/dispatches') && scenario === 'uncertain-dispatch') {
+        response.writeHead(503, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ message: 'private-dispatch-body-9724', authorization: 'Bearer fixture-dispatch-token-4231' }));
+        return;
+      }
+      try {
+        const data = await x.api(path, options);
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify(Buffer.isBuffer(data) ? { bytes: data.toString('base64') } : { data }));
+      } catch (error) { response.writeHead(500); response.end(JSON.stringify({ message: error.message })); }
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+    const script = `
+      import * as core from '@actions/core';
+      import { workflowCommand } from './src/platform/control.mjs';
+      const original = globalThis.setTimeout;
+      globalThis.setTimeout = (callback, delay, ...args) => original(callback, delay === 30000 ? ${scenario === 'signal' ? 5000 : 30} : delay, ...args);
+      const endpoint = process.argv[1];
+      const github = { request: async (route, data) => {
+        const [method, path] = route.split(' ');
+        const response = await fetch(endpoint, { method: 'POST', body: JSON.stringify({ path, options: { ...data, method } }) });
+        const payload = await response.json();
+        if (!response.ok) throw Object.assign(new Error(payload.message), { status: response.status, response: { headers: { authorization: payload.authorization } } });
+        return { data: payload.bytes ? Buffer.from(payload.bytes, 'base64') : payload.data };
+      } };
+      await workflowCommand('recover', { github, core, env: { GITHUB_REPOSITORY: 'fixture/repo', GITHUB_RUN_ID: '13',
+        GITHUB_RUN_ATTEMPT: '1', RUNNER_TEMP: process.argv[2] } });
+    `;
+    const env = { ...process.env }; delete env.ACTIONS_STEP_DEBUG;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, `http://127.0.0.1:${server.address().port}`, x.f.temporary],
+      { cwd: projectRoot, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '', errors = '', sent = false;
+    child.stdout.setEncoding('utf8'); child.stdout.on('data', chunk => {
+      output += chunk;
+      if (scenario === 'signal' && !sent && output.includes('"event":"continuation.cooldown"') && output.includes('"outcome":"started"')) {
+        sent = true; child.kill('SIGTERM');
+      }
+    });
+    child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { errors += chunk; });
+    const [code] = await once(child, 'close');
+    assert.equal(code, scenario === 'uncertain-dispatch' ? 1 : 0, errors);
+    const records = actionsRecords(output);
+    const decision = records.find(record => record.event === 'continuation.dispatch');
+    assert.equal(decision.repository, repository); assert.equal(decision.run_id, '13');
+    assert.ok(!(output + errors).includes('private-dispatch-body-9724')); assert.ok(!(output + errors).includes('fixture-dispatch-token-4231'));
+    for (const key of ['parent_run_id', 'parent_attempt', 'workflow_id', 'parent_job_id', 'parent_head_sha', 'artifact_id', 'checkpoint_sha',
+      'session_id', 'runner', 'runner_version', 'root_run_id', 'activation_run_id', 'operator', 'trigger', 'native_outcome', 'recovery_reason',
+      'auto_continue', 'continuation_count', 'max_continuations', 'cooldown_ms', 'cooldown_elapsed_ms', 'cooldown_outcome',
+      'post_cooldown_rechecked', 'reason', 'outcome', 'elapsed_ms', 'truncated']) {
+      assert.ok(Object.hasOwn(decision, key), key); assert.notEqual(decision[key], undefined, key);
+    }
+    const cooldowns = records.filter(record => record.event === 'continuation.cooldown');
+    assert.deepEqual(cooldowns.map(record => record.outcome), scenario === 'permanent' ? [] :
+      scenario === 'signal' ? ['started', 'cancelled'] : ['started', 'completed']);
+    for (const cooldown of cooldowns) {
+      for (const key of ['reason', 'trigger', 'recovery_reason', 'cooldown_ms', 'cooldown_elapsed_ms', 'continuation_count', 'max_continuations', 'elapsed_ms'])
+        assert.ok(Object.hasOwn(cooldown, key), key);
+      if (cooldown.outcome !== 'cancelled') assert.equal(cooldown.reason, null);
+      assert.equal(cooldown.trigger, 'native_provider_transient'); assert.equal(cooldown.recovery_reason, 'native_provider_transient');
+      assert.equal(cooldown.cooldown_ms, 30000); assert.equal(cooldown.continuation_count, 0); assert.equal(cooldown.max_continuations, 3);
+    }
+    assert.equal(decision.native_outcome, 'failed'); assert.equal(decision.artifact_id, 55); assert.equal(decision.session_id, sessionId);
+    if (scenario === 'policy-drift') { assert.equal(decision.reason, 'automatic_continuation_disabled'); assert.equal(decision.post_cooldown_rechecked, true); assert.equal(decision.auto_continue, false); }
+    if (scenario === 'signal') { assert.equal(decision.reason, 'cooldown_cancelled'); assert.equal(decision.cooldown_outcome, 'cancelled'); }
+    if (scenario === 'permanent') { assert.equal(decision.reason, 'native_interruption_unconfirmed'); assert.equal(decision.recovery_reason, null); }
+    if (scenario === 'uncertain-dispatch') { assert.equal(decision.outcome, 'unconfirmed'); assert.equal(decision.http_status, 503); assert.ok(decision.corrective_action); }
+  });
+}
+
 test('snapshot retention removes only old snapshots of this run and attempt after replacement', async t => {
   const x = await transport(t);
   x.state.artifacts = [1, 2, 3, 4].map(id => ({ ...x.state.artifact, id, name: `remote-dev-session-r13-a1-${id}` }));
@@ -244,7 +406,9 @@ test('manifest validation rejects legacy schemas, unsupported native versions an
   for (const changed of [{ ...manifest, schema_version: 4 }, { ...manifest, runner_version: '0.0.1' }, { ...manifest, files: [{ path: '../auth', bytes: 0, sha256: 'a'.repeat(64) }] }]) assert.throws(() => validateCheckpoint(changed, repository));
   assert.throws(() => validateProducer({ ...x.state.artifact, workflow_run: { id: 99 } }, x.state.parent, manifest, repository));
   assert.throws(() => validateManifest({ ...manifest, recovery_reason: 'native_worker_sigkill' }, { repository }), /invalid_checkpoint_recovery_reason/);
+  assert.throws(() => validateManifest({ ...manifest, recovery_reason: 'native_provider_transient' }, { repository }), /invalid_checkpoint_recovery_reason/);
   assert.throws(() => validateManifest({ ...manifest, outcome: 'failed', recovery_reason: 'unknown' }, { repository }), /invalid_checkpoint_recovery_reason/);
+  assert.equal(validateManifest({ ...manifest, outcome: 'failed', recovery_reason: 'native_provider_transient' }, { repository }).recovery_reason, 'native_provider_transient');
 });
 
 test('native timeout remains eligible when skipped cleanup steps have timestamps', () => {

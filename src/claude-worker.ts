@@ -1,8 +1,9 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, USAGE_LIMIT_ERROR_PREFIXES, ORG_POLICY_LIMIT_PREFIXES } from "@anthropic-ai/claude-agent-sdk";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { boundedLines, editForPath, summarizeCommand } from "./activity.js";
 import { Diagnostics } from "./diagnostics.js";
+import { classifyCodexError, hasLimitPrefix } from "./provider-errors.js";
 
 type Tool = { name: string; input: Record<string, any>; started: number; parent: string | null };
 
@@ -24,9 +25,10 @@ async function main() {
   const settings = JSON.parse(await readFile(join(process.env.CLAUDE_CONFIG_DIR!, "settings.json"), "utf8"));
   const session = process.argv[3] || undefined;
   const tools = new Map<string, Tool>();
-  let pending: { id: string; content: string; parent: string | null } | undefined;
+  let stderrTail = "", writesLost = false;
+  let pending: { id: string; content: string; parent: string | null; from_error: boolean } | undefined;
   const flushText = (result?: string) => {
-    if (pending && pending.content.trim() !== result?.trim()) emit({ type: "text", text: text(pending.content), parent: pending.parent });
+    if (pending && pending.content.trim() !== result?.trim()) emit({ type: "text", text: text(pending.content), parent: pending.parent, from_error: pending.from_error });
     pending = undefined;
   };
   const invocation = query({ prompt: request.prompt, options: {
@@ -37,23 +39,39 @@ async function main() {
     allowedTools: ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"],
     allowDangerouslySkipPermissions: true, permissionPrompts: "none", sandbox: { enabled: false },
     persistSession: true, resume: session,
+    stderr: data => {
+      stderrTail = (stderrTail + data).slice(-8192);
+      if (!writesLost && /Claude Code could not save [^\n]*(?:\bENOSPC\b|\bEDQUOT\b|disk is full|disk quota is used up)/i.test(stderrTail)) {
+        writesLost = true;
+        emit({ type: "session_writes_lost" });
+      }
+    },
   } });
   try {
     for await (const message of invocation) {
-      if (message.type === "assistant" && message.error) emit({ type: "provider_error", reason: message.error });
+      if (message.type === "assistant" && message.error) {
+        flushText();
+        const errorText = message.message.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+        emit({ type: "provider_error", reason: message.error, parent: message.parent_tool_use_id,
+          usage_limit_rejected: hasLimitPrefix(errorText, USAGE_LIMIT_ERROR_PREFIXES, ORG_POLICY_LIMIT_PREFIXES),
+          error_hint: classifyCodexError(errorText) });
+      }
       if (message.type === "system" && message.subtype === "api_retry") emit({ type: "provider_retry", reason: message.error,
-        attempt: message.attempt, max_retries: message.max_retries, retry_delay_ms: message.retry_delay_ms, http_status: message.error_status });
+        attempt: message.attempt, max_retries: message.max_retries, retry_delay_ms: message.retry_delay_ms, http_status: message.error_status,
+        no_response: Boolean(message.no_response) });
+      if (message.type === "rate_limit_event") emit({ type: "rate_limit", rejected: message.rate_limit_info.status === "rejected" || message.rate_limit_info.overageStatus === "rejected" });
+      if (message.type === "system" && message.subtype === "session_writes_lost") emit({ type: "session_writes_lost" });
       if (message.type === "system" && message.subtype === "init") emit({ type: "session", session: message.session_id });
       if (message.type === "assistant") for (const block of message.message.content) {
         if (block.type === "text") {
           const parent = message.parent_tool_use_id;
-          if (pending && (pending.id !== message.message.id || pending.parent !== parent)) flushText();
-          if (!pending) pending = { id: message.message.id, content: "", parent };
-          pending.content += block.text;
+          if (pending && (pending.id !== message.message.id || pending.parent !== parent || pending.from_error !== Boolean(message.error))) flushText();
+          if (!pending) pending = { id: message.message.id, content: "", parent, from_error: Boolean(message.error) };
+          pending.content += message.error ? "[provider error details omitted]" : block.text;
         } else {
           flushText();
-          if (block.type === "thinking") emit({ type: "thinking", text: text(block.thinking), parent: message.parent_tool_use_id });
-          if (block.type === "redacted_thinking") emit({ type: "thinking", text: "[redacted thinking]", parent: message.parent_tool_use_id });
+          if (block.type === "thinking") emit({ type: "thinking", text: text(block.thinking), parent: message.parent_tool_use_id, from_error: Boolean(message.error) });
+          if (block.type === "redacted_thinking") emit({ type: "thinking", text: "[redacted thinking]", parent: message.parent_tool_use_id, from_error: Boolean(message.error) });
           if (block.type === "tool_use") {
             const input = block.input && typeof block.input === "object" ? block.input as Record<string, any> : {};
             tools.set(block.id, { name: block.name, input, started: Date.now(), parent: message.parent_tool_use_id });
@@ -110,13 +128,20 @@ async function main() {
         const success = message.subtype === "success" && !message.is_error;
         flushText(success ? message.result : undefined);
         await writeFile(process.argv[2], success ? message.result : "", { mode: 0o600 });
-        emit({ type: "result", success, reason: message.subtype });
+        const errors = "errors" in message ? message.errors : [];
+        const cause = errors.join("\n");
+        emit({ type: "result", success, reason: message.subtype, is_error: message.is_error,
+          terminal_reason: message.terminal_reason ?? null, api_error_status: "api_error_status" in message ? message.api_error_status ?? null : null,
+          startup_failure_reason: "startup_failure_reason" in message ? message.startup_failure_reason ?? null : null,
+          usage_limit_rejected: errors.some(error => hasLimitPrefix(error, USAGE_LIMIT_ERROR_PREFIXES, ORG_POLICY_LIMIT_PREFIXES)),
+          transient_error_hint: classifyCodexError(cause) });
       }
     }
   } finally { flushText(); }
 }
 main().catch(error => {
-  process.stdout.write(JSON.stringify({ type: "result", success: false, reason: "sdk_failure" }) + "\n");
-  process.stderr.write(error instanceof Error ? error.message : "Claude SDK invocation failed.");
+  const hint = classifyCodexError(error instanceof Error ? error.message : "");
+  process.stdout.write(JSON.stringify({ type: "worker_error", reason: "sdk_failure", transient_hint: hint }) + "\n");
+  process.stderr.write("Claude SDK invocation failed; provider details omitted.");
   process.exitCode = 1;
 });

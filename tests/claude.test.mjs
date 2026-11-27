@@ -13,10 +13,120 @@ import { restoreCheckpoint, validateCheckpoint, unpackArchive } from '../.build/
 import { drive } from '../.build/driver.js';
 import { TaskGit } from '../.build/git.js';
 import { watchSnapshots } from '../.build/checkpoint-worker.js';
-import { checkpoint, exec, fixture, mcpProvider, repository, root, sessionId } from './helpers.mjs';
+import { actionsProviderRun, checkpoint, exec, fixture, mcpProvider, repository, root, sessionId } from './helpers.mjs';
 import { call, claudeProvider, text, thinking, redactedThinking, simulateSdkMessages } from './claude-provider.mjs';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+test('Claude classifies only current main-session provider failures', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  await configure(f.job, JSON.stringify({ model: 'fixture' }), f.log);
+  const init = { type: 'system', subtype: 'init', session_id: 'fixture-session-8712' };
+  const assistant = (error, parent = null, content = [text('Provider error')]) => ({ type: 'assistant', error, parent_tool_use_id: parent,
+    message: { id: 'message-1', content } });
+  const failed = (extra = {}) => ({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['fixture failure'], terminal_reason: 'api_error', ...extra });
+  const retry = { type: 'system', subtype: 'api_retry', error: 'rate_limit', attempt: 1, max_retries: 1, retry_delay_ms: 1, error_status: 429 };
+  const cases = [
+    { name: 'server', events: [init, assistant('server_error'), failed()], reason: 'native_provider_transient' },
+    { name: 'overloaded', events: [init, assistant('overloaded'), failed()], reason: 'native_provider_transient' },
+    { name: 'rate-limit', events: [init, retry, assistant('rate_limit'), failed()], reason: 'native_provider_transient' },
+    { name: 'rejected-rate-limit', events: [init, retry, { type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } }, assistant('rate_limit'), failed()], reason: 'claude_native_failure', rejection: 'permanent_provider_error' },
+    { name: 'usage-limit', events: [init, retry, assistant('rate_limit', null, [text("You've hit your monthly limit")]), failed()], reason: 'claude_native_failure', rejection: 'permanent_provider_error' },
+    { name: 'subagent-only', events: [init, assistant('server_error', 'subagent-1'), failed()], reason: 'claude_native_failure', rejection: 'unclassified_native_failure' },
+    { name: 'subagent-retry', events: [init, { ...retry, error: 'unknown', error_status: null, no_response: { waited_ms: 5, retry_wait_ms: 5 } }, assistant('unknown', 'subagent-1'), failed()], reason: 'claude_native_failure', rejection: 'unclassified_native_failure' },
+    { name: 'subagent-retry-worker', events: [init, { ...retry, error: 'unknown', error_status: null, no_response: { waited_ms: 5, retry_wait_ms: 5 } }, assistant('unknown', 'subagent-1')],
+      reason: 'command_failed', rejection: 'unclassified_native_failure', throwAfterMessages: 'ECONNRESET' },
+    { name: 'transport-code', events: [init, { ...retry, error: 'unknown', error_status: null, no_response: { waited_ms: 5, retry_wait_ms: 5 } },
+      assistant('unknown', null, [text('ECONNRESET')]), failed()], reason: 'native_provider_transient', cause: 'ECONNRESET' },
+    { name: 'progress', events: [init, assistant('server_error'), assistant(undefined, null, [text('Working again')]), failed()], reason: 'claude_native_failure', rejection: 'unclassified_native_failure' },
+    { name: 'stale-retry', events: [init, retry, assistant(undefined, null, [text('Working again')]), failed()], reason: 'claude_native_failure', rejection: 'unclassified_native_failure' },
+    { name: 'writes-lost', events: [init, assistant('server_error'), { type: 'system', subtype: 'session_writes_lost' }, failed()], reason: 'claude_native_failure', rejection: 'session_writes_lost' },
+    { name: 'budget', events: [init, assistant('server_error'), failed({ subtype: 'error_max_budget_usd' })], reason: 'claude_native_failure', rejection: 'permanent_provider_error' },
+    { name: 'startup', events: [init, assistant('server_error'), failed({ startup_failure_reason: 'proxy_invalid' })], reason: 'claude_native_failure', rejection: 'permanent_provider_error' },
+    { name: 'pre-session', events: [assistant('server_error'), failed()], reason: 'conversation_identity_changed', rejection: 'session_not_started' },
+    { name: 'worker-error', events: [init, assistant('server_error'), failed({ startup_failure_reason: 'proxy_invalid' })], reason: 'command_failed', rejection: 'permanent_provider_error', throwAfterMessages: 'worker failed' },
+    { name: 'stderr-writes-lost', events: [init, assistant('server_error'), failed()], reason: 'command_failed', rejection: 'session_writes_lost',
+      stderrAfterMessages: [`Error: Claude Code could not save all of this session's transcript under /${'long-path/'.repeat(100)}`,
+        ' because the disk is full (ENOSPC). If you resume this session, part of the conversation may be missing.'], throwAfterMessages: 'worker failed' },
+    { name: 'signal', events: [init, assistant('server_error'), failed()], reason: 'command_failed', rejection: 'non_quiescent_or_signal_exit', signalAfterMessages: 'SIGTERM' },
+  ];
+  for (const entry of cases) {
+    f.records.length = 0;
+    await simulateSdkMessages(f, entry.events, { throwAfterMessages: entry.throwAfterMessages,
+      stderrAfterMessages: entry.stderrAfterMessages, signalAfterMessages: entry.signalAfterMessages });
+    await assert.rejects(runClaude(f.job, r.cwd, 'Continue the fixture.', f.log, 30000, entry.name), error => {
+      assert.equal(error.reason, entry.reason, entry.name);
+      if (entry.rejection) assert.equal(error.details.auto_continue_rejection_reason, entry.rejection, entry.name);
+      else assert.equal(error.details.auto_continue_eligible, true);
+      if (entry.cause) assert.equal(error.details.cause_code, entry.cause);
+      return true;
+    });
+    if (entry.name === 'rejected-rate-limit' || entry.name === 'usage-limit') {
+      assert.ok(f.records.some(record => record.event === 'runtime.provider' && record.provider_error_class === 'permanent_provider_error' && !record.transient));
+    }
+    if (entry.cause) assert.ok(f.records.some(record => record.event === 'runtime.provider' && record.cause_code === entry.cause));
+    if (entry.cause) {
+      f.records.length = 0;
+      await drive({ job: f.job, cwd: r.cwd, log: f.log, plan: 'Continue the fixture.', state: async () => {} });
+      assert.equal(f.records.find(record => record.event === 'runtime.failed').cause_code, entry.cause);
+      assert.equal(f.records.find(record => record.event === 'runtime.outcome').cause_code, entry.cause);
+    }
+  }
+});
+
+for (const scenario of ['503', '529', '429', '401', '403', '400', 'quota', 'org-policy', 'disconnect']) test(`real Claude classifies ${scenario} provider response`, async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  const api = await claudeProvider(t, () => scenario === 'disconnect' ? { disconnect: true }
+    : { status: scenario === 'quota' ? 429 : scenario === 'org-policy' ? 403 : Number(scenario), body: { type: 'error', error: {
+      type: scenario === '401' ? 'authentication_error' : scenario === 'quota' || scenario === '429' ? 'rate_limit_error' : scenario === '403' || scenario === 'org-policy' ? 'permission_error' : scenario === '400' ? 'invalid_request_error' : 'api_error',
+      message: scenario === 'quota' ? "You've hit your monthly usage limit" : scenario === 'org-policy' ? 'This service is disabled for your org' : 'private-provider-body-5891' } } });
+  const settings = JSON.parse(api.config);
+  if (scenario === '529') settings.env.CLAUDE_CODE_MAX_RETRIES = '1';
+  await configure(f.job, JSON.stringify(settings), f.log);
+  let observed;
+  await assert.rejects(runClaude(f.job, r.cwd, 'Exercise the provider failure.', f.log, 60000, scenario, undefined, id => { observed = id; }), error => {
+    const transient = ['503', '529', '429', 'disconnect'].includes(scenario);
+    assert.equal(error.details.auto_continue_eligible, transient);
+    if (transient) assert.equal(error.reason, 'native_provider_transient');
+    else {
+      assert.equal(error.details.provider_error_class, 'permanent_provider_error');
+      assert.equal(error.details.auto_continue_rejection_reason, 'permanent_provider_error');
+      assert.equal(error.details.http_status, scenario === 'quota' ? 429 : scenario === 'org-policy' ? 403 : Number(scenario));
+    }
+    f.log.failure(error);
+    return true;
+  });
+  assert.ok(observed, 'the real provider failure must occur after session startup');
+  assert.ok(api.requests.length > 0);
+  if (scenario === '529') assert.ok(api.requests.length >= 2, 'Claude must exhaust a retry');
+  assert.doesNotMatch(f.lines.join('\n'), /private-provider-body-5891|fixture-claude-key/);
+});
+test('Actions diagnostics reconstruct a real Claude transient failure and checkpoint', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  const api = await claudeProvider(t, () => ({ status: 503, body: { type: 'error', error: { type: 'api_error', message: 'private-claude-response-8427' } } }));
+  await configure(f.job, api.config, f.log);
+  const captured = await actionsProviderRun(f, r.cwd);
+  const output = captured.stdout.split('\n').filter(line => !line.startsWith('::add-mask::') && !line.startsWith('::debug::')).join('\n');
+  assert.doesNotMatch(output + captured.stderr, /private-claude-response-8427|fixture-api-credential-9374|fixture-github-credential-6241/);
+  const failed = captured.records.find(record => record.event === 'runtime.failed');
+  const outcome = captured.records.find(record => record.event === 'runtime.outcome');
+  const exported = captured.records.find(record => record.event === 'checkpoint.export');
+  assert.equal(failed.reason, 'native_provider_transient'); assert.equal(failed.runner, 'claude');
+  assert.equal(failed.auto_continue_eligible, true); assert.ok(failed.corrective_action);
+  assert.equal(failed.provider_error_class, 'transient_provider_error'); assert.equal(failed.transient, true);
+  assert.equal(failed.http_status, 503); assert.equal(failed.cause_code, null); assert.equal(failed.auto_continue_rejection_reason, null);
+  assert.equal(failed.repository, 'fixture/repo'); assert.equal(failed.run_id, '13'); assert.equal(failed.run_attempt, '1');
+  assert.equal(failed.root_run_id, '13'); assert.equal(failed.continuation_count, 0); assert.ok(failed.runner_version);
+  for (const key of ['session_id', 'provider_error_class', 'transient', 'http_status', 'cause_code', 'exit_code',
+    'native_cause', 'recovery_reason', 'auto_continue_rejection_reason', 'corrective_action']) {
+    assert.ok(Object.hasOwn(failed, key), key); assert.notEqual(failed[key], undefined, key);
+  }
+  assert.equal(outcome.session_id, failed.session_id);
+  assert.equal(outcome.recovery_reason, failed.recovery_reason); assert.equal(outcome.auto_continue_eligible, true);
+  const providerRecord = captured.records.find(record => record.event === 'runtime.provider' && record.level === 'ERROR');
+  for (const key of ['provider_error_class', 'transient', 'http_status', 'cause_code', 'native_reason', 'parent_tool_use_id', 'corrective_action']) assert.ok(Object.hasOwn(providerRecord, key));
+  assert.equal(exported.native_outcome, 'failed'); assert.equal(exported.recovery_reason, 'native_provider_transient');
+  assert.equal(captured.records.find(record => record.event === 'checkpoint.complete').recovery_reason, 'native_provider_transient');
+});
 async function waitFor(probe) {
   const deadline = Date.now() + 60000;
   while (!await probe()) { assert.ok(Date.now() < deadline, 'Expected native state became available'); await pause(50); }

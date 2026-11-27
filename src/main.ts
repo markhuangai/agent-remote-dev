@@ -11,6 +11,7 @@ import { command } from "./process.js";
 import { configure, createJob, fetchSkillSource, installSkillSource, installTools, installUserInstructions, removeJob, Job } from "./setup.js";
 import { restoreCheckpoint } from "./resume.js";
 import { githubAPI, prepareExecution } from "./platform/continuation-policy.mjs";
+import { recoveryReasons } from "./platform/checkpoint-policy.mjs";
 import { resolveSkills } from "./platform/sources.mjs";
 import { fetchInstructions } from "./platform/instructions.mjs";
 import { runnerInputs } from "./runners.js";
@@ -24,6 +25,20 @@ export type SavedRun = { control?: { directory: string; nonce: string }; watcher
 const summaryReplyBytes = 900 * 1024;
 const summaryByteLimit = 1024 * 1024;
 const omittedReplyMarker = "\n\n[... middle omitted from this summary; open the full result artifact for the complete reply ...]\n\n";
+
+export function resumedPrompt(manifest: { checkpoint_sha: string; omitted_work?: boolean }, recovery: string | undefined, prompt: string) {
+  return `Continue this conversation using the current repository configuration. The checkout is the published revision ${manifest.checkpoint_sha}. ` +
+    (recovery && recoveryReasons.includes(recovery)
+      ? "The previous worker was interrupted. Verify published work and any external effects before repeating an operation. " : "") +
+    (manifest.omitted_work ? 'Uncommitted or unpushed work from the previous runner was not restored; inspect the checkout and recreate missing work as needed. ' : '') +
+    `\n\nAdditional context:\n${prompt || 'Continue the unfinished task.'}`;
+}
+
+export function recordRecoveryReason(metadata: CheckpointInput, result: { outcome: string; session: string | null; reason: string }, skipFinalSnapshot: boolean) {
+  delete metadata.recovery_reason;
+  if (result.outcome === "failed" && result.session && !skipFinalSnapshot && recoveryReasons.includes(result.reason))
+    metadata.recovery_reason = result.reason as CheckpointInput["recovery_reason"];
+}
 
 export class SnapshotLogTailer {
   private position: number;
@@ -283,15 +298,11 @@ export async function main({ github }: { github: any }) {
     const logs = setInterval(() => {
       if (!tailError) void tailer.flush().catch(error => { tailError ??= error; });
     }, 1000); logs.unref();
-    log.fields = { ...log.fields, session_id: metadata.session_id, root_run_id: metadata.root_run_id, continuation_count: metadata.auto_count,
+    log.fields = { ...log.fields, session_id: metadata.session_id || null, root_run_id: metadata.root_run_id, continuation_count: metadata.auto_count,
       project_config_sha256: prepared.config_sha256, skills, user_instructions_sha256: userInstructions?.sha256 ?? null };
     log.emitContext(); contextEmitted = true;
     let prompt = process.env.REMOTE_DEV_PLAN ?? '';
-    if (restored) prompt = `Continue this conversation using the current repository configuration. The checkout is the published revision ${restored.manifest.checkpoint_sha}. ` +
-      (prepared.automatic_recovery === "native_worker_sigkill"
-        ? "The previous worker was interrupted. Verify published work and any external effects before repeating an operation. " : "") +
-      (restored.manifest.omitted_work ? 'Uncommitted or unpushed work from the previous runner was not restored; inspect the checkout and recreate missing work as needed. ' : '') +
-      `\n\nAdditional context:\n${prompt || 'Continue the unfinished task.'}`;
+    if (restored) prompt = resumedPrompt(restored.manifest, prepared.automatic_recovery, prompt);
     log.endGroup();
     log.beginBuffering();
     let result;
@@ -310,7 +321,7 @@ export async function main({ github }: { github: any }) {
     }
     state.response = result.response;
     state.skip_final_snapshot = result.reason === "snapshot_resume_failed";
-    if (result.reason === "native_worker_sigkill") state.metadata.recovery_reason = result.reason;
+    recordRecoveryReason(state.metadata, result, state.skip_final_snapshot);
     await persist();
     core.setOutput("session-id", result.session ?? ''); core.setOutput("status", result.outcome);
     if (result.outcome !== 'completed') core.setFailed(`Native invocation ${result.outcome}; inspect the saved session and diagnostics.`);
@@ -360,7 +371,7 @@ export async function finish({ github, statePath }: { github: any; statePath: st
   const runnerEnvironment = host === "github-hosted" || host === "self-hosted" ? host : "unknown";
   const { lineage } = saved.metadata;
   log.fields = { repository: saved.metadata.repository, runner: saved.job.runner, runner_version: versions[saved.job.runner],
-    run_id: lineage.run_id, run_attempt: lineage.run_attempt, session_id: saved.metadata.session_id, workflow_sha: lineage.workflow_sha,
+    run_id: lineage.run_id, run_attempt: lineage.run_attempt, session_id: saved.metadata.session_id || null, workflow_sha: lineage.workflow_sha,
     root_run_id: saved.metadata.root_run_id, runner_environment: runnerEnvironment };
   log.setWorkspace(saved.metadata.workspace, [saved.job.root, saved.job.home, saved.job.runnerHome, process.env.RUNNER_TEMP ?? ""]);
   for (const secret of saved.secrets) log.protect(secret);
@@ -384,11 +395,15 @@ export async function finish({ github, statePath }: { github: any; statePath: st
     }
     saved.latest = await latestSnapshot(saved.job);
     if (saved.skip_final_snapshot) {
-      log.event("checkpoint.final", "WARN", { outcome: "skipped", reason: "snapshot_resume_failed", last_durable_checkpoint: saved.latest });
+      log.event("checkpoint.final", "WARN", { outcome: "skipped", reason: "snapshot_resume_failed", last_durable_checkpoint: saved.latest,
+        native_outcome: saved.metadata.outcome, recovery_reason: null });
     } else if (saved.metadata.session_id) {
       finalCheckpoint = await saveSnapshot(saved, log, api, (job, name, files, root, diagnostics) =>
         uploadSnapshot(job, name, files, root, diagnostics, undefined, { ...uploadContext, kind: "checkpoint" }));
       saved.latest = finalCheckpoint;
+    } else {
+      log.event("checkpoint.final", "INFO", { outcome: "skipped", reason: "session_not_started", last_durable_checkpoint: saved.latest,
+        native_outcome: saved.metadata.outcome, recovery_reason: null });
     }
     if (saved.latest) core.setOutput("artifact-id", saved.latest.artifact_id);
     inspectCredentials(saved.response, log, "credential_in_result");

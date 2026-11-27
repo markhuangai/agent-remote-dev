@@ -450,17 +450,22 @@ integrity, credential exclusion, native version and session references are
 verified. Expired artifacts, unrelated producers, unsupported native versions and
 legacy checkpoint formats stop restoration with diagnostics.
 
-Enable `auto-continue: true` to recover after a native execution timeout or an
-unexpected native worker `SIGKILL`. For a worker kill, the supervisor must confirm
+Enable `auto-continue: true` to recover after a native execution timeout, an
+unexpected native worker `SIGKILL`, or a classified transient provider or
+transport failure after the session starts. For a worker kill, the supervisor must confirm
 that the session started, the worker died before returning a result, and its
 descendants exited. The final-save step must publish a verified checkpoint
 recording the interruption. A separate recovery job checks the execution steps,
 current policy, checkpoint and continuation limit before dispatching the same
-consumer workflow. The default maximum is three automatic runs. An explicit
+consumer workflow. Transient provider failures wait 30, 60, 120, 240, then at
+most 300 seconds based on the continuation count. After waiting, the recovery
+job rechecks the parent, checkpoint, actor permissions and current policy. The
+default maximum is three automatic runs. An explicit
 manual resume by run ID starts a fresh allowance.
 
-Setup and upload timeouts, completed turns, ordinary failed exits and
-cancellation are ineligible for automatic continuation. Dispatch happens only
+Setup and upload timeouts, completed turns, cancellation, authentication errors,
+quota or billing limits, invalid requests and unclassified failures are
+ineligible for automatic continuation. Dispatch happens only
 on the parent's first attempt. An ambiguous dispatch requires inspection before
 another request. If a worker was interrupted, check published work and external
 effects before repeating an operation. After cancellation, inspect and cancel
@@ -507,6 +512,10 @@ INFO records identify setup, dependency versions, selected skills, current confi
 hash, session/run identity and completed snapshots. WARN records identify failed
 snapshots and retention problems while preserving the prior artifact. ERROR
 records identify native failures, rejected archives and required operations.
+Provider classification and rejection details appear in `runtime.provider`,
+`runtime.failed` and `runtime.outcome`. Checkpoint events record the recovery
+reason, while `continuation.cooldown` and `continuation.dispatch` show the delay,
+policy recheck and dispatch decision. Provider response bodies are omitted.
 Commands emit a heartbeat after 60 seconds of silence. The execution log shows
 agent updates, safe command summaries and edited paths. Thinking and bounded edit
 diffs appear in collapsed groups. Diffs for sensitive files and paths outside the

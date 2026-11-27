@@ -16,7 +16,7 @@ export type DurableCheckpoint = { artifact_id: number; checkpoint_sha: string; s
 export type CheckpointInput = { repository: string; branch: string | null; checkpoint_sha: string; omitted_work: boolean;
   session_id: string; root_run_id: string; activation_run_id: string; operator: string; auto_count: number;
   provider_sha?: string; sequence?: number; lineage: any; outcome: "running" | "completed" | "failed" | "cancelled";
-  recovery_reason?: "native_worker_sigkill"; workspace: string; previous?: DurableCheckpoint | null };
+  recovery_reason?: "native_worker_sigkill" | "native_provider_transient"; workspace: string; previous?: DurableCheckpoint | null };
 export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Diagnostics, limit = checkpointLimit, control?: ProcessControl) {
   const sequence = input.sequence ?? (input.previous?.sequence ?? 0) + 1;
   const root = await mkdtemp(join(job.exports, `snapshot-${sequence}-`));
@@ -39,7 +39,8 @@ export async function exportCheckpoint(job: Job, input: CheckpointInput, log: Di
     validateManifest(manifest, { repository: input.repository, runner: job.runner, runnerVersion: adapter.version });
     await writeFile(join(root, "manifest.json"), encoded, {mode:0o600});
     log.event("checkpoint.export", "INFO", { runner: job.runner, runner_version: adapter.version, sequence,
-      file_count: files.length, bytes, checkpoint_sha: input.checkpoint_sha, omitted_work: input.omitted_work, outcome: "validated" });
+      file_count: files.length, bytes, checkpoint_sha: input.checkpoint_sha, omitted_work: input.omitted_work, outcome: "validated",
+      native_outcome: input.outcome, recovery_reason: input.recovery_reason ?? null });
     return { root, files: [...files, join(root,"manifest.json")], sequence, manifest, name: checkpointName(manifest) };
   } catch (error) { await removeJob(root); throw error; }
 }
@@ -60,7 +61,7 @@ export async function durableCheckpoint(job: Job, input: CheckpointInput, log: D
         cause_exit_code: error instanceof RunnerError ? error.details.exit_code : undefined }); }
     requireValue(Number.isSafeInteger(result.id) && result.id! > 0, "missing_artifact_receipt", "checkpoint");
     const receipt = { artifact_id: result.id!, checkpoint_sha: input.checkpoint_sha, sequence: exported.sequence };
-    log.event("checkpoint.complete", "INFO", receipt);
+    log.event("checkpoint.complete", "INFO", { ...receipt, native_outcome: input.outcome, recovery_reason: input.recovery_reason ?? null });
     return receipt;
   } finally { await removeJob(exported.root); }
 }

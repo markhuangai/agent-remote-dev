@@ -5,6 +5,7 @@ import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { executionMode, RunnerError, versions } from "./contracts.js";
 import { safeError } from "./platform/runtime-log.mjs";
+import { safeProviderCause } from "./provider-errors.js";
 
 export type LoggerCore = Pick<typeof core, "info" | "warning" | "error" | "debug"> &
   Partial<Pick<typeof core, "startGroup" | "endGroup" | "setSecret">>;
@@ -266,11 +267,15 @@ export class Diagnostics {
     const reason = typeof candidate.reason === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(candidate.reason) ? candidate.reason : "unexpected_failure";
     const stage = typeof candidate.stage === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(candidate.stage) ? candidate.stage : "runtime";
     const details = candidate.details && typeof candidate.details === "object" ? candidate.details : {};
-    const cause = error instanceof RunnerError ? error.nativeCause : error instanceof Error ? error.message : "Unknown native failure";
+    const cause = error instanceof RunnerError && error.details.provider_error_class
+      ? safeProviderCause({ provider_error_class: error.details.provider_error_class as any, transient: error.details.transient === true,
+        http_status: error.details.http_status as number | null ?? null, cause_code: error.details.cause_code as string | null ?? null })
+      : error instanceof RunnerError ? error.nativeCause : error instanceof Error ? error.message : "Unknown native failure";
     const apiCause = safeError(error);
     this.event("runtime.failed", "ERROR", { stage, native_cause: cause, ...apiCause, ...details, reason,
       last_durable_checkpoint: lastCheckpoint,
       corrective_action: reason === "invalid_configured_credential" ? "Replace the indicated configured credential with a non-trivial value."
+        : reason === "native_provider_transient" ? "Inspect provider status and the final checkpoint; automatic continuation will observe the configured limit and cooldown."
         : "Inspect the named stage and native cause; preserve the last durable checkpoint and resolve the cause before retrying." });
   }
 }
