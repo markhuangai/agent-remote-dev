@@ -38,7 +38,8 @@ export function activityPath(path: string, cwd: string, base = cwd) {
   const outside = escapes(name) || escapes(physical);
   const sensitive = [raw, physical].some(candidate => {
     const segments = candidate.split(/[\\/]/), file = basename(candidate);
-    return segments.some(segment => [".ssh", ".aws", ".gnupg"].includes(segment.toLowerCase())) ||
+    return (segments.at(-2)?.toLowerCase() === ".docker" && file.toLowerCase() === "config.json") ||
+      segments.some(segment => [".ssh", ".aws", ".gnupg"].includes(segment.toLowerCase())) ||
       sensitiveNames.test(file) || sensitiveExtension.test(file) || sensitiveData.test(file) && (!extname(file) || dataExtension.test(extname(file)));
   });
   return { path: outside ? "<outside-workspace>" : name || ".", outside, sensitive, present };

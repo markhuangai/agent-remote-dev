@@ -72,6 +72,24 @@ test('real Codex suppresses a patch moved into a sensitive file', async t => {
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-6249|new-unregistered-secret-6249/);
 });
 
+test('real Codex withholds Docker authentication configuration diffs', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const oldAuth = Buffer.from('fixture-user:old-registry-password-7412').toString('base64');
+  const newAuth = Buffer.from('fixture-user:new-registry-password-7412').toString('base64');
+  const before = JSON.stringify({ auths: { 'registry.invalid': { auth: oldAuth } } });
+  const after = JSON.stringify({ auths: { 'registry.invalid': { auth: newAuth } } });
+  await mkdir(join(r.cwd, '.docker'));
+  await writeFile(join(r.cwd, '.docker/config.json'), before + '\n');
+  const patch = `*** Begin Patch\n*** Update File: .docker/config.json\n@@\n-${before}\n+${after}\n*** End Patch`;
+  const api = await provider(t, [[tool(`apply_patch <<'PATCH'\n${patch}\nPATCH`, 'docker-edit')], [message('Docker fixture updated.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Update the fixture.', f.log, 60000, 'docker-config');
+  assert.equal(await readFile(join(r.cwd, '.docker/config.json'), 'utf8'), after + '\n');
+  assert.ok(!f.log.protectedValues.includes(oldAuth)); assert.ok(!f.log.protectedValues.includes(newAuth));
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('sensitive file')));
+  assert.ok(!f.lines.join('\n').includes(oldAuth)); assert.ok(!f.lines.join('\n').includes(newAuth));
+});
+
 test('real Codex suppresses a moved symlink diff after its sensitive target becomes unobservable', async t => {
   const f = await fixture(t), r = await repository(f);
   await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-4398\n');

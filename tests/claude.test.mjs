@@ -133,6 +133,22 @@ test('real Claude rejects sensitive symlink edits without logging their content'
   assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-8712|new-unregistered-secret-8712/);
 });
 
+test('real Claude withholds Docker authentication configuration diffs', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f), path = join(r.cwd, '.docker/config.json');
+  const oldAuth = Buffer.from('fixture-user:old-registry-password-8523').toString('base64');
+  const newAuth = Buffer.from('fixture-user:new-registry-password-8523').toString('base64');
+  await mkdir(join(r.cwd, '.docker'));
+  await writeFile(path, JSON.stringify({ auths: { 'registry.invalid': { auth: oldAuth } } }) + '\n');
+  const api = await claudeProvider(t, [[call('Read', { file_path: path }, 'docker-read')],
+    [call('Edit', { file_path: path, old_string: oldAuth, new_string: newAuth }, 'docker-edit')], [text('Docker fixture updated.')]]);
+  await configure(f.job, api.config, f.log);
+  await runClaude(f.job, r.cwd, 'Update the fixture.', f.log, 90000, 'docker-config');
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).auths['registry.invalid'].auth, newAuth);
+  assert.ok(!f.log.protectedValues.includes(oldAuth)); assert.ok(!f.log.protectedValues.includes(newAuth));
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('sensitive file')));
+  assert.ok(!f.lines.join('\n').includes(oldAuth)); assert.ok(!f.lines.join('\n').includes(newAuth));
+});
+
 test('Claude worker suppresses successful edit events for a sensitive symlink path', async t => {
   const f = await fixture(t, 'claude'), r = await repository(f);
   await mkdir(join(r.cwd, 'config'));

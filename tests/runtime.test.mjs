@@ -1070,6 +1070,13 @@ test("patch moves suppress diff bodies when either path is sensitive or outside 
 
 test("activity paths protect sensitive symlink names and resolve symlink traversal before checking the workspace", async t => {
   const f = await fixture(t), r = await repository(f);
+  await mkdir(join(r.cwd, ".docker"));
+  await writeFile(join(r.cwd, ".docker/config.json"), "{}\n");
+  await writeFile(join(r.cwd, ".docker/Dockerfile"), "FROM scratch\n");
+  await symlink(".docker/config.json", join(r.cwd, "docker-config-alias"));
+  assert.equal(activityPath(".docker/config.json", r.cwd).sensitive, true);
+  assert.equal(activityPath("docker-config-alias", r.cwd).sensitive, true);
+  assert.equal(activityPath(".docker/Dockerfile", r.cwd).sensitive, false);
   await mkdir(join(r.cwd, "config"));
   await writeFile(join(r.cwd, "config/development.env"), "unregistered-sensitive-value\n");
   await symlink("config/development.env", join(r.cwd, ".env"));
