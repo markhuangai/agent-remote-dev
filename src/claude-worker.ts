@@ -11,6 +11,7 @@ async function main() {
   for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
   const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const log = new Diagnostics({}, { info() {}, warning() {}, error() {}, debug() {} }, { maskSecrets: false });
+  log.setWorkspace(process.cwd());
   for (const secret of request.secrets) log.protect(secret);
   const emit = (value: Record<string, unknown>) => {
     let encoded = JSON.stringify(value);

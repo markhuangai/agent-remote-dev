@@ -6,6 +6,9 @@ const versionPattern = /^v([1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\
 const absentOid = '0'.repeat(40);
 
 export function releaseVersion(version) {
+  invariant(typeof version === 'string', 'invalid_release_version');
+  const trimmed = version.trim();
+  version = trimmed.startsWith('v') ? trimmed : `v${trimmed}`;
   const match = versionPattern.exec(version);
   invariant(match, 'invalid_release_version');
   invariant(version.length <= 100 && match.slice(1).filter(value => value !== undefined).every(value => Number.isSafeInteger(Number(value))), 'invalid_release_version');
@@ -48,19 +51,35 @@ export async function prepareRelease({ api, repository, version, sourceSha, acto
   for (const login of new Set([actor, triggeringActor])) invariant(['maintain', 'admin'].includes((await api(`/repos/${repository}/collaborators/${login}/permission`)).permission), 'release_maintainer_required');
   invariant(shaPattern.test(sourceSha) && (await api(`/repos/${repository}/commits/${sourceSha}`)).sha === sourceSha, 'invalid_release_source');
   invariant(['ahead', 'identical'].includes((await api(`/repos/${repository}/compare/${sourceSha}...main`)).status), 'release_source_not_merged');
-  invariant(!await optional(api, `/repos/${repository}/git/ref/tags/${version}`) && !await optional(api, `/repos/${repository}/releases/tags/${version}`), 'release_version_exists');
+  invariant(!await optional(api, `/repos/${repository}/git/ref/tags/${parsed.version}`) && !await optional(api, `/repos/${repository}/releases/tags/${parsed.version}`), 'release_version_exists');
   const releases = await pages(api, `/repos/${repository}/releases`, null);
   let latestStable = null;
   for (const prior of releases) {
-    if (prior.draft || prior.prerelease !== parsed.prerelease) continue;
+    if (prior.draft || prior.prerelease) continue;
     const match = versionPattern.exec(prior.tag_name);
-    if (!match || (match[4] !== undefined) !== parsed.prerelease) continue;
+    if (!match || match[4] !== undefined) continue;
     const previous = releaseVersion(prior.tag_name);
-    if (previous.alias === parsed.alias) invariant(compareVersions(parsed, previous) > 0, 'release_version_not_increasing');
-    if (!previous.prerelease && (!latestStable || compareVersions(previous, latestStable) > 0)) latestStable = previous;
+    if (!latestStable || compareVersions(previous, latestStable) > 0) latestStable = previous;
   }
-  const makeLatest = !parsed.prerelease && (!latestStable || compareVersions(parsed, latestStable) > 0);
-  const latestVersion = makeLatest ? version : latestStable?.version ?? null;
+  if (latestStable && compareVersions(parsed, latestStable) <= 0) {
+    const reason = 'release_version_not_after_latest_stable';
+    throw Object.assign(new Error(reason), { reason, details: { latest_version: latestStable.version } });
+  }
+  let latestChannelPrerelease = null;
+  if (parsed.prerelease) for (const prior of releases) {
+    if (prior.draft || !prior.prerelease) continue;
+    const match = versionPattern.exec(prior.tag_name);
+    if (!match || match[4] === undefined || `v${match[1]}-prerelease` !== parsed.alias) continue;
+    const previous = releaseVersion(prior.tag_name);
+    if (!latestChannelPrerelease || compareVersions(previous, latestChannelPrerelease) > 0) latestChannelPrerelease = previous;
+  }
+  if (latestChannelPrerelease && compareVersions(parsed, latestChannelPrerelease) <= 0) {
+    const reason = 'release_version_not_increasing';
+    throw Object.assign(new Error(reason), { reason,
+      details: { latest_version: latestStable?.version ?? null, previous_version: latestChannelPrerelease.version } });
+  }
+  const makeLatest = !parsed.prerelease;
+  const latestVersion = makeLatest ? parsed.version : latestStable?.version ?? null;
   const aliases = [];
   for (const name of makeLatest ? [parsed.alias, 'latest'] : [parsed.alias]) {
     const current = await optional(api, `/repos/${repository}/git/ref/tags/${name}`);
@@ -143,9 +162,18 @@ export async function releasePreflight({ github, context, core, env = process.en
     logEvent(core, 'release.verify', 'INFO', { ...plan, outcome: 'verified', elapsed_ms: Date.now() - started }, env);
     return plan;
   } catch (error) {
-    logEvent(core, 'release.verify', 'ERROR', { version: versionPattern.test(env.RELEASE_VERSION ?? '') ? env.RELEASE_VERSION : null,
+    let version = null;
+    try { version = releaseVersion(env.RELEASE_VERSION).version; } catch { /* Invalid input must not be logged. */ }
+    const failure = safeError(error);
+    const correctiveActions = {
+      invalid_release_version: 'Enter a valid version such as v1.2.3 or v1.2.3-rc.0.',
+      release_version_not_after_latest_stable: 'Choose a version newer than the logged latest stable release.',
+      release_version_not_increasing: 'Choose a release candidate newer than the logged previous version.'
+    };
+    logEvent(core, 'release.verify', 'ERROR', { version,
       source_sha: shaPattern.test(env.SOURCE_SHA ?? '') ? env.SOURCE_SHA : null, ...safeError(error), ...error.details,
-      outcome: 'blocked', elapsed_ms: Date.now() - started, corrective_action: 'Resolve the named source, bundle or alias gate; do not overwrite a version or force-update a reference.' }, env);
-    throw new Error(safeError(error).reason);
+      outcome: 'blocked', elapsed_ms: Date.now() - started, corrective_action: correctiveActions[failure.reason] ??
+        'Resolve the named source, bundle or alias gate; do not overwrite a version or force-update a reference.' }, env);
+    throw new Error(failure.reason);
   }
 }

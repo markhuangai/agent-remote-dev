@@ -146,9 +146,12 @@ to automatic children. Automatic continuation remains disabled in this repositor
 `release.yml`, named **Publish release**, is the sole release publisher. It
 verifies the dispatched main source, locked build/tests and required CI/CodeQL
 results, then publishes an immutable version tag and GitHub release record.
-Stable versions advance their major tag (`vN`). The highest stable version also
-advances `latest` and receives GitHub's **Latest** badge. A patch for an older
-major advances its own tag. Prereleases advance `vN-prerelease` alone.
+Enter a stable version such as `1.2.3` or a release candidate such as
+`1.2.3-rc.0`. The `v` prefix is optional in the input and published version
+tags always include it. Every release must be newer than the latest stable
+release, and release candidates must also advance their major's prerelease
+channel. Stable releases advance their major tag (`vN`) and `latest` and receive
+GitHub's **Latest** badge. Prereleases advance `vN-prerelease` alone.
 
 The publisher updates the applicable aliases atomically and requires each update
 to move forward. For partial publication, inspect the version tag, release record,

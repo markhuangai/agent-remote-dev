@@ -12,6 +12,17 @@ import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
 import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, reasoning, repository, root, tool, updatePlan } from './helpers.mjs';
 
 const plan = 'Implement the supplied plan autonomously. Ask only when clarification is indispensable.';
+test('real Codex activity redacts outside paths for direct runner callers', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, [[reasoning(`Inspect /outside/private.txt and ${join(r.cwd, 'README.md')} via /v1/messages.`),
+    message('Fixture completed.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Inspect the fixture.', f.log, 60000, 'outside-path');
+  const output = f.lines.join('\n');
+  assert.match(output, /<outside-workspace> and README\.md via \/v1\/messages/);
+  assert.doesNotMatch(output, /\/outside\/private\.txt/);
+});
+
 test('real Codex streams reads, edits and command failures without logging their output', async t => {
   const f = await fixture(t), r = await repository(f);
   await writeFile(join(r.cwd, 'private-output.txt'), 'private-tool-output-9158\n');
