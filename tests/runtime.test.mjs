@@ -578,6 +578,65 @@ test("real Actions masking filters syntax lines and rejected composite credentia
   assert.equal(stdout.split('"reason":"invalid_configured_credential"').length - 1, 3);
 });
 
+test("registered credential forms are masked and excluded from exports", async () => {
+  const diagnostics = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const contracts = JSON.stringify(new URL("../.build/contracts.js", import.meta.url).href);
+  const secret = 'fixture "private~! password \\9284';
+  const form = new URLSearchParams([["value", secret]]).toString().slice(6);
+  const encoded = encodeURIComponent(secret);
+  const forms = [secret, encoded, form, form.replaceAll("+", "%20"), encoded.replaceAll("%20", "+")];
+  const { log } = logger();
+  log.protect(secret);
+  for (const form of forms) assert.throws(() => inspectCredentials(form, log), { reason: "credential_in_checkpoint" });
+  assert.throws(() => inspectCredentials(JSON.stringify(secret), log), { reason: "credential_in_checkpoint" });
+  assert.doesNotThrow(() => inspectCredentials("1 + 2 = 3; a+b; scope=read+write; +line", log));
+  log.protect("alpha%20");
+  log.protect("alpha b");
+  assert.equal(log.redact("alpha%20b"), "[redacted]");
+  log.protect("fixture lone surrogate \ud800");
+  assert.equal(log.redact("fixture lone surrogate \ud800"), "[redacted]");
+
+  const loggedForms = [...forms, JSON.stringify(secret).slice(1, -1)];
+  const script = `import {Diagnostics} from ${diagnostics}; import {RunnerError} from ${contracts};
+    const log = new Diagnostics({run_id:'13'});
+    log.protect(${JSON.stringify(secret)});
+    log.protect('fixture private password 9284');
+    for (const form of ${JSON.stringify(loggedForms)}) log.line(form);
+    log.line('fixture+private+password+9284 1 + 2 = 3; a+b; scope=read+write; +line');
+    log.group('fixture+private+password+9284', ['fixture+private+password+9284']);
+    log.failure(new RunnerError('fixture_failure', 'runtime', ${JSON.stringify(forms.at(-1))}));`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
+  assert.ok(stdout.includes("::add-mask::fixture+private+password+9284"));
+  const output = stdout.split("\n").filter(line => !line.startsWith("::add-mask::")).join("\n");
+  assert.doesNotMatch(output, /fixture(?:\+|%20| )private/);
+  for (const form of loggedForms) assert.ok(!output.includes(form));
+  assert.ok((output.match(/\[redacted\]/g) ?? []).length >= loggedForms.length + 3);
+  assert.match(output, /"event":"runtime.failed"/);
+  assert.match(output, /1 \+ 2 = 3; a\+b; scope=read\+write; \+line/);
+});
+
+test("real Actions logging redacts outside paths while retaining workspace paths and routes", async () => {
+  const diagnostics = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const paths = 'paths: /outside/private.txt, `/outside/noext` -/elsewhere/private; file:///outside/%70rivate.txt.';
+  const script = `import {Diagnostics} from ${diagnostics};
+    const log = new Diagnostics({run_id:'13'});
+    log.setWorkspace('/tmp/fixture-workspace');
+    log.line(${JSON.stringify(paths)});
+    log.line('/v1/../etc/passwd /v1/.hidden /api/file.txt /~user/private');
+    log.line('/tmp/fixture-workspace/src/file.ts /v1/messages /health GET /orders/recent');
+    log.line('const pattern = /allowed/g; const endpoint = "/v1/messages"; /dev/null');`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
+  assert.doesNotMatch(stdout, /outside\/private|outside\/noext|elsewhere\/private|\/etc\/passwd|\.hidden|\/api\/file\.txt|~user/);
+  assert.ok((stdout.match(/<outside-workspace>/g) ?? []).length >= 8);
+  assert.match(stdout, /src\/file\.ts \/v1\/messages \/health GET \/orders\/recent/);
+  assert.match(stdout, /const pattern = \/allowed\/g; const endpoint = "\/v1\/messages"; \/dev\/null/);
+  const { log } = logger();
+  log.setWorkspace("/tmp/fixture-workspace", ["/v1"]);
+  log.ensureWorkspace("/outside/other-workspace");
+  assert.equal(log.redact("/v1/messages"), "<outside-workspace>");
+  assert.equal(log.redact("/tmp/fixture-workspace/src/file.ts"), "src/file.ts");
+});
+
 test("multiline JSON configuration warns through the real Actions logger", async t => {
   const f = await fixture(t), main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
   const script = `import {main} from ${main}; await main({github:{}});`;
@@ -1570,6 +1629,17 @@ const timer = setInterval(() => {
     onControl: value => { saved.control = { directory: value.directory, nonce: value.nonce }; },
   }).catch(error => error);
   let watching;
+  let stopPromise;
+  const stopWatcher = () => {
+    stopPromise ??= (async () => {
+      if (!watching) return;
+      saved.metadata.outcome = 'completed';
+      await writeFile(statePath + '.tmp', JSON.stringify(saved));
+      await rename(statePath + '.tmp', statePath);
+      await watching;
+    })();
+    return stopPromise;
+  };
   try {
     const pid = await waitFor(async () => Number(await readMarker(helperPid)), 'The root-owned helper did not start');
     assert.throws(() => process.kill(pid, 0), { code: 'EPERM' });
@@ -1585,21 +1655,33 @@ const timer = setInterval(() => {
     assert.equal(deferred.retry_interval_ms, 250);
     assert.deepEqual(deferred.last_durable_checkpoint, previous);
     assert.equal(captures.length, 1);
-    assert.deepEqual(JSON.parse(await readFile(latestPath, 'utf8')), previous);
     const stalledAt = Number(await readMarker(counter));
     await waitFor(async () => Number(await readMarker(counter)) > stalledAt, 'The same writer did not resume after the denied pause');
     await writeFile(release, 'exit');
-    await waitFor(async () => JSON.parse(await readFile(latestPath, 'utf8')).artifact_id > previous.artifact_id,
+    await waitFor(() => records.find(record => record.event === 'checkpoint.cycle' &&
+      record.outcome === 'completed' && record.cycle > deferred.cycle),
       'The next eligible checkpoint did not complete');
-    assert.equal(captures[1].session_id, sessionId);
-    assert.ok(captures[1].sequence > previous.sequence + 1);
+    await stopWatcher();
+    const latest = JSON.parse(await readFile(latestPath, 'utf8'));
+    const completedSnapshots = records.filter(record => record.event === 'checkpoint.complete' && record.cycle > deferred.cycle);
+    assert.ok(completedSnapshots.length > 0);
+    assert.equal(completedSnapshots.length, captures.length - 1);
+    for (const [index, capture] of captures.slice(1).entries()) {
+      assert.equal(capture.session_id, sessionId);
+      assert.ok(capture.sequence > previous.sequence + 1);
+      assert.equal(completedSnapshots[index].sequence, capture.sequence);
+    }
+    assert.equal(latest.artifact_id, completedSnapshots.at(-1).artifact_id);
+    assert.equal(latest.sequence, completedSnapshots.at(-1).sequence);
+    assert.equal(latest.sequence, captures.at(-1).sequence);
+    assert.equal(records.filter(record => record.event === 'runtime.failed').length, 0);
   } finally {
-    saved.metadata.outcome = 'completed';
-    await writeFile(statePath + '.tmp', JSON.stringify(saved));
-    await rename(statePath + '.tmp', statePath);
     await writeFile(release, 'exit');
-    await writeFile(finish, 'exit');
-    await Promise.all([watching, running]);
+    try { await stopWatcher(); }
+    finally {
+      await writeFile(finish, 'exit');
+      await running;
+    }
   }
   assert.equal(await running, '');
 });

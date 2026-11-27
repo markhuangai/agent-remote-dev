@@ -1,5 +1,5 @@
 import { requireValue, RunnerError } from "./contracts.js";
-import { trivialCredential } from "./diagnostics.js";
+import { credentialForms, trivialCredential } from "./diagnostics.js";
 import type { Diagnostics } from "./diagnostics.js";
 
 const credentialKey = /(?:^|[_-])(?:api[_-]?key|key|token|secret|password|passwd|auth|authorization|credential|signature)(?:$|[_-])/i;
@@ -146,8 +146,7 @@ export function inspectCredentials(value: unknown, log: Diagnostics, reason = "c
   if (typeof value === "string" || value instanceof Uint8Array) {
     const data = Buffer.from(value);
     for (const secret of log.protectedValues) {
-      const forms = [secret, encodeURIComponent(secret), new URLSearchParams([["value", secret]]).toString().slice(6)];
-      for (const form of forms) requireValue(!data.includes(Buffer.from(form)), reason, "checkpoint");
+      for (const form of credentialForms(secret)) requireValue(!data.includes(Buffer.from(form)), reason, "checkpoint");
     }
     if (typeof value === "string" && /^[\s]*[\[{"]/.test(value)) {
       let decoded: unknown;

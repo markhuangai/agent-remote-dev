@@ -83,6 +83,39 @@ test('real Claude folds thinking and bounded edits without forwarding signatures
   assert.doesNotMatch(f.lines.join('\n'), /private-thinking-signature-4192|private-redacted-thinking-3192|Final reply from Claude\./);
 });
 
+test('real Claude activity redacts outside paths for direct runner callers', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  const api = await claudeProvider(t, [[thinking(`Inspect /outside/private.txt and ${join(r.cwd, 'README.md')} via /v1/messages.`),
+    text('Fixture completed.')]]);
+  await configure(f.job, api.config, f.log);
+  await runClaude(f.job, r.cwd, 'Inspect the fixture.', f.log, 90000, 'outside-path');
+  const output = f.lines.join('\n');
+  assert.match(output, /<outside-workspace> and README\.md via \/v1\/messages/);
+  assert.doesNotMatch(output, /\/outside\/private\.txt/);
+});
+
+test('Claude worker redacts paths before emitting native activity', async t => {
+  const f = await fixture(t, 'claude'), r = await repository(f);
+  await configure(f.job, JSON.stringify({ model: 'fixture' }), f.log);
+  await simulateSdkMessages(f, [
+    { type: 'system', subtype: 'init', session_id: 'fixture-session-8712' },
+    { type: 'assistant', parent_tool_use_id: null, message: { id: 'message-1', content: [
+      thinking(`Inspect /outside/private.txt and ${join(r.cwd, 'README.md')} via /v1/messages.`),
+    ] } },
+    { type: 'result', subtype: 'success', is_error: false, result: 'Fixture completed.' },
+  ]);
+  const child = spawn(process.execPath, [join(root, '.build/claude-worker.js'), join(f.temporary, 'worker-result.txt'), ''],
+    { cwd: r.cwd, env: f.job.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '', errors = '';
+  child.stdout.setEncoding('utf8'); child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { errors += chunk; });
+  child.stdin.end(JSON.stringify({ prompt: 'Run the fixture.', secrets: [] }));
+  const [code] = await once(child, 'close');
+  assert.equal(code, 0, errors);
+  assert.match(output, /<outside-workspace> and README\.md via \/v1\/messages/);
+  assert.doesNotMatch(output, /\/outside\/private\.txt/);
+});
+
 test('real Claude bounds a large Write event before sending it to the parent', async t => {
   const f = await fixture(t, 'claude'), r = await repository(f);
   const content = 'x'.repeat(1536 * 1024) + '\nvisible final line\n';

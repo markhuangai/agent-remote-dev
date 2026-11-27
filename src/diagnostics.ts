@@ -1,6 +1,8 @@
 import * as core from "@actions/core";
 import { randomBytes } from "node:crypto";
+import { readdirSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { executionMode, RunnerError, versions } from "./contracts.js";
 import { safeError } from "./platform/runtime-log.mjs";
 
@@ -13,6 +15,19 @@ export function trivialCredential(value: string) {
   return trimmed.length < 4 || /^[^\p{L}\p{N}]+$/u.test(trimmed) || /^(?:true|false|null)$/i.test(trimmed);
 }
 
+export function credentialForms(secret: string, includeJson = false) {
+  const form = new URLSearchParams([["value", secret]]).toString().slice(6);
+  const forms = [secret, form, form.replaceAll("+", "%20")];
+  if (includeJson) forms.push(JSON.stringify(secret).slice(1, -1));
+  try {
+    const uri = encodeURIComponent(secret);
+    forms.push(uri, uri.replaceAll("%20", "+"));
+  } catch (error) {
+    if (!(error instanceof URIError)) throw error;
+  }
+  return [...new Set(forms.filter(Boolean))];
+}
+
 export function actionsText(value: string) {
   return value.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
@@ -23,6 +38,7 @@ export function actionsText(value: string) {
 
 export class Diagnostics {
   private secrets: string[] = [];
+  private redactionForms: string[] = [];
   private activeGroup: string | null = null;
   private reopenGroupTitle: string | null = null;
   private buffering = false;
@@ -40,9 +56,11 @@ export class Diagnostics {
   protect(value: string) {
     if (trivialCredential(value) || this.secrets.includes(value)) return;
     this.secrets.push(value);
+    const forms = credentialForms(value, true);
+    this.redactionForms = [...new Set([...this.redactionForms, ...forms])].sort((a, b) => b.length - a.length);
     if (this.options.maskSecrets === false) return;
     const setSecret = this.sink.setSecret ?? core.setSecret;
-    for (const line of value.split(/\r\n|\r|\n/)) {
+    for (const line of new Set(forms.flatMap(form => form.split(/\r\n|\r|\n/)))) {
       if (line.length >= 6 && /[A-Za-z0-9]/.test(line) && !/^(?:Bearer|Basic|application\/json)$/i.test(line.trim())) setSecret(line);
     }
   }
@@ -52,15 +70,33 @@ export class Diagnostics {
   setWorkspace(path: string, externalRoots: string[] = []) {
     this.workspace = resolve(path);
     this.externalRoots = ["/tmp", "/home", "/var", "/root", "/Users", "/etc", "/opt", "/usr", "/proc", "/srv", "/mnt", "/runner",
-      ...externalRoots.filter(Boolean).map(root => resolve(root))];
+      resolve("/", this.workspace.split(sep).filter(Boolean)[0] ?? ""),
+      ...externalRoots.filter(Boolean).map(root => resolve(root)),
+      ...readdirSync("/").map(root => resolve("/", root))];
+  }
+
+  ensureWorkspace(path: string) {
+    if (!this.workspace) this.setWorkspace(path);
+  }
+
+  private redactPath(path: string, context: string, filesystem = false) {
+    const resolved = resolve(path);
+    const name = relative(this.workspace!, resolved);
+    if (name !== ".." && !name.startsWith(".." + sep)) return name || ".";
+    if (resolved === "/dev/null") return path;
+    const segments = path.split("/").filter(Boolean);
+    const filesystemSignal = filesystem || segments.some(segment => segment.startsWith(".") || segment.startsWith("~") || /\.[^.]/.test(segment)) ||
+      this.externalRoots.some(root => resolved === root || resolved.startsWith(root + sep));
+    if (filesystemSignal) return "<outside-workspace>";
+    if (segments.length < 2 || /^\/(?:v\d+|api|graphql|health|metrics|rest|oauth|auth|openapi|swagger)(?:\/|$)/i.test(path) ||
+      /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+$/i.test(context) ||
+      /(?:[=(:,[]|\breturn)\s*$/.test(context) && /^\/[^/]+\/[dgimsuvy]*$/.test(path)) return path;
+    return "<outside-workspace>";
   }
 
   redact(value: string) {
     let result = value;
-    for (const secret of [...this.secrets].sort((a, b) => b.length - a.length)) {
-      const forms = [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)];
-      for (const form of forms) if (form) result = result.split(form).join("[redacted]");
-    }
+    for (const form of this.redactionForms) result = result.split(form).join("[redacted]");
     result = result.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, "[private key omitted]");
     result = result.replace(/(?:^|\n)(?:[ +\-]?[A-Za-z0-9+/=]{48,}\n)+[ +\-]?-----END [A-Z ]*PRIVATE KEY-----/g, "\n[private key omitted]");
     result = result.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, url => {
@@ -73,11 +109,19 @@ export class Diagnostics {
     result = result.replace(/\b(Bearer|Basic)\s+([A-Za-z0-9._+/=-]{16,})(?![A-Za-z0-9._+/=-])/gi,
       (match, scheme: string, token: string) => /[0-9._+/=-]/.test(token) ? `${scheme} [redacted]` : match);
     result = result.replace(/\b(?:sk-ant-[A-Za-z0-9_-]+|sk-(?:proj-|svcacct-)?[A-Za-z0-9]{16,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]+|npm_[A-Za-z0-9]+|pypi-[A-Za-z0-9_-]+|hf_[A-Za-z0-9]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g, "[redacted]");
-    if (this.workspace) result = result.replace(/(^|[\s"'=(\[{+])((?:\/[A-Za-z0-9_~.%+-]+)+\/?)/g, (_match, prefix: string, path: string) => {
-      const name = relative(this.workspace!, resolve(path));
-      if (name !== ".." && !name.startsWith(".." + sep)) return prefix + (name || ".");
-      return prefix + (this.externalRoots.some(root => path === root || path.startsWith(root + sep)) ? "<outside-workspace>" : path);
-    });
+    if (this.workspace) {
+      result = result.replace(/\bfile:\/\/[^\s<>"'`]+/gi, url => {
+        const suffix = /[.,;:]+$/.exec(url)?.[0] ?? "";
+        try { return this.redactPath(fileURLToPath(url.slice(0, url.length - suffix.length)), "", true) + suffix; }
+        catch { return "<outside-workspace>" + suffix; }
+      });
+      result = result.replace(/(^|[\s"'`=(\[{+,:;\-])((?:\/[A-Za-z0-9_~.%+@-]+)+\/?)/g,
+        (match, prefix: string, path: string, offset: number, input: string) => {
+          const suffix = /(?:^|\/)\.{1,2}$/.test(path) ? "" : /\.+$/.exec(path)?.[0] ?? "";
+          const candidate = suffix ? path.slice(0, -suffix.length) : path;
+          return prefix + this.redactPath(candidate, input.slice(0, offset + prefix.length)) + (candidate === path ? "" : suffix);
+        });
+    }
     return actionsText(result);
   }
 

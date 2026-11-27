@@ -35,6 +35,7 @@ export async function configureClaude(job: Job, raw: string, log: Diagnostics, m
 
 export async function runClaude(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
+  log.ensureWorkspace(cwd);
   const output = join(job.root, `result-${ordinal}.txt`);
   let observed: string | undefined, conflictingSession: string | undefined, identityChanged = false, terminal = false, failure: string | undefined;
   let unparsed = 0;

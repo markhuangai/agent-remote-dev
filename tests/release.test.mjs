@@ -4,7 +4,10 @@ import { latestJobs, publishRelease, releasePreflight, releaseVersion } from '..
 test('release channels accept immutable versions and major channels and inspect latest child attempts including partial reruns', () => {
   assert.equal(releaseVersion('v1.0.0-rc.0').alias, 'v1-prerelease'); assert.equal(releaseVersion('v1.0.0').alias, 'v1');
   assert.equal(releaseVersion('v2.3.4').alias, 'v2'); assert.equal(releaseVersion('v3.0.0-rc.1').alias, 'v3-prerelease');
-  for (const version of ['v1', 'v0.0.0', 'main', 'v1.0.0;echo injected', 'v1.00.0']) assert.throws(() => releaseVersion(version));
+  assert.equal(releaseVersion(' 1.2.3 ').version, 'v1.2.3');
+  assert.equal(releaseVersion(' 1.2.3-rc.4 ').version, 'v1.2.3-rc.4');
+  for (const version of ['v1', 'v0.0.0', 'main', 'v1.0.0;echo injected', 'v1.00.0', 'v1.0.0-beta.1',
+    'v1.0.0-rc.9007199254740992', 'v' + '9'.repeat(100) + '.0.0']) assert.throws(() => releaseVersion(version));
   const jobs = [{ id: 1, name: 'Analyze (actions)', run_attempt: 1, status: 'completed', conclusion: 'success' }, { id: 2, name: 'Analyze (javascript-typescript)', run_attempt: 1, status: 'completed', conclusion: 'success' },
     { id: 3, name: 'Analyze (actions)', run_attempt: 2, status: 'completed', conclusion: 'success' }];
   assert.deepEqual(latestJobs(jobs, ['Analyze (actions)', 'Analyze (javascript-typescript)'], 2).map(result => result.job_id), [3, 2]);
@@ -87,7 +90,7 @@ function publication(version, { releases = [], tags = {} } = {}) {
     }
   };
   const core = { info: line => output.push(line), error: line => output.push(line) };
-  const env = { GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: repository, GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '2',
+  const env = { GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: repository, GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '2', GITHUB_WORKFLOW_SHA: source,
     SOURCE_SHA: source, TRIGGERING_ACTOR: actor, RELEASE_VERSION: version };
   const context = { repo: { owner: 'fixture', repo: 'repo' }, eventName: 'workflow_dispatch', actor };
   return { refs, calls, output, preflight: () => releasePreflight({ github, core, env, context }),
@@ -101,11 +104,9 @@ for (const [description, version, releases, tags, aliasNames, latestVersion] of 
   ['v2 promotion ignores drafts and release candidates', 'v2.0.0',
     [published('v1.10.0'), published('v9.0.0', { draft: true }), published('v10.0.0-rc.9007199254740992', { prerelease: true })],
     { v1: old, latest: old }, ['v2', 'latest'], 'v2.0.0'],
-  ['a v1 backport keeps v2 as latest', 'v1.1.1', [published('v1.1.0'), published('v2.0.0')],
-    { v1: old, v2: other, latest: other }, ['v1'], 'v2.0.0'],
   ['a release candidate advances only its prerelease tag', 'v2.1.0-rc.1',
     [published('v2.0.0'), published('v2.1.0-rc.0', { prerelease: true })],
-    { v2: old, latest: old, 'v2-prerelease': other }, ['v2-prerelease'], null],
+    { v2: old, latest: old, 'v2-prerelease': other }, ['v2-prerelease'], 'v2.0.0'],
   ['an alias already at the target is checked in the same update', 'v2.0.0', [published('v1.10.0')],
     { v1: source, latest: source }, ['v2', 'latest'], 'v2.0.0']
 ]) {
@@ -128,6 +129,52 @@ for (const [description, version, releases, tags, aliasNames, latestVersion] of 
     assert.equal(JSON.parse(fixture.output.at(-1)).outcome, 'verified');
   });
 }
+
+test('release input is canonical for existence checks and publication', async () => {
+  const existing = publication(' 1.1.0 ', { tags: { 'v1.1.0': old } });
+  await assert.rejects(existing.preflight(), /release_version_exists/);
+  assert.ok(existing.calls.some(call => call.endpoint === '/git/ref/tags/v1.1.0'));
+  assert.ok(existing.calls.every(call => call.method === 'GET'));
+  const fixture = publication(' 1.1.0 ', { releases: [published('v1.0.0')], tags: { v1: old, latest: old } });
+  const plan = await fixture.preflight();
+  assert.equal(plan.version, 'v1.1.0');
+  assert.equal(plan.latest_version, 'v1.1.0');
+  await fixture.publish(plan);
+  assert.equal(fixture.calls.find(call => call.method === 'POST' && call.endpoint === '/git/refs').ref, 'refs/tags/v1.1.0');
+  assert.equal(fixture.calls.find(call => call.method === 'POST' && call.endpoint === '/releases').tag_name, 'v1.1.0');
+});
+
+test('release preflight reports actionable version ordering failures without writes', async t => {
+  for (const [version, releases, reason, latestVersion, previousVersion] of [
+    ['private invalid version', [], 'invalid_release_version', undefined, undefined],
+    ['1.1.1', [published('v1.1.0'), published('v2.0.0')], 'release_version_not_after_latest_stable', 'v2.0.0', undefined],
+    ['1.0.0-rc.0', [published('v1.0.4')], 'release_version_not_after_latest_stable', 'v1.0.4', undefined],
+    ['2.1.0-rc.1', [published('v2.0.0'), published('v2.1.0-rc.2', { prerelease: true }),
+      published('v9.0.0-rc.9007199254740992', { prerelease: true })], 'release_version_not_increasing', 'v2.0.0', 'v2.1.0-rc.2']
+  ]) {
+    const fixture = publication(version, { releases });
+    await assert.rejects(fixture.preflight(), new RegExp(reason));
+    assert.ok(fixture.calls.every(call => call.method === 'GET'));
+    const record = JSON.parse(fixture.output.at(-1));
+    assert.equal(record.event, 'release.verify');
+    assert.equal(record.level, 'ERROR');
+    assert.equal(record.repository, 'fixture/repo');
+    assert.equal(record.run_id, '42');
+    assert.equal(record.run_attempt, '2');
+    assert.equal(record.workflow_sha, source);
+    assert.equal(record.source_sha, source);
+    assert.equal(record.version, reason === 'invalid_release_version' ? null : `v${version}`);
+    assert.equal(record.reason, reason);
+    assert.equal(record.latest_version, latestVersion);
+    assert.equal(record.previous_version, previousVersion);
+    assert.equal(record.outcome, 'blocked');
+    assert.equal(record.truncated, false);
+    assert.ok(Number.isInteger(record.elapsed_ms));
+    assert.match(record.corrective_action, /version|release candidate/i);
+    assert.doesNotMatch(fixture.output.at(-1), /private invalid version/);
+    t.diagnostic(fixture.output.at(-1));
+  }
+});
 
 test('preflight refuses a diverged major or latest tag before publication', async () => {
   for (const tag of ['v1', 'latest']) {

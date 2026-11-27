@@ -82,6 +82,7 @@ export function logCodexActivity(log: Diagnostics, event: any, session: string, 
 }
 export async function runCodex(job: Job, cwd: string, prompt: string, log: Diagnostics, timeoutMs: number, ordinal: string, session?: string,
   onSession?: (id: string) => void, onControl?: (control: ProcessControl) => void) {
+  log.ensureWorkspace(cwd);
   const output = join(job.root, `result-${ordinal}.txt`);
   let observed: string | undefined, conflictingSession: string | undefined, identityChanged = false, terminal = false, pending: { id: string; text: string } | undefined;
   let unparsed = 0;
