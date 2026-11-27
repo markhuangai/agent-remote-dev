@@ -423,6 +423,14 @@ test("environment references and benign URL query values remain usable", async t
   await configure(f.job, `[mcp_servers.fixture]\nurl="https://${token}@example.invalid/mcp?format=enabled"\n`, f.log);
   assert.ok(f.log.protectedValues.includes(token));
   assert.ok(!f.log.protectedValues.includes("enabled"));
+  for (const reference of ["$MY_TOKEN", "${MY_TOKEN}", "${MY_TOKEN:-fallback}"]) {
+    for (const url of [`https://user:${reference}@example.invalid/mcp`, `https://${reference}@example.invalid/mcp`,
+      `https://example.invalid/mcp?token=${reference}`]) {
+      const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http", url } } });
+      await configure(f.job, 'model="fixture"', f.log, mcp);
+      assert.ok(!f.log.protectedValues.includes(reference));
+    }
+  }
 });
 
 test("credential headers in MCP command arguments are validated and protected", async t => {
@@ -491,6 +499,65 @@ test("URL-encoded configured credentials cannot pass checkpoint or result inspec
   assert.throws(() => inspectCredentials("fixture spaced%20%6bey", f.log, "credential_in_result"), { reason: "credential_in_result" });
 });
 
+test("encoded URL credential literals that resemble references are validated and protected", async t => {
+  const f = await fixture(t);
+  const locations = [value => `https://user:${value}@example.invalid/mcp`, value => `https://${value}@example.invalid/mcp`,
+    value => `https://example.invalid/mcp?token=${value}`];
+  for (const [index, location] of locations.entries()) {
+    const mcp = value => JSON.stringify({ mcpServers: { fixture: { type: "http", url: location(value) } } });
+    const rejected = "$xy", encodedRejected = encodeURIComponent(rejected);
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp(encodedRejected)), error => {
+      assert.equal(error.reason, "invalid_configured_credential"); assert.equal(error.details.field, "url_credential"); return true;
+    });
+    assert.ok(!f.log.protectedValues.includes(rejected)); assert.ok(!f.log.protectedValues.includes(encodedRejected));
+    for (const secret of [`$LocalPassword${index}9284`, "$" + `{TOKEN${index}}`]) {
+      const encoded = encodeURIComponent(secret);
+      await configure(f.job, 'model="fixture"', f.log, mcp(encoded));
+      for (const form of [secret, encoded]) {
+        assert.ok(f.log.protectedValues.includes(form));
+        assert.throws(() => inspectCredentials(form, f.log, "credential_in_result"), { reason: "credential_in_result" });
+      }
+      f.log.line(`Fixture output: ${secret}`);
+      assert.ok(!f.lines.join("\n").includes(secret));
+    }
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("%61%")), { reason: "invalid_configured_credential" });
+    assert.ok(!f.log.protectedValues.includes("a%")); assert.ok(!f.log.protectedValues.includes("%61%"));
+    const mixed = `%24LongPassword${index}%ZZ`, decoded = `$LongPassword${index}%ZZ`;
+    await configure(f.job, 'model="fixture"', f.log, mcp(mixed));
+    assert.ok(f.log.protectedValues.includes(decoded)); assert.ok(f.log.protectedValues.includes(mixed));
+    assert.throws(() => inspectCredentials(decoded, f.log, "credential_in_result"), { reason: "credential_in_result" });
+  }
+  await history(f, "$LocalPassword09284");
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
+test("URL userinfo decoding preserves literal plus signs and ampersands", async t => {
+  const f = await fixture(t);
+  const locations = [value => `https://user:${value}@example.invalid/mcp`, value => `https://${value}@example.invalid/mcp`];
+  for (const [index, location] of locations.entries()) {
+    const encoded = `long${index}+with&value%61%`, decoded = `long${index}+with&valuea%`, url = location(encoded);
+    const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http", url } } });
+    await configure(f.job, 'model="fixture"', f.log, mcp);
+    assert.ok(f.log.protectedValues.includes(decoded));
+    assert.throws(() => inspectCredentials(decoded, f.log, "credential_in_result"), { reason: "credential_in_result" });
+  }
+});
+
+test("parsed URL authority credentials are protected across accepted authority spellings", async t => {
+  const f = await fixture(t);
+  const locations = [value => `https://name@realm:${value}@example.invalid/mcp`,
+    value => `https:/name:${value}@example.invalid/mcp`, value => `https:name:${value}@example.invalid/mcp`,
+    value => `https:\\\\name:${value}@example.invalid/mcp`, value => `custom://name@realm:${value}@example.invalid/mcp`];
+  for (const [index, location] of locations.entries()) {
+    const mcp = value => JSON.stringify({ mcpServers: { fixture: { type: "http", url: location(value) } } });
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("abc")), { reason: "invalid_configured_credential" });
+    const secret = `fixture-authority-password-${index}-9483`;
+    await configure(f.job, 'model="fixture"', f.log, mcp(secret));
+    assert.ok(f.log.protectedValues.includes(secret));
+    assert.throws(() => inspectCredentials(secret, f.log, "credential_in_result"), { reason: "credential_in_result" });
+  }
+});
+
 test("real Actions masking filters syntax lines and rejected composite credentials", async () => {
   const diagnostics = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
   const credentials = JSON.stringify(new URL("../.build/credentials.js", import.meta.url).href);
@@ -498,7 +565,8 @@ test("real Actions masking filters syntax lines and rejected composite credentia
   const script = `import {Diagnostics} from ${diagnostics}; import {protectConfiguration} from ${credentials};
     const log = new Diagnostics({run_id:'13'});
     for (const value of ['{}','Bearer','false','{\\n"token":"fixture-multiline-7281"\\n}']) log.protect(value);
-    for (const config of [{headers:{Authorization:'Basic ${payload}'}},{url:'https://user:%21%3F@example.invalid/mcp'}]) {
+    for (const config of [{headers:{Authorization:'Basic ${payload}'}},{url:'https://user:%21%3F@example.invalid/mcp'},
+      {url:'https://user:%61%@example.invalid/mcp'}]) {
       try { protectConfiguration(config, log, '', 'MCP_CONFIG_JSON'); } catch (error) { log.failure(error); }
     }`;
   const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
@@ -506,7 +574,8 @@ test("real Actions masking filters syntax lines and rejected composite credentia
   assert.ok(!masks.some(line => /^::add-mask::(?:\{|\}|Bearer|false)$/.test(line)));
   assert.ok(!stdout.includes(payload));
   assert.ok(!stdout.includes("user:%21%3F"));
-  assert.equal(stdout.split('"reason":"invalid_configured_credential"').length - 1, 2);
+  assert.ok(!stdout.includes("user:%61%"));
+  assert.equal(stdout.split('"reason":"invalid_configured_credential"').length - 1, 3);
 });
 
 test("multiline JSON configuration warns through the real Actions logger", async t => {
@@ -587,12 +656,14 @@ test("real setup reports an invalid primary credential before exposing a state p
   });
 });
 
-test("real fresh setup rejects composite credentials before launch or export", async t => {
+for (const variant of ["basic", "url"]) test(`real fresh setup rejects ${variant} credentials before launch or export`, async t => {
   const f = await fixture(t), output = join(f.temporary, "fresh-output");
   await writeFile(output, "");
   const payload = Buffer.from("user:!?").toString("base64");
-  const mcp = JSON.stringify({ mcpServers: { fixture: { command: "node", env: { DEBUG: "1" },
-    headers: { Authorization: `Basic ${payload}` } } } });
+  const mcp = JSON.stringify({ mcpServers: { fixture: variant === "basic" ? { command: "node", env: { DEBUG: "1" },
+    headers: { Authorization: `Basic ${payload}` } } : { type: "http", url: "https://user:%24xy@example.invalid/mcp" } } });
+  const forbidden = variant === "basic" ? ["user:!?", "user:%21%3F", payload] : ["$xy", "%24xy"];
+  const maskForbidden = variant === "basic" ? ["!?", "%21%3F", payload] : forbidden;
   const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
   const script = `import {main} from ${main}; await main({github:{request(){throw new Error('Unexpected API call');}}});`;
   const env = { ...process.env, REMOTE_DEV_RUNNER: "codex", REMOTE_DEV_GITHUB_TOKEN: "fixture-github-token-9382",
@@ -603,21 +674,23 @@ test("real fresh setup rejects composite credentials before launch or export", a
     const failure = error.stdout.split("\n").find(line => line.startsWith("::error::") && line.includes('"event":"runtime.failed"'));
     const record = JSON.parse(failure.slice(failure.indexOf("{")));
     assert.equal(record.reason, "invalid_configured_credential"); assert.equal(record.stage, "configuration");
-    assert.equal(record.source, "MCP_CONFIG_JSON"); assert.equal(record.field, "basic_password");
+    assert.equal(record.source, "MCP_CONFIG_JSON"); assert.equal(record.field, variant === "basic" ? "basic_password" : "url_credential");
     assert.equal(record.run_id, "13"); assert.equal(record.run_attempt, "2");
-    assert.doesNotMatch(error.stdout, /user:!\?|user:%21%3F/); assert.ok(!error.stdout.includes(payload));
+    for (const value of forbidden) assert.ok(!error.stdout.includes(value));
     const masks = error.stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
-    assert.ok(masks.every(line => !line.includes("!?") && !line.includes("%21%3F")));
+    assert.ok(masks.every(line => maskForbidden.every(value => !line.includes(value))));
     assert.ok(!error.stdout.includes('"stage":"tools"')); return true;
   });
   assert.equal(await readFile(output, "utf8"), "");
 });
 
-test("real resumed setup rejects restored composite credentials before launch or export", async t => {
+for (const variant of ["basic", "url"]) test(`real resumed setup rejects restored ${variant} credentials before launch or export`, async t => {
   const f = await fixture(t), repo = await repository(f);
   const payload = Buffer.from("user:!?").toString("base64");
-  const bad = JSON.stringify({ mcpServers: { fixture: { command: "node", env: { DEBUG: "1" },
-    headers: { Authorization: `Basic ${payload}` } } } });
+  const bad = JSON.stringify({ mcpServers: { fixture: variant === "basic" ? { command: "node", env: { DEBUG: "1" },
+    headers: { Authorization: `Basic ${payload}` } } : { type: "http", url: "https://user:%24xy@example.invalid/mcp" } } });
+  const forbidden = variant === "basic" ? ["user:!?", "user:%21%3F", payload] : ["$xy", "%24xy"];
+  const maskForbidden = variant === "basic" ? ["!?", "%21%3F", payload] : forbidden;
   await writeFile(join(repo.cwd, ".mcp.json"), bad);
   await repo.git("add", ".mcp.json"); await repo.git("commit", "-m", "Configure fixture"); await repo.git("push", "origin", "HEAD");
   await history(f);
@@ -669,11 +742,12 @@ with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
       if (line.startsWith("::error::") && line.includes('"event":"runtime.failed"')) { assert.equal(depth, 0); failure = JSON.parse(line.slice(line.indexOf("{"))); }
     }
     assert.equal(contexts, 1); assert.equal(failure.reason, "invalid_configured_credential");
-    assert.equal(failure.stage, "configuration"); assert.equal(failure.source, ".mcp.json"); assert.equal(failure.field, "basic_password");
+    assert.equal(failure.stage, "configuration"); assert.equal(failure.source, ".mcp.json");
+    assert.equal(failure.field, variant === "basic" ? "basic_password" : "url_credential");
     assert.equal(failure.run_id, "20"); assert.equal(failure.run_attempt, "1");
-    assert.doesNotMatch(error.stdout, /user:!\?|user:%21%3F/); assert.ok(!error.stdout.includes(payload));
+    for (const value of forbidden) assert.ok(!error.stdout.includes(value));
     const masks = error.stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
-    assert.ok(masks.every(line => !line.includes("!?") && !line.includes("%21%3F")));
+    assert.ok(masks.every(line => maskForbidden.every(value => !line.includes(value))));
     assert.ok(!error.stdout.includes('"stage":"tools"')); return true;
   });
   assert.equal(await readFile(output, "utf8"), "");

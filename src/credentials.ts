@@ -15,6 +15,12 @@ function isEnvironmentReference(value: string) {
   return /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\})$/.test(value.trim());
 }
 
+function decodeUrlUserinfo(value: string) {
+  // Preserve literal userinfo "+" and "&" while applying URL percent decoding.
+  const encoded = value.replace(/[+&]/g, character => character === "+" ? "%2B" : "%26");
+  return new URLSearchParams(`value=${encoded}`).get("value")!;
+}
+
 function looksLikeCredential(value: string) {
   return /^(?:sk-(?:ant-|proj-|svcacct-)?[A-Za-z0-9_-]{12,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]+|npm_[A-Za-z0-9]+|pypi-[A-Za-z0-9_-]+|hf_[A-Za-z0-9]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.test(value);
 }
@@ -59,23 +65,27 @@ function protectUrl(value: string, log: Diagnostics, source: string) {
   let url: URL;
   try { url = new URL(value); } catch { return; }
   const credentials: { decoded: string; encoded: string }[] = [], composite: string[] = [];
-  const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@]*)@/i.exec(value)?.[1];
-  if (userinfo?.includes(":")) {
-    let password = url.password, combined = userinfo;
-    try { password = decodeURIComponent(password); combined = decodeURIComponent(userinfo); } catch {}
-    if (!isEnvironmentReference(password)) { credentials.push({ decoded: password, encoded: userinfo.slice(userinfo.indexOf(":") + 1) }); composite.push(combined); }
-  } else if (userinfo) {
-    let token = userinfo;
-    try { token = decodeURIComponent(userinfo); } catch {}
-    if (!isEnvironmentReference(token)) credentials.push({ decoded: token, encoded: userinfo });
+  const input = value.replace(/[\t\n\r]/g, "").trim(), remainder = input.slice(input.indexOf(":") + 1);
+  const special = /^(?:ftp|https?|wss?):$/.test(url.protocol);
+  const authority = (special ? remainder.replace(/^[\\/]+/, "") : remainder.startsWith("//") ? remainder.slice(2) : "")
+    .split(special ? /[\\/?#]/ : /[/?#]/, 1)[0];
+  const at = authority.lastIndexOf("@"), userinfo = at >= 0 ? authority.slice(0, at) : "";
+  if (userinfo.includes(":") && !isEnvironmentReference(userinfo)) {
+    const encoded = userinfo.slice(userinfo.indexOf(":") + 1);
+    const password = decodeUrlUserinfo(url.password), combined = decodeUrlUserinfo(userinfo);
+    if (!isEnvironmentReference(encoded)) { credentials.push({ decoded: password, encoded }); composite.push(combined); }
+  } else if (userinfo && !isEnvironmentReference(userinfo)) {
+    const token = decodeUrlUserinfo(url.username);
+    credentials.push({ decoded: token, encoded: userinfo });
   }
   for (const part of url.search.slice(1).split("&")) {
     if (!part) continue;
     const entry = new URLSearchParams(part).entries().next().value;
     if (!entry) continue;
     const [key, item] = entry, separator = part.indexOf("=");
-    if (!isEnvironmentReference(item) && (isCredentialKey(key) || looksLikeCredential(item)))
-      credentials.push({ decoded: item, encoded: separator < 0 ? "" : part.slice(separator + 1) });
+    const encoded = separator < 0 ? "" : part.slice(separator + 1);
+    if (!isEnvironmentReference(encoded) && (isCredentialKey(key) || looksLikeCredential(item)))
+      credentials.push({ decoded: item, encoded });
   }
   for (const { decoded } of credentials) {
     if (trivialCredential(decoded)) throw new RunnerError("invalid_configured_credential", "configuration", "Replace the indicated configured credential.", { source, field: "url_credential" });
