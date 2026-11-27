@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { configure, installSkillSource, installUserInstructions } from '../.build/setup.js';
-import { logCodexActivity, runCodex } from '../.build/codex.js';
+import { logCodexActivity, logCodexError, runCodex } from '../.build/codex.js';
 import { TaskGit } from '../.build/git.js';
 import { drive } from '../.build/driver.js';
 import { durableCheckpoint, exportCheckpoint } from '../.build/checkpoint.js';
 import { restoreCheckpoint, validateCheckpoint } from '../.build/resume.js';
-import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, repository, tool } from './helpers.mjs';
+import { exec, checkpoint, fixture, logger, mcpProvider, message, provider, reasoning, repository, root, tool, updatePlan } from './helpers.mjs';
 
 const plan = 'Implement the supplied plan autonomously. Ask only when clarification is indispensable.';
 test('real Codex streams reads, edits and command failures without logging their output', async t => {
@@ -30,7 +30,7 @@ test('real Codex streams reads, edits and command failures without logging their
   assert.equal(commands[2].item_id, commands[3].item_id);
   assert.equal(commands[0].command_name, 'cat'); assert.equal(commands[2].command_name, 'printf');
   assert.equal(commands[1].exit_code, 0);
-  assert.equal(commands[3].exit_code, 7); assert.equal(commands[3].level, 'WARN');
+  assert.equal(commands[3].exit_code, 7); assert.equal(commands[3].level, 'INFO');
   const edits = records.filter(record => record.item_type === 'file_change');
   assert.deepEqual(edits.map(record => record.phase), ['started', 'completed']);
   assert.equal(edits[0].item_id, edits[1].item_id);
@@ -43,6 +43,262 @@ test('real Codex streams reads, edits and command failures without logging their
   }
   const logged = JSON.stringify(records);
   assert.doesNotMatch(logged, /Fixture repository|private-tool-output-9158|private-patch-content-7281|private-agent-message-1682|private-task-prompt-4197|private-inline-task-content-3982|fixture-api-credential-9374/);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('README.md')));
+  assert.doesNotMatch(f.lines.join('\n'), /private-tool-output-9158|private-inline-task-content-3982|fixture-api-credential-9374/);
+});
+
+test('real Codex suppresses patch bodies for a quoted outside directory', async t => {
+  const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'outside directory');
+  await mkdir(outside);
+  await writeFile(join(outside, 'config.txt'), 'old-unregistered-secret-5724\n');
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n@@\n-old-unregistered-secret-5724\n+new-unregistered-secret-5724\n*** End Patch';
+  const api = await provider(t, [[tool(`cd '${outside}' && apply_patch <<'PATCH'\n${patch}\nPATCH`, 'outside-edit')], [message('Finished outside edit.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Apply the fixture change.', f.log, 60000, 'outside');
+  assert.equal(await readFile(join(outside, 'config.txt'), 'utf8'), 'new-unregistered-secret-5724\n');
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('<outside-workspace>')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-5724|new-unregistered-secret-5724/);
+});
+
+test('real Codex suppresses a patch moved into a sensitive file', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, 'config.txt'), 'old-unregistered-secret-6249\n');
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n*** Move to: .env\n@@\n-old-unregistered-secret-6249\n+new-unregistered-secret-6249\n*** End Patch';
+  const api = await provider(t, [[tool(`cd . && apply_patch <<'PATCH'\n${patch}\nPATCH`, 'move-edit')], [message('Finished moving the file.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Move the fixture file.', f.log, 60000, 'sensitive-move');
+  assert.equal(await readFile(join(r.cwd, '.env'), 'utf8'), 'new-unregistered-secret-6249\n');
+  assert.ok(f.lines.some(line => line.includes('[edit]')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-6249|new-unregistered-secret-6249/);
+});
+
+test('real Codex withholds Docker authentication configuration diffs', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const oldAuth = Buffer.from('fixture-user:old-registry-password-7412').toString('base64');
+  const newAuth = Buffer.from('fixture-user:new-registry-password-7412').toString('base64');
+  const before = JSON.stringify({ auths: { 'registry.invalid': { auth: oldAuth } } });
+  const after = JSON.stringify({ auths: { 'registry.invalid': { auth: newAuth } } });
+  await mkdir(join(r.cwd, '.docker'));
+  await writeFile(join(r.cwd, '.docker/config.json'), before + '\n');
+  const patch = `*** Begin Patch\n*** Update File: .docker/config.json\n@@\n-${before}\n+${after}\n*** End Patch`;
+  const api = await provider(t, [[tool(`apply_patch <<'PATCH'\n${patch}\nPATCH`, 'docker-edit')], [message('Docker fixture updated.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Update the fixture.', f.log, 60000, 'docker-config');
+  assert.equal(await readFile(join(r.cwd, '.docker/config.json'), 'utf8'), after + '\n');
+  assert.ok(!f.log.protectedValues.includes(oldAuth)); assert.ok(!f.log.protectedValues.includes(newAuth));
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('sensitive file')));
+  assert.ok(!f.lines.join('\n').includes(oldAuth)); assert.ok(!f.lines.join('\n').includes(newAuth));
+});
+
+test('real Codex suppresses a moved symlink diff after its sensitive target becomes unobservable', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-4398\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const patch = '*** Begin Patch\n*** Update File: settings\n*** Move to: config.txt\n@@\n-old-unregistered-secret-4398\n+new-unregistered-secret-4398\n*** End Patch';
+  const command = `/bin/bash -c "cd . && apply_patch <<'PATCH'\n${patch}\nPATCH"`;
+  const api = await provider(t, [[tool(command, 'symlink-move')], [message('Finished moving the file.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Move the fixture file.', f.log, 60000, 'symlink-move');
+  assert.equal(await readFile(join(r.cwd, 'config.txt'), 'utf8'), 'new-unregistered-secret-4398\n');
+  await assert.rejects(readFile(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('working directory unknown')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-4398|new-unregistered-secret-4398/);
+});
+
+test('Codex command events suppress the diff after a real symlink move', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-4398\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  const binary = join(f.temporary, 'apply_patch'); await symlink(native, binary);
+  const patch = '*** Begin Patch\n*** Update File: settings\n*** Move to: config.txt\n@@\n-old-unregistered-secret-4398\n+new-unregistered-secret-4398\n*** End Patch';
+  const { stdout } = await exec(binary, [patch], { cwd: r.cwd, env: f.job.env });
+  assert.equal(await readFile(join(r.cwd, 'config.txt'), 'utf8'), 'new-unregistered-secret-4398\n');
+  await assert.rejects(readFile(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  const event = { type: 'item.completed', item: { id: 'symlink-move', type: 'command_execution', status: 'completed', exit_code: 0,
+    command: `apply_patch <<'PATCH'\n${patch}\nPATCH`, aggregated_output: stdout } };
+  logCodexActivity(f.log, event, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('original source path unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-4398|new-unregistered-secret-4398/);
+});
+
+test('Codex command events suppress an expanded external patch target', async t => {
+  const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'external.txt');
+  await writeFile(outside, 'old-unregistered-secret-5267\n');
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: $TARGET\n@@\n-old-unregistered-secret-5267\n+new-unregistered-secret-5267\n*** End Patch';
+  const command = `apply_patch <<PATCH\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd,
+    env: { ...f.job.env, TARGET: outside, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.equal(await readFile(outside, 'utf8'), 'new-unregistered-secret-5267\n');
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'expanded', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('shell expansion unresolved')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-5267|new-unregistered-secret-5267/);
+});
+
+test('Codex command events suppress diffs when a patch leaves a dangling symlink', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-3926\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  const binary = join(f.temporary, 'apply_patch'); await symlink(native, binary);
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-3926\n+new-unregistered-secret-3926\n*** Delete File: .env\n*** End Patch';
+  const { stdout } = await exec(binary, [patch], { cwd: r.cwd, env: f.job.env });
+  assert.ok((await lstat(join(r.cwd, 'settings'))).isSymbolicLink());
+  await assert.rejects(readFile(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'dangling', type: 'command_execution', status: 'completed',
+    exit_code: 0, command: `apply_patch <<'PATCH'\n${patch}\nPATCH`, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('<outside-workspace>')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-3926|new-unregistered-secret-3926/);
+});
+
+test('Codex command events suppress update diffs when the patched alias is deleted', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-3726\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  const binary = join(f.temporary, 'apply_patch'); await symlink(native, binary);
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-3726\n+new-unregistered-secret-3726\n*** Delete File: settings\n*** End Patch';
+  const { stdout } = await exec(binary, [patch], { cwd: r.cwd, env: f.job.env });
+  await assert.rejects(lstat(join(r.cwd, 'settings')), { code: 'ENOENT' });
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'deleted-alias', type: 'command_execution', status: 'completed',
+    exit_code: 0, command: `apply_patch <<'PATCH'\n${patch}\nPATCH`, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('post-patch state unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-3726|new-unregistered-secret-3726/);
+});
+
+test('Codex command events suppress diffs after the patched alias is replaced', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-2983\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-2983\n+new-unregistered-secret-2983\n*** End Patch';
+  const command = `apply_patch <<'PATCH' && rm settings && printf ordinary > settings\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env: { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.ok((await lstat(join(r.cwd, 'settings'))).isFile());
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'replaced-alias', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('post-patch state unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-2983|new-unregistered-secret-2983/);
+});
+
+test('Codex command events suppress diffs after process substitution replaces the alias', async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, '.env'), 'old-unregistered-secret-9183\n');
+  await symlink('.env', join(r.cwd, 'settings'));
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: settings\n@@\n-old-unregistered-secret-9183\n+new-unregistered-secret-9183\n*** End Patch';
+  const command = `apply_patch <<'PATCH' > >(python3 -c 'import os,sys; sys.stdin.read(); os.unlink("settings"); open("settings","w").write("ordinary")')\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env: { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.ok((await lstat(join(r.cwd, 'settings'))).isFile());
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'substitution', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('post-patch state unverified')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-9183|new-unregistered-secret-9183/);
+});
+
+test('Codex command events do not report skipped or failed background patches as applied', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: README.md\n@@\n-missing fixture content\n+replacement\n*** End Patch';
+  const env = { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` };
+  for (const command of [`true || apply_patch <<'PATCH'\n${patch}\nPATCH`, `apply_patch <<'PATCH' &\n${patch}\nPATCH`]) {
+    const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env });
+    logCodexActivity(f.log, { type: 'item.completed', item: { id: 'not-applied', type: 'command_execution', status: 'completed',
+      exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  }
+  assert.equal(await readFile(join(r.cwd, 'README.md'), 'utf8'), 'Fixture repository\n');
+  assert.ok(!f.lines.some(line => line.includes('[edit]')));
+});
+
+test('Codex command events report a successful patch after an independent condition', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: README.md\n@@\n-Fixture repository\n+Updated fixture\n*** End Patch';
+  const command = `false || true; apply_patch <<'PATCH'\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd, env: { ...f.job.env, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.equal(await readFile(join(r.cwd, 'README.md'), 'utf8'), 'Updated fixture\n');
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'applied', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('README.md')));
+  assert.ok(f.lines.some(line => line.includes('+Updated fixture')));
+});
+
+test('Codex command events suppress patch diffs after option-only cd', async t => {
+  const f = await fixture(t), r = await repository(f), outside = join(f.temporary, 'home');
+  await mkdir(outside); await writeFile(join(outside, 'config.txt'), 'old-unregistered-secret-1948\n');
+  const triple = process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
+  const native = join(root, 'node_modules', '@openai', `codex-linux-${process.arch}`, 'vendor', triple, 'bin', 'codex');
+  await symlink(native, join(f.temporary, 'apply_patch'));
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n@@\n-old-unregistered-secret-1948\n+new-unregistered-secret-1948\n*** End Patch';
+  const command = `cd -P && apply_patch <<'PATCH'\n${patch}\nPATCH`;
+  const { stdout } = await exec('/bin/bash', ['-c', command], { cwd: r.cwd,
+    env: { ...f.job.env, HOME: outside, PATH: `${f.temporary}:${f.job.env.PATH}` } });
+  assert.equal(await readFile(join(outside, 'config.txt'), 'utf8'), 'new-unregistered-secret-1948\n');
+  logCodexActivity(f.log, { type: 'item.completed', item: { id: 'option-cd', type: 'command_execution', status: 'completed',
+    exit_code: 0, command, aggregated_output: stdout } }, 'fixture-session', r.cwd);
+  assert.ok(f.lines.some(line => line.includes('[edit]') && line.includes('working directory unknown')));
+  assert.doesNotMatch(f.lines.join('\n'), /old-unregistered-secret-1948|new-unregistered-secret-1948/);
+});
+
+test('Codex identity failures retain the conflicting session ID', async t => {
+  const f = await fixture(t), r = await repository(f), binary = join(f.job.tools, 'node_modules/.bin/codex');
+  const expected = 'expected-session-1428', observed = 'observed-session-2428';
+  for (const exit of [0, 1]) {
+    await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' '{"type":"thread.started","thread_id":"${observed}"}' '{"type":"turn.completed"}'\nexit ${exit}\n`, { mode: 0o700 });
+    await assert.rejects(runCodex(f.job, r.cwd, 'Continue the fixture.', f.log, 60000, `identity-${exit}`, expected), error => {
+      assert.equal(error.reason, exit ? 'command_failed' : 'conversation_identity_changed');
+      assert.equal(error.details.expected_session, expected); assert.equal(error.details.observed_session, observed);
+      f.log.failure(error); return true;
+    });
+    const failure = f.records.at(-1);
+    assert.equal(failure.expected_session, expected); assert.equal(failure.observed_session, observed);
+  }
+});
+
+test('Codex command events suppress move diffs for sensitive destinations', () => {
+  const { log, lines } = logger();
+  const patch = '*** Begin Patch\n*** Update File: config.txt\n*** Move to: .env\n@@\n-old-unregistered-secret-6249\n+new-unregistered-secret-6249\n*** End Patch';
+  const event = { type: 'item.completed', item: { id: 'move-edit', type: 'command_execution', status: 'completed', exit_code: 0,
+    command: `cd . && apply_patch <<'PATCH'\n${patch}\nPATCH` } };
+  logCodexActivity(log, event, 'session-1', process.cwd());
+  assert.ok(lines.some(line => line.includes('[edit]') && line.includes('sensitive file')));
+  assert.doesNotMatch(lines.join('\n'), /old-unregistered-secret-6249|new-unregistered-secret-6249/);
+});
+
+test('real Codex folds reasoning while keeping the final reply in the result', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const api = await provider(t, [[reasoning('Inspect the fixture first.'),
+    updatePlan([{ step: 'Inspect the fixture', status: 'in_progress' }])], [message('Final fixture response.')]]);
+  await configure(f.job, api.config, f.log);
+  const result = await runCodex(f.job, r.cwd, 'Inspect the fixture.', f.log, 60000, 'readable');
+  assert.equal(result.result.trim(), 'Final fixture response.');
+  assert.ok(f.timeline.some(entry => entry.level === 'group' && entry.line === 'Thinking'));
+  assert.ok(f.lines.some(line => line.includes('Inspect the fixture first.')));
+  assert.doesNotMatch(f.lines.join('\n'), /Final fixture response\./);
+});
+
+test('Codex todo-list updates render the current plan', () => {
+  const { log, timeline, lines } = logger();
+  logCodexActivity(log, { type: 'item.updated', item: { id: 'plan-1', type: 'todo_list',
+    items: [{ text: 'Inspect the fixture', completed: false }, { text: 'Apply the change', completed: true }] } }, 'session-1', process.cwd());
+  assert.ok(timeline.some(entry => entry.level === 'group' && entry.line === 'Plan'));
+  assert.ok(lines.some(line => line.includes('[ ] Inspect the fixture')));
+  assert.ok(lines.some(line => line.includes('[x] Apply the change')));
 });
 test('native activity logs allowlisted metadata with bounded changes and no argument bodies', () => {
   const { log, records } = logger();
@@ -58,7 +314,7 @@ test('native activity logs allowlisted metadata with bounded changes and no argu
     item('file_change', { changes: [{ path: 'repo/private-path-fragment/' + 'x'.repeat(1000), kind: 'update' }], status: 'completed' }),
     item('file_change', { changes: Array.from({ length: 105 }, (_, index) => ({ path: `file-${index}`, kind: 'update', diff: 'private-diff' })), status: 'completed' }),
   ]) logCodexActivity(log, event, 'session-1');
-  assert.equal(records.length, 8); assert.equal(records[0].level, 'WARN');
+  assert.equal(records.length, 8); assert.equal(records[0].level, 'INFO');
   assert.equal(records[0].server, 'github'); assert.equal(records[0].tool, 'get_issue');
   assert.deepEqual(records[1].receiver_thread_ids, ['child-session']); assert.equal(records[1].tool, 'spawn_agent');
   assert.equal(records[2].action, 'search'); assert.equal(records[3].command_name, 'cat');
@@ -68,6 +324,28 @@ test('native activity logs allowlisted metadata with bounded changes and no argu
   for (const type of ['agent_message', 'reasoning', 'todo_list', 'error', 'unknown']) logCodexActivity(log, item(type, { text: 'private-text' }), 'session-1');
   logCodexActivity(log, { type: 'item.updated', item: { id: 'item-1', type: 'command_execution', command: 'private-update' } }, 'session-1');
   assert.equal(records.length, 8); assert.doesNotMatch(JSON.stringify(records), /private-/);
+});
+
+test('Codex error events use strict provider sanitization before logging', () => {
+  const { log, records } = logger();
+  log.protect('fixture-provider-secret-9257');
+  logCodexError(log, { type: 'error', message: 'HTTP 403 {"body":"private-provider-body-5891"}' });
+  logCodexError(log, { type: 'item.completed', item: { type: 'error', text: '{"token":"fixture-provider-secret-9257"}' } }, 'session-1');
+  assert.equal(records.length, 2);
+  assert.ok(records.every(record => record.event === 'runtime.provider' && record.level === 'ERROR'));
+  assert.equal(records[1].session_id, 'session-1');
+  assert.doesNotMatch(JSON.stringify(records), /private-provider-body-5891|fixture-provider-secret-9257/);
+});
+
+test('real Codex counts unparsed stdout without logging the raw line', async t => {
+  const f = await fixture(t), r = await repository(f);
+  const binary = join(f.job.tools, 'node_modules/.bin/codex');
+  await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' 'unparsed-native-line-8192'\nexec '${join(root, 'node_modules/.bin/codex')}' "$@"\n`, { mode: 0o700 });
+  const api = await provider(t, [[message('Native stream complete.')]]);
+  await configure(f.job, api.config, f.log);
+  await runCodex(f.job, r.cwd, 'Finish the fixture.', f.log, 60000, 'unparsed');
+  assert.ok(f.records.some(record => record.event === 'runtime.native_stream' && record.unparsed_stdout_lines === 1));
+  assert.doesNotMatch(f.lines.join('\n'), /unparsed-native-line-8192/);
 });
 async function driver(f, r, overrides = {}) {
   const git = new TaskGit(r.cwd, f.job.env, f.log), exports = []; let last = null, state;
@@ -258,7 +536,7 @@ for (const rejected of [false, true]) test(`native conversation is saved with ${
     assert.notEqual(await observed.git.head(), r.base);
     assert.equal(await observed.git.remoteHead(), r.base);
     const failed = f.records.find(record => record.event === 'runtime.tool' && record.command_name === 'git' && record.status === 'failed');
-    assert.equal(failed?.level, 'WARN');
+    assert.equal(failed?.level, 'INFO');
     assert.equal(failed.exit_code, 1);
     assert.equal(failed.session_id, observed.result.session);
   }
@@ -351,21 +629,33 @@ test('native terminal completion does not await a stalled periodic upload', asyn
 test('the actual snapshot loop repeatedly captures a running native conversation', async t => {
   const { watchSnapshots } = await import('../.build/checkpoint-worker.js');
   const { rename } = await import('node:fs/promises');
-  const f = await fixture(t), r = await repository(f);
-  const api = await provider(t, [[(await import('./helpers.mjs')).tool('sleep 2')], [message('Completed after periodic persistence.')]]);
+  const f = await fixture(t), r = await repository(f), captures = [];
+  let releaseCaptures;
+  const capturesReady = new Promise(resolve => { releaseCaptures = resolve; });
+  const api = await provider(t, async (_body, count) => {
+    if (count === 1) return [tool('sleep 1')];
+    if (count === 2) {
+      let timer;
+      await Promise.race([capturesReady, new Promise(resolve => { timer = setTimeout(resolve, 15000); })]);
+      clearTimeout(timer);
+      return [message('Completed after periodic persistence.')];
+    }
+  });
   await configure(f.job, api.config, f.log);
   const saved = { job: f.job, metadata: checkpoint({ workspace: r.cwd, session_id: '' }), secrets: f.log.protectedValues, response: '', latest: null };
-  const path = join(f.job.root, 'state.json'); let writes = Promise.resolve(); const captures = [];
+  const path = join(f.job.root, 'state.json'); let writes = Promise.resolve();
   const persist = () => writes = writes.then(async () => { await writeFile(path + '.tmp', JSON.stringify(saved)); await rename(path + '.tmp', path); });
   await persist();
   const watcher = watchSnapshots(path, { intervalMs: 50, api: async () => ({ artifacts: [] }), upload: async (job, name, files, root) => {
-    captures.push(JSON.parse(await readFile(join(root, 'manifest.json')))); return { id: captures.length };
+    captures.push(JSON.parse(await readFile(join(root, 'manifest.json'))));
+    if (captures.length === 2) releaseCaptures();
+    return { id: captures.length };
   } });
-  await drive({ job: f.job, cwd: r.cwd, log: f.log, plan, state: async value => {
+  const result = await drive({ job: f.job, cwd: r.cwd, log: f.log, plan, state: async value => {
     if (value.session) saved.metadata.session_id = value.session; if (value.control) saved.control = value.control;
     saved.metadata.outcome = value.outcome; await persist();
   } });
-  await watcher; assert.ok(captures.length >= 2);
+  await watcher; assert.equal(result.outcome, 'completed'); assert.ok(captures.length >= 2);
   assert.ok(captures.every(value => value.outcome === 'running' && value.session_id === saved.metadata.session_id));
   assert.ok(captures.at(-1).sequence > captures[0].sequence);
 });

@@ -12,9 +12,18 @@ import { hash, versions, projectStorageKey } from "../.build/contracts.js";
 export const root = resolve(import.meta.dirname, "..");
 export const exec = promisify(execFile);
 export function logger() {
-  const records = [];
-  const sink = Object.fromEntries(["info", "warning", "error", "debug"].map((key) => [key, (line) => records.push(JSON.parse(line))]));
-  return { log: new Diagnostics({ task_id: "fixture-task", run_id: "13", run_attempt: "1" }, sink), records };
+  const records = [], timeline = [], lines = [], warnings = [];
+  const sink = Object.fromEntries(["info", "warning", "error", "debug"].map((level) => [level, (value) => {
+    const line = String(value);
+    lines.push(line);
+    timeline.push({ level, line });
+    if (level === "warning") warnings.push(line);
+    try { records.push(JSON.parse(line.startsWith("│ ") ? line.slice(2) : line)); } catch {}
+  }]));
+  sink.startGroup = title => timeline.push({ level: "group", line: title });
+  sink.endGroup = () => timeline.push({ level: "endgroup", line: "" });
+  sink.setSecret = () => {};
+  return { log: new Diagnostics({ task_id: "fixture-task", run_id: "13", run_attempt: "1" }, sink), records, timeline, lines, warnings };
 }
 export async function fixture(t, runner = "codex") {
   const temporary = await mkdtemp(join(tmpdir(), "codex-runtime-test-"));
@@ -32,7 +41,7 @@ export async function fixture(t, runner = "codex") {
     ".agents/skills/unwanted/SKILL.md": "---\nname: unwanted-host-sentinel-3719\ndescription: Host sentinel\n---\nNever load this host skill.\n",
   };
   for (const [name, content] of Object.entries(hostFiles)) await writeFile(join(host, name), content);
-  const { log, records } = logger();
+  const { log, records, timeline, lines, warnings } = logger();
   const job = await createJob(temporary, "fixture-api-credential-9374", "fixture-github-credential-6241", "Fixture Author", "fixture@example.invalid",
     { ...process.env, HOME: host, CODEX_HOME: join(host, ".codex"), CLAUDE_CONFIG_DIR: join(host, ".claude") }, runner);
   if (runner === "claude") job.env.CLAUDE_CODE_PROJECT_DIR_NAME = projectStorageKey('fixture/repo', '13');
@@ -42,7 +51,7 @@ export async function fixture(t, runner = "codex") {
   for (const binary of ["codex", "skills"]) {
     await writeFile(join(job.tools, "node_modules/.bin", binary), `#!/bin/sh\nexec '${join(root, "node_modules/.bin", binary)}' "$@"\n`, { mode: 0o700 });
   }
-  return { temporary, job, log, records, host, hostFiles };
+  return { temporary, job, log, records, timeline, lines, warnings, host, hostFiles };
 }
 export async function repository(f) {
   const cwd = join(f.temporary, "repo"), remote = join(f.temporary, "remote.git");
@@ -63,6 +72,12 @@ export const turn = (kind, extra = {}) => ({ kind, summary: "Fixture accomplishm
 export const policy = { checks: ["CI"], reviewers: [], local_checks: ["node --check greeting.js"], marked_review_count: 0 };
 export function message(text, id = "m1") {
   return { type: "response.output_item.done", item: { type: "message", role: "assistant", id, content: [{ type: "output_text", text: typeof text === "string" ? text : JSON.stringify(text) }] } };
+}
+export function reasoning(text, id = "reasoning-1") {
+  return { type: "response.output_item.done", item: { type: "reasoning", id, summary: [{ type: "summary_text", text }] } };
+}
+export function updatePlan(plan, id = "plan-1") {
+  return { type: "response.output_item.done", item: { type: "function_call", call_id: id, name: "update_plan", arguments: JSON.stringify({ plan }) } };
 }
 export function tool(cmd, id = "call1") {
   return { type: "response.output_item.done", item: { type: "function_call", call_id: id, name: "exec_command", arguments: JSON.stringify({ cmd, login: false, yield_time_ms: 1000, max_output_tokens: 1000 }) } };

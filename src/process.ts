@@ -10,7 +10,7 @@ import { Diagnostics } from "./diagnostics.js";
 export type ProcessControl = { directory: string; nonce: string; freeze<T>(copy: () => Promise<T>): Promise<T> };
 export type CommandOptions = { cwd: string; env: NodeJS.ProcessEnv; stage: string; log?: Diagnostics; timeoutMs?: number;
   onControl?: (control: ProcessControl) => void; stdin?: string; onLine?: (line: string) => void; stdoutFile?: string; collect?: boolean; diagnosticStdout?: boolean; context?: Record<string, unknown>;
-  nativeSessionUnfinished?: () => boolean };
+  nativeSessionUnfinished?: () => boolean; rejectStderr?: boolean };
 export async function command(executable: string, args: string[], options: CommandOptions) {
   if (options.env.REMOTE_DEV_TASK_CANCELLED === "1") throw new RunnerError("command_cancelled", options.stage, "Task cancellation is latched; no new operation was started.");
   const started = Date.now();
@@ -22,18 +22,22 @@ export async function command(executable: string, args: string[], options: Comma
   const child = spawn("python3", [join(import.meta.dirname, "supervise.py"), receiptPath, nonce, executable, ...args],
     { cwd: options.cwd, env: options.env, detached: true, stdio: ["pipe", fd ?? "pipe", "pipe"] });
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
-  let stdout = "", stderr = "", pending = "", timeout = false, overflow = false, cancelled = false;
+  let stdout = "", stderr = "", pending = "", timeout = false, overflow = false, cancelled = false, lastActivityAt = started;
   const signal = (kind: NodeJS.Signals) => { child.kill(kind); };
   const cancel = () => { cancelled = true; signal("SIGTERM"); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
-  const heartbeat = setInterval(() => options.log?.event("runtime.heartbeat", "INFO", {
-    stage: options.stage, ...options.context, elapsed_ms: Date.now() - started, timeout_ms: timeoutMs,
-  }), 60000);
+  const heartbeat = setInterval(() => {
+    const idle = Date.now() - lastActivityAt;
+    if (idle >= 60000) options.log?.event("runtime.heartbeat", "INFO", {
+      stage: options.stage, ...options.context, elapsed_ms: Date.now() - started, idle_ms: idle, timeout_ms: timeoutMs,
+    });
+  }, 60000);
   const timer = Number.isFinite(timeoutMs) ? setTimeout(() => { timeout = true; signal("SIGTERM"); }, timeoutMs) : undefined;
   const hardTimer = Number.isFinite(timeoutMs) ? setTimeout(() => signal("SIGKILL"), timeoutMs + 5000) : undefined;
   options.onControl?.(processControl(control, nonce));
   child.stdout?.setEncoding("utf8"); child.stderr?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
+    lastActivityAt = Date.now();
     if (options.collect !== false) { if (stdout.length + chunk.length <= 16 * 1024 * 1024) stdout += chunk; else overflow = true; }
     if (options.onLine) {
       pending += chunk;
@@ -45,7 +49,7 @@ export async function command(executable: string, args: string[], options: Comma
       if (pending.length > 1024 * 1024) { pending = ""; overflow = true; }
     }
   });
-  child.stderr?.on("data", (chunk: string) => { if (stderr.length < 65536) stderr += chunk.slice(0, 65536 - stderr.length); });
+  child.stderr?.on("data", (chunk: string) => { lastActivityAt = Date.now(); if (stderr.length < 65536) stderr += chunk.slice(0, 65536 - stderr.length); });
   child.stdin?.on("error", () => { /* Early CLI exit is reported by the process result. */ });
   child.stdin?.end(options.stdin);
   let code: number | null = null, spawnError: Error | undefined;
@@ -72,7 +76,7 @@ export async function command(executable: string, args: string[], options: Comma
       throw new RunnerError("native_worker_sigkill", options.stage, "SIGKILL interrupted the native session after it started. The supervisor confirmed all descendants exited.",
         { worker_exit_code: receipt.exit_code, exit_code: code, signal: "SIGKILL", quiescent: true, output_closed: drained, elapsed_ms: Date.now() - started });
     }
-    if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained) {
+    if (spawnError || code !== 0 || timeout || overflow || cancelled || !drained || options.rejectStderr && stderr.trim()) {
       let cause = spawnError?.message ?? stderr;
       if (options.diagnosticStdout) {
         cause = [cause, stdout].filter(Boolean).join("\n");

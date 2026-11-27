@@ -23,6 +23,6 @@ export function parseMcpServers(raw: string | undefined, source: "MCP_CONFIG_JSO
   let config: unknown;
   try { config = JSON.parse(raw); } catch { throw invalid(); }
   if (!object(config) || !object(config.mcpServers) || !Object.values(config.mcpServers).every(object)) throw invalid();
-  protectConfiguration({ mcpServers: config.mcpServers }, log);
+  protectConfiguration({ mcpServers: config.mcpServers }, log, "", source);
   return config.mcpServers;
 }

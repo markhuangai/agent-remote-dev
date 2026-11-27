@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
-import { chmod, cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, cp, lstat, mkdir, readFile, readdir, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createServer } from "node:http";
 import { zstdCompressSync } from "node:zlib";
 import test from "node:test";
-import { hash, skillSources } from "../.build/contracts.js";
+import { hash, RunnerError, skillSources } from "../.build/contracts.js";
 import { configure, fetchSkillSource, installTools, installSkillSource, safeTree, removeJob } from "../.build/setup.js";
 import { exportCheckpoint, durableCheckpoint, inspectCredentials } from "../.build/checkpoint.js";
 import { saveSnapshot, uploadSnapshot, watchSnapshots } from "../.build/checkpoint-worker.js";
 import { TaskGit } from "../.build/git.js";
 import { command } from "../.build/process.js";
+import { Diagnostics } from "../.build/diagnostics.js";
+import { SnapshotLogTailer } from "../.build/main.js";
+import { activityPath, boundedLines, parseApplyPatch, summarizeCommand } from "../.build/activity.js";
+import { restoreCheckpoint, validateCheckpoint } from "../.build/resume.js";
 import { exec, executionSource, checkpoint, sessionId, fixture, logger, portableSource, repository, root, skillTransport, lineage } from "./helpers.mjs";
 
 const plan = "Implement the fixture plan.\n";
@@ -282,6 +287,22 @@ test("non-secret environment flags permit export while configured MCP credential
   await writeFile(path,await readFile(path,"utf8")+JSON.stringify({type:"response_item",payload:{text:secret}})+"\n");
   await assert.rejects(exportCheckpoint(f.job,checkpoint({previous:{sequence:1,artifact_id:4,checkpoint_sha:"a".repeat(40)}}),f.log),{reason:"credential_in_checkpoint"});
 });
+test("undelimited MCP environment credentials are protected without rejecting ordinary settings", async t => {
+  const f = await fixture(t), secret = "fixture-postgres-password-6218";
+  const mcp = value => JSON.stringify({ mcpServers: { postgres: { command: "node", env: {
+    PGPASSWORD: value, MONKEY: "x", TOKENIZERS_PARALLELISM: "false", KEYBOARD: "us",
+  } } } });
+  await assert.rejects(configure(f.job, 'model="gpt-5.1"', f.log, mcp("x!")), { reason: "invalid_configured_credential" });
+  assert.ok(!f.log.protectedValues.includes("x!"));
+  await configure(f.job, 'model="gpt-5.1"', f.log, mcp(secret));
+  assert.ok(f.log.protectedValues.includes(secret));
+  for (const value of ["x", "false", "us"]) assert.ok(!f.log.protectedValues.includes(value));
+  f.log.line(`Fixture output: ${secret}`);
+  assert.doesNotMatch(f.lines.join("\n"), /fixture-postgres-password-6218/);
+  await history(f, secret);
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+  assert.throws(() => inspectCredentials(secret, f.log, "credential_in_result"), { reason: "credential_in_result" });
+});
 test("upload failures, missing sessions, drift and size limits never advance the last durable receipt", async (t) => {
   const f = await fixture(t); await history(f);
   await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log, 1), { reason: "checkpoint_size_limit" });
@@ -371,10 +392,743 @@ test("the real Actions logger retains required failure evidence after DEBUG filt
   assert.equal(evidence.stage,"checkpoint");assert.equal(evidence.expected_sha,"a".repeat(40));assert.equal(evidence.observed_sha,"b".repeat(40));assert.equal(evidence.last_durable_checkpoint.artifact_id,17);
 });
 
+test("explicit trivial credentials fail during configuration without registering their composite header", async t => {
+  const f = await fixture(t);
+  const password = "x!", payload = Buffer.from(`fixture-user:${password}`).toString("base64");
+  const config = `[mcp_servers.fixture]\nurl="https://example.invalid/mcp"\n[mcp_servers.fixture.http_headers]\nAuthorization="Basic ${payload}"\n`;
+  await assert.rejects(configure(f.job, config, f.log), error => {
+    assert.equal(error.reason, "invalid_configured_credential");
+    assert.equal(error.stage, "configuration");
+    assert.equal(error.details.source, "CODEX_CONFIG_TOML");
+    assert.equal(error.details.field, "basic_password");
+    return true;
+  });
+  assert.ok(!f.log.protectedValues.includes(password));
+  assert.ok(!f.log.protectedValues.includes(payload));
+  assert.ok(!f.log.protectedValues.includes(`Basic ${payload}`));
+  await assert.rejects(configure(f.job, '[mcp_servers.fixture.env]\nAPI_TOKEN="true"\n', f.log), { reason: "invalid_configured_credential" });
+  await assert.rejects(configure(f.job, '[mcp_servers.fixture]\nurl="https://example.invalid/?token=!?"\n', f.log), { reason: "invalid_configured_credential" });
+  await assert.rejects(configure(f.job, '[mcp_servers.fixture.http_headers]\nAuthorization="Bearer "\n', f.log), { reason: "invalid_configured_credential" });
+  await configure(f.job, '[mcp_servers.fixture.env]\nDEBUG="1"\n[mcp_servers.fixture.http_headers]\naccept="application/json"\n', f.log);
+});
+
+test("environment references and benign URL query values remain usable", async t => {
+  const f = await fixture(t);
+  const config = '[mcp_servers.fixture]\nurl="https://$MY_TOKEN@example.invalid/mcp?format=enabled&token=$MY_TOKEN"\n' +
+    'bearer_token_env_var="MY_TOKEN"\n[mcp_servers.fixture.env]\nTOKEN="$TK"\n' +
+    '[mcp_servers.fixture.env_http_headers]\nAuthorization="MY_TOKEN"\n';
+  await configure(f.job, config, f.log);
+  for (const value of ["$MY_TOKEN", "$TK", "MY_TOKEN", "enabled"]) assert.ok(!f.log.protectedValues.includes(value));
+  const token = "fixture-userinfo-token-6193";
+  await configure(f.job, `[mcp_servers.fixture]\nurl="https://${token}@example.invalid/mcp?format=enabled"\n`, f.log);
+  assert.ok(f.log.protectedValues.includes(token));
+  assert.ok(!f.log.protectedValues.includes("enabled"));
+  for (const reference of ["$MY_TOKEN", "${MY_TOKEN}", "${MY_TOKEN:-fallback}"]) {
+    for (const url of [`https://user:${reference}@example.invalid/mcp`, `https://${reference}@example.invalid/mcp`,
+      `https://example.invalid/mcp?token=${reference}`]) {
+      const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http", url } } });
+      await configure(f.job, 'model="fixture"', f.log, mcp);
+      assert.ok(!f.log.protectedValues.includes(reference));
+    }
+  }
+});
+
+test("credential headers in MCP command arguments are validated and protected", async t => {
+  const f = await fixture(t), secret = "fixture-header-password-7264";
+  for (const argument of [value => ["--header", `X-API-Key: ${value}`], value => ["-H", `X-API-Key: ${value}`],
+    value => [`--header=X-API-Key: ${value}`], value => [`-HX-API-Key: ${value}`]]) {
+    const mcp = value => JSON.stringify({ mcpServers: { fixture: { command: "curl", args: argument(value) } } });
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("x!")), { reason: "invalid_configured_credential" });
+    await configure(f.job, 'model="fixture"', f.log, mcp(secret));
+  }
+  assert.ok(f.log.protectedValues.includes(secret));
+  assert.ok(!f.log.protectedValues.includes("x!"));
+  await history(f, secret);
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
+test("authorization flags validate and protect every supported scheme payload", async t => {
+  const f = await fixture(t), secret = "fixture-scheme-token-8294";
+  const ordinary = JSON.stringify({ mcpServers: { fixture: { command: "curl", args: ["--label=Token abc", "--label=Bearer abc"] } } });
+  await configure(f.job, 'model="fixture"', f.log, ordinary);
+  assert.ok(!f.log.protectedValues.includes("abc"));
+  for (const scheme of ["Token", "Digest", "ApiKey"]) {
+    for (const args of [value => ["--authorization", `${scheme} ${value}`], value => [`--authorization=${scheme} ${value}`]]) {
+      const mcp = value => JSON.stringify({ mcpServers: { fixture: { command: "curl", args: args(value) } } });
+      await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("abc")), { reason: "invalid_configured_credential" });
+      assert.ok(!f.log.protectedValues.includes(`${scheme} abc`));
+      await configure(f.job, 'model="fixture"', f.log, mcp(secret));
+      assert.ok(f.log.protectedValues.includes(secret)); assert.ok(f.log.protectedValues.includes(`${scheme} ${secret}`));
+      assert.throws(() => inspectCredentials(secret, f.log, "credential_in_result"), { reason: "credential_in_result" });
+    }
+  }
+  await history(f, secret);
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
+test("decoded Basic passwords resembling environment references are treated as literals", async t => {
+  const f = await fixture(t);
+  const config = password => JSON.stringify({ mcpServers: { fixture: { type: "http", url: "https://example.invalid/mcp",
+    headers: { Authorization: `Basic ${Buffer.from(`user:${password}`).toString("base64")}` } } } });
+  const rejected = "$x", rejectedPayload = Buffer.from(`user:${rejected}`).toString("base64");
+  await assert.rejects(configure(f.job, 'model="fixture"', f.log, config(rejected)), { reason: "invalid_configured_credential" });
+  assert.ok(!f.log.protectedValues.includes(rejected)); assert.ok(!f.log.protectedValues.includes(rejectedPayload));
+  for (const password of ["$LocalPassword9284", "${TOKEN}"]) {
+    const pair = `user:${password}`, payload = Buffer.from(pair).toString("base64"), header = `Basic ${payload}`;
+    await configure(f.job, 'model="fixture"', f.log, config(password));
+    for (const value of [password, pair, payload, header]) {
+      assert.ok(f.log.protectedValues.includes(value));
+      assert.throws(() => inspectCredentials(value, f.log, "credential_in_result"), { reason: "credential_in_result" });
+    }
+    f.log.line(`Fixture output: ${password}`);
+    assert.ok(!f.lines.join("\n").includes(password));
+  }
+  await history(f, "$LocalPassword9284");
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
+test("URL-encoded configured credentials cannot pass checkpoint or result inspection", async t => {
+  const f = await fixture(t);
+  const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http",
+    url: "https://fixture:p%40%73sword@example.invalid/mcp?token=spaced%20%6bey" } } });
+  await configure(f.job, 'model="fixture"', f.log, mcp);
+  assert.ok(f.log.protectedValues.includes("p@ssword"));
+  assert.ok(f.log.protectedValues.includes("spaced key"));
+  await history(f, "fixture p%40%73sword");
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+  assert.throws(() => inspectCredentials("fixture spaced%20%6bey", f.log, "credential_in_result"), { reason: "credential_in_result" });
+});
+
+test("encoded URL credential literals that resemble references are validated and protected", async t => {
+  const f = await fixture(t);
+  const locations = [value => `https://user:${value}@example.invalid/mcp`, value => `https://${value}@example.invalid/mcp`,
+    value => `https://example.invalid/mcp?token=${value}`];
+  for (const [index, location] of locations.entries()) {
+    const mcp = value => JSON.stringify({ mcpServers: { fixture: { type: "http", url: location(value) } } });
+    const rejected = "$xy", encodedRejected = encodeURIComponent(rejected);
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp(encodedRejected)), error => {
+      assert.equal(error.reason, "invalid_configured_credential"); assert.equal(error.details.field, "url_credential"); return true;
+    });
+    assert.ok(!f.log.protectedValues.includes(rejected)); assert.ok(!f.log.protectedValues.includes(encodedRejected));
+    for (const secret of [`$LocalPassword${index}9284`, "$" + `{TOKEN${index}}`]) {
+      const encoded = encodeURIComponent(secret);
+      await configure(f.job, 'model="fixture"', f.log, mcp(encoded));
+      for (const form of [secret, encoded]) {
+        assert.ok(f.log.protectedValues.includes(form));
+        assert.throws(() => inspectCredentials(form, f.log, "credential_in_result"), { reason: "credential_in_result" });
+      }
+      f.log.line(`Fixture output: ${secret}`);
+      assert.ok(!f.lines.join("\n").includes(secret));
+    }
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("%61%")), { reason: "invalid_configured_credential" });
+    assert.ok(!f.log.protectedValues.includes("a%")); assert.ok(!f.log.protectedValues.includes("%61%"));
+    const mixed = `%24LongPassword${index}%ZZ`, decoded = `$LongPassword${index}%ZZ`;
+    await configure(f.job, 'model="fixture"', f.log, mcp(mixed));
+    assert.ok(f.log.protectedValues.includes(decoded)); assert.ok(f.log.protectedValues.includes(mixed));
+    assert.throws(() => inspectCredentials(decoded, f.log, "credential_in_result"), { reason: "credential_in_result" });
+  }
+  await history(f, "$LocalPassword09284");
+  await assert.rejects(exportCheckpoint(f.job, checkpoint(), f.log), { reason: "credential_in_checkpoint" });
+});
+
+test("URL userinfo decoding preserves literal plus signs and ampersands", async t => {
+  const f = await fixture(t);
+  const locations = [value => `https://user:${value}@example.invalid/mcp`, value => `https://${value}@example.invalid/mcp`];
+  for (const [index, location] of locations.entries()) {
+    const encoded = `long${index}+with&value%61%`, decoded = `long${index}+with&valuea%`, url = location(encoded);
+    const mcp = JSON.stringify({ mcpServers: { fixture: { type: "http", url } } });
+    await configure(f.job, 'model="fixture"', f.log, mcp);
+    assert.ok(f.log.protectedValues.includes(decoded));
+    assert.throws(() => inspectCredentials(decoded, f.log, "credential_in_result"), { reason: "credential_in_result" });
+  }
+});
+
+test("parsed URL authority credentials are protected across accepted authority spellings", async t => {
+  const f = await fixture(t);
+  const locations = [value => `https://name@realm:${value}@example.invalid/mcp`,
+    value => `https:/name:${value}@example.invalid/mcp`, value => `https:name:${value}@example.invalid/mcp`,
+    value => `https:\\\\name:${value}@example.invalid/mcp`, value => `custom://name@realm:${value}@example.invalid/mcp`];
+  for (const [index, location] of locations.entries()) {
+    const mcp = value => JSON.stringify({ mcpServers: { fixture: { type: "http", url: location(value) } } });
+    await assert.rejects(configure(f.job, 'model="fixture"', f.log, mcp("abc")), { reason: "invalid_configured_credential" });
+    const secret = `fixture-authority-password-${index}-9483`;
+    await configure(f.job, 'model="fixture"', f.log, mcp(secret));
+    assert.ok(f.log.protectedValues.includes(secret));
+    assert.throws(() => inspectCredentials(secret, f.log, "credential_in_result"), { reason: "credential_in_result" });
+  }
+});
+
+test("real Actions masking filters syntax lines and rejected composite credentials", async () => {
+  const diagnostics = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const credentials = JSON.stringify(new URL("../.build/credentials.js", import.meta.url).href);
+  const payload = Buffer.from("user:!?").toString("base64");
+  const script = `import {Diagnostics} from ${diagnostics}; import {protectConfiguration} from ${credentials};
+    const log = new Diagnostics({run_id:'13'});
+    for (const value of ['{}','Bearer','false','{\\n"token":"fixture-multiline-7281"\\n}']) log.protect(value);
+    for (const config of [{headers:{Authorization:'Basic ${payload}'}},{url:'https://user:%21%3F@example.invalid/mcp'},
+      {url:'https://user:%61%@example.invalid/mcp'}]) {
+      try { protectConfiguration(config, log, '', 'MCP_CONFIG_JSON'); } catch (error) { log.failure(error); }
+    }`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
+  const masks = stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
+  assert.ok(!masks.some(line => /^::add-mask::(?:\{|\}|Bearer|false)$/.test(line)));
+  assert.ok(!stdout.includes(payload));
+  assert.ok(!stdout.includes("user:%21%3F"));
+  assert.ok(!stdout.includes("user:%61%"));
+  assert.equal(stdout.split('"reason":"invalid_configured_credential"').length - 1, 3);
+});
+
+test("multiline JSON configuration warns through the real Actions logger", async t => {
+  const f = await fixture(t), main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import {main} from ${main}; await main({github:{}});`;
+  const env = { ...process.env, REMOTE_DEV_RUNNER: "claude", REMOTE_DEV_GITHUB_TOKEN: "fixture-github-token-9382",
+    ANTHROPIC_API_KEY: "fixture-claude-key-9382", CLAUDE_SETTINGS_JSON: '{\n"model":"fixture"\n}',
+    MCP_CONFIG_JSON: '{\n"mcpServers":{}\n}', GITHUB_WORKSPACE: join(f.temporary, "missing"), GITHUB_RUN_ID: "13", GITHUB_RUN_ATTEMPT: "1" };
+  await assert.rejects(exec(process.execPath, ["--input-type=module", "-e", script], { env }), error => {
+    const warnings = error.stdout.split("\n").filter(line => line.startsWith("::warning::") && line.includes('"reason":"multiline_json_secret_masking_risk"'));
+    assert.equal(warnings.length, 2);
+    assert.ok(warnings.some(line => line.includes('"source":"CLAUDE_SETTINGS_JSON"')));
+    assert.ok(warnings.some(line => line.includes('"source":"MCP_CONFIG_JSON"')));
+    return true;
+  });
+});
+
+test("code-safe redaction preserves routes and removes credential patterns before truncation", () => {
+  const { log } = logger();
+  log.setWorkspace("/tmp/fixture-workspace");
+  const secret = 'fixture-"escaped\\secret-7219';
+  log.protect(secret);
+  const source = 'const routes = ["/v1/messages", "/health"]; const config = { enabled: true };';
+  assert.equal(log.redact(source), source);
+  assert.equal(log.redact('Bearer authenticationHeader'), 'Bearer authenticationHeader');
+  assert.equal(log.redact('Basic YWJjZGVmZ2hpamtsbW4='), 'Basic [redacted]');
+  assert.match(log.redact('https://user:password@example.invalid/mcp?token=fixture'), /^https:\/\/example\.invalid\/mcp$/);
+  assert.ok(!log.redact(JSON.stringify(secret)).includes('escaped'));
+  assert.ok(!log.redact(encodeURIComponent(secret)).includes('escaped'));
+  assert.equal(log.redact('/tmp/fixture-workspace/src/file.ts'), 'src/file.ts');
+  assert.equal(log.redact('/tmp/another-root/file.ts'), '<outside-workspace>');
+  for (const value of ['sk-ant-abcdefghijklmnop', 'ghp_abcdefghijklmnop', 'eyJabcdefghijk.abcdefghijklmnop.signature']) {
+    assert.equal(log.redact(value), '[redacted]');
+  }
+  const body = 'A'.repeat(64);
+  assert.doesNotMatch(log.redact(`-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----`), /AAAA/);
+  assert.doesNotMatch(log.redact(`+${body}\n+-----END PRIVATE KEY-----`), /AAAA/);
+  const longLine = 'x'.repeat(4090) + secret + 'z'.repeat(100);
+  assert.deepEqual(boundedLines(log.redact(longLine)), ['[oversized line omitted]']);
+});
+
+test("resume validates the restored repository configuration before importing native state", async t => {
+  const f = await fixture(t), repo = await repository(f);
+  const bad = JSON.stringify({ mcpServers: { fixture: { type: "http", url: "https://example.invalid/mcp",
+    headers: { Authorization: `Basic ${Buffer.from("user:!?").toString("base64")}` } } } });
+  await writeFile(join(repo.cwd, ".mcp.json"), bad);
+  await repo.git("add", ".mcp.json"); await repo.git("commit", "-m", "Add fixture configuration"); await repo.git("push", "origin", "HEAD");
+  await history(f);
+  const git = new TaskGit(repo.cwd, f.job.env, f.log);
+  const exported = await exportCheckpoint(f.job, checkpoint({ ...await git.snapshot(), workspace: repo.cwd }), f.log);
+  const fresh = await fixture(t), cwd = join(fresh.temporary, "restored-checkout");
+  await exec("git", ["clone", repo.remote, cwd], { env: fresh.job.env });
+  const restored = new TaskGit(cwd, fresh.job.env, fresh.log);
+  await assert.rejects(restoreCheckpoint(fresh.job, exported.root, validateCheckpoint(exported.manifest, "fixture/repo"), restored, fresh.log,
+    () => configure(fresh.job, 'model="fixture"', fresh.log, "", cwd)), { reason: "invalid_configured_credential" });
+  await assert.rejects(lstat(join(fresh.job.runnerHome, "sessions")), { code: "ENOENT" });
+  assert.ok(fresh.records.some(record => record.event === "resume.restore" && record.reason === "invalid_configured_credential"));
+});
+
+test("real setup reports an invalid primary credential before exposing a state path", async () => {
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import {main} from ${main}; await main({github:{}});`;
+  const env = { ...process.env, REMOTE_DEV_RUNNER: "codex", REMOTE_DEV_GITHUB_TOKEN: "!?!", CODEX_API_KEY: "fixture-api-key-7242",
+    CODEX_CONFIG_TOML: 'model="fixture"', GITHUB_RUN_ID: "13", GITHUB_RUN_ATTEMPT: "2" };
+  await assert.rejects(exec(process.execPath, ["--input-type=module", "-e", script], { env }), error => {
+    assert.equal(error.code, 1);
+    const lines = error.stdout.split("\n");
+    const failure = lines.find(line => line.includes('"reason":"invalid_configured_credential"'));
+    assert.ok(failure?.startsWith("::error::"));
+    const record = JSON.parse(failure.slice(failure.indexOf("{")));
+    assert.equal(record.stage, "configuration");
+    assert.equal(record.source, "REMOTE_DEV_GITHUB_TOKEN");
+    assert.equal(record.run_id, "13");
+    assert.equal(record.run_attempt, "2");
+    assert.ok(!error.stdout.includes("!?!"));
+    assert.ok(!error.stdout.includes("state-path"));
+    return true;
+  });
+});
+
+for (const variant of ["basic", "url"]) test(`real fresh setup rejects ${variant} credentials before launch or export`, async t => {
+  const f = await fixture(t), output = join(f.temporary, "fresh-output");
+  await writeFile(output, "");
+  const payload = Buffer.from("user:!?").toString("base64");
+  const mcp = JSON.stringify({ mcpServers: { fixture: variant === "basic" ? { command: "node", env: { DEBUG: "1" },
+    headers: { Authorization: `Basic ${payload}` } } : { type: "http", url: "https://user:%24xy@example.invalid/mcp" } } });
+  const forbidden = variant === "basic" ? ["user:!?", "user:%21%3F", payload] : ["$xy", "%24xy"];
+  const maskForbidden = variant === "basic" ? ["!?", "%21%3F", payload] : forbidden;
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import {main} from ${main}; await main({github:{request(){throw new Error('Unexpected API call');}}});`;
+  const env = { ...process.env, REMOTE_DEV_RUNNER: "codex", REMOTE_DEV_GITHUB_TOKEN: "fixture-github-token-9382",
+    CODEX_API_KEY: "fixture-api-key-7242", CODEX_CONFIG_TOML: 'model="fixture"', MCP_CONFIG_JSON: mcp,
+    GITHUB_OUTPUT: output, GITHUB_RUN_ID: "13", GITHUB_RUN_ATTEMPT: "2" };
+  await assert.rejects(exec(process.execPath, ["--input-type=module", "-e", script], { env }), error => {
+    assert.equal(error.code, 1);
+    const failure = error.stdout.split("\n").find(line => line.startsWith("::error::") && line.includes('"event":"runtime.failed"'));
+    const record = JSON.parse(failure.slice(failure.indexOf("{")));
+    assert.equal(record.reason, "invalid_configured_credential"); assert.equal(record.stage, "configuration");
+    assert.equal(record.source, "MCP_CONFIG_JSON"); assert.equal(record.field, variant === "basic" ? "basic_password" : "url_credential");
+    assert.equal(record.run_id, "13"); assert.equal(record.run_attempt, "2");
+    for (const value of forbidden) assert.ok(!error.stdout.includes(value));
+    const masks = error.stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
+    assert.ok(masks.every(line => maskForbidden.every(value => !line.includes(value))));
+    assert.ok(!error.stdout.includes('"stage":"tools"')); return true;
+  });
+  assert.equal(await readFile(output, "utf8"), "");
+});
+
+for (const variant of ["basic", "url"]) test(`real resumed setup rejects restored ${variant} credentials before launch or export`, async t => {
+  const f = await fixture(t), repo = await repository(f);
+  const payload = Buffer.from("user:!?").toString("base64");
+  const bad = JSON.stringify({ mcpServers: { fixture: variant === "basic" ? { command: "node", env: { DEBUG: "1" },
+    headers: { Authorization: `Basic ${payload}` } } : { type: "http", url: "https://user:%24xy@example.invalid/mcp" } } });
+  const forbidden = variant === "basic" ? ["user:!?", "user:%21%3F", payload] : ["$xy", "%24xy"];
+  const maskForbidden = variant === "basic" ? ["!?", "%21%3F", payload] : forbidden;
+  await writeFile(join(repo.cwd, ".mcp.json"), bad);
+  await repo.git("add", ".mcp.json"); await repo.git("commit", "-m", "Configure fixture"); await repo.git("push", "origin", "HEAD");
+  await history(f);
+  const git = new TaskGit(repo.cwd, f.job.env, f.log);
+  const exported = await exportCheckpoint(f.job, checkpoint({ ...await git.snapshot(), workspace: repo.cwd }), f.log);
+  const archive = join(f.temporary, "setup-checkpoint.zip");
+  await exec("python3", ["-c", `import json,sys,zipfile
+with zipfile.ZipFile(sys.argv[1],'w',compression=zipfile.ZIP_DEFLATED) as z:
+ for name in json.loads(sys.argv[3]): z.write(name,name[len(sys.argv[2])+1:])`, archive, exported.root, JSON.stringify(exported.files)]);
+  const workspace = join(f.temporary, "workspace"), target = join(workspace, "target"), bin = join(f.temporary, "fixture-bin");
+  await mkdir(workspace); await mkdir(bin);
+  await exec("git", ["clone", "--branch", "main", repo.remote, target], { env: f.job.env });
+  await exec("git", ["remote", "set-url", "origin", "https://github.com/fixture/repo"], { cwd: target, env: f.job.env });
+  await copyFile(process.execPath, join(bin, "node"), constants.COPYFILE_FICLONE);
+  await writeFile(join(bin, "git"), `#!/bin/sh\nif [ "$1" = fetch ]; then exec /usr/bin/git -c 'url.file://${repo.remote}.insteadOf=https://github.com/fixture/repo' "$@"; fi\nexec /usr/bin/git "$@"\n`, { mode: 0o700 });
+  const output = join(f.temporary, "resume-output"); await writeFile(output, "");
+  const info = { full_name: "fixture/repo" };
+  const parent = { id: 13, run_attempt: 1, workflow_id: lineage.workflow_id, path: lineage.workflow_path, head_sha: lineage.workflow_sha,
+    repository: info, head_repository: info, head_branch: "main", event: "workflow_dispatch", status: "completed", conclusion: "failure" };
+  const current = { ...parent, id: 20, status: "in_progress" };
+  const bytes = await readFile(archive), artifact = { id: 55, name: `remote-dev-session-r13-a1-${exported.manifest.sequence}`,
+    workflow_run: { id: 13 }, size_in_bytes: bytes.length, expired: false, expires_at: "2099-01-01T00:00:00Z" };
+  const config = Buffer.from("allowed-actors: [Z-M-Huang]\nskills: []\n");
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import {main} from ${main};
+    const parent=${JSON.stringify(parent)}, current=${JSON.stringify(current)}, artifact=${JSON.stringify(artifact)};
+    const github={request:async route=>{const [method,path]=route.split(' '); if(method!=='GET') throw new Error('Unexpected export');
+      if(path.endsWith('/actions/runs/20')) return {data:current}; if(path.endsWith('/actions/runs/13')) return {data:parent};
+      if(path.includes('/actions/runs/13/artifacts?')) return {data:{artifacts:[artifact]}};
+      if(path.endsWith('/actions/artifacts/55/zip')) return {data:Buffer.from(${JSON.stringify(bytes.toString("base64"))},'base64')};
+      if(path.endsWith('/actions/artifacts/55')) return {data:artifact};
+      if(path==='/repos/fixture/repo') return {data:{default_branch:'main'}};
+      if(path.includes('/commits/main')) return {data:{sha:'a'.repeat(40)}};
+      if(path.includes('/collaborators/')) return {data:{permission:'write'}};
+      if(path.includes('/contents/.remote-dev.yml?')) return {data:{type:'file',encoding:'base64',size:${config.length},content:${JSON.stringify(config.toString("base64"))}}};
+      throw new Error('Unexpected fixture route');}}; await main({github});`;
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: f.temporary, GITHUB_WORKSPACE: workspace,
+    GITHUB_REPOSITORY: "fixture/repo", GITHUB_RUN_ID: "20", GITHUB_RUN_ATTEMPT: "1", GITHUB_ACTOR: "Z-M-Huang",
+    TRIGGERING_ACTOR: "Z-M-Huang", GITHUB_REF: "refs/heads/main", GITHUB_OUTPUT: output,
+    REMOTE_DEV_RUNNER: "codex", REMOTE_DEV_GITHUB_TOKEN: "fixture-github-token-9382", CODEX_API_KEY: "fixture-api-key-7242",
+    CODEX_CONFIG_TOML: 'model="fixture"', MCP_CONFIG_JSON: "", REMOTE_DEV_RESUME_RUN_ID: "13", REMOTE_DEV_PLAN: "Continue" };
+  await assert.rejects(exec(join(bin, "node"), ["--input-type=module", "-e", script], { env, timeout: 60000 }), error => {
+    assert.equal(error.code, 1);
+    let depth = 0, contexts = 0, failure;
+    for (const line of error.stdout.split("\n")) {
+      if (line.startsWith("::group::")) depth++;
+      if (line.startsWith("::endgroup::")) depth--;
+      if (line.includes('"event":"runtime.context"')) { assert.ok(depth > 0); contexts++; }
+      if (line.startsWith("::error::") && line.includes('"event":"runtime.failed"')) { assert.equal(depth, 0); failure = JSON.parse(line.slice(line.indexOf("{"))); }
+    }
+    assert.equal(contexts, 1); assert.equal(failure.reason, "invalid_configured_credential");
+    assert.equal(failure.stage, "configuration"); assert.equal(failure.source, ".mcp.json");
+    assert.equal(failure.field, variant === "basic" ? "basic_password" : "url_credential");
+    assert.equal(failure.run_id, "20"); assert.equal(failure.run_attempt, "1");
+    for (const value of forbidden) assert.ok(!error.stdout.includes(value));
+    const masks = error.stdout.split("\n").filter(line => line.startsWith("::add-mask::"));
+    assert.ok(masks.every(line => maskForbidden.every(value => !line.includes(value))));
+    assert.ok(!error.stdout.includes('"stage":"tools"')); return true;
+  });
+  assert.equal(await readFile(output, "utf8"), "");
+  assert.equal(await readFile(join(target, ".mcp.json"), "utf8"), bad);
+  assert.equal((await exec("git", ["rev-parse", "HEAD"], { cwd: target })).stdout.trim(), exported.manifest.checkpoint_sha);
+});
+
+test("real Actions commands preserve group balance, warning visibility and safe diagnostics", async () => {
+  const module = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const script = `import {Diagnostics} from ${module};
+    const log = new Diagnostics({run_id:'13',run_attempt:'2',session_id:'fixture-session'});
+    log.protect('fixture-secret-9217');
+    log.beginGroup('Setup & environment'); log.emitContext();
+    log.event('runtime.setup','WARN',{reason:'unsupported_mcp_transport'});
+    log.event('runtime.setup','INFO',{stage:'configuration'}); log.endGroup();
+    log.beginBuffering(); log.event('runtime.tool','INFO',{stage:'native',payload:'##[error] injected',items:Array.from({length:105},(_,i)=>i),large:2n});
+    log.group('Thinking',['::endgroup::',' ##[error] injected','fixture-secret-9217'],{untrusted:true});
+    const circular={}; circular.self=circular; log.event('runtime.bad','INFO',{circular});
+    log.event('runtime.failed','ERROR',{stage:'native',reason:'fixture_failure',http_status:403}); log.endBuffering();`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
+  const lines = stdout.split("\n").filter(line => !line.startsWith("::add-mask::"));
+  let depth = 0, disabled = "";
+  for (const line of lines) {
+    if (disabled) { if (line === `::${disabled}::`) disabled = ""; continue; }
+    if (line.startsWith("::stop-commands::")) { disabled = line.slice("::stop-commands::".length); continue; }
+    if (line.startsWith("::group::")) { assert.equal(depth, 0); depth++; }
+    else if (line === "::endgroup::") { assert.equal(depth, 1); depth--; }
+    else if (line.startsWith("::warning::") || line.startsWith("::error::")) assert.equal(depth, 0);
+    else assert.ok(!line.startsWith("::endgroup::"));
+  }
+  assert.equal(depth, 0); assert.equal(disabled, "");
+  assert.ok(lines.includes("::group::Setup & environment (continued)"));
+  assert.doesNotMatch(lines.join("\n"), /fixture-secret-9217|##\[error\]/);
+  const toolLine = lines.find(line => line.includes('"event":"runtime.tool"'));
+  const tool = JSON.parse(toolLine.slice(toolLine.indexOf("{")));
+  assert.equal(tool.run_id, "13"); assert.equal(tool.run_attempt, "2");
+  assert.equal(tool.large, "2"); assert.equal(tool.truncated, true); assert.equal(tool.items.length, 100);
+  assert.ok(lines.some(line => line.startsWith("::error::") && line.includes('"event":"runtime.log_error"')));
+  const failureLine = lines.find(line => line.includes('"reason":"fixture_failure"'));
+  const failure = JSON.parse(failureLine.slice(failureLine.indexOf("{")));
+  assert.equal(failure.session_id, "fixture-session"); assert.equal(failure.http_status, 403);
+});
+
+test("buffered diagnostics flush at the event and byte limits", () => {
+  const byCount = logger();
+  byCount.log.beginBuffering();
+  for (let index = 0; index < 49; index++) byCount.log.event("runtime.tool", "INFO", { index });
+  assert.equal(byCount.records.length, 0);
+  byCount.log.event("runtime.tool", "INFO", { index: 49 });
+  assert.equal(byCount.records.length, 50);
+  byCount.log.endBuffering();
+  const byBytes = logger();
+  byBytes.log.beginBuffering();
+  let index = 0;
+  while (!byBytes.records.length && index < 49) {
+    byBytes.log.event("runtime.tool", "INFO", { index, a: "a".repeat(512), b: "b".repeat(512), c: "c".repeat(512), d: "d".repeat(512) });
+    index++;
+  }
+  assert.ok(index < 50);
+  assert.equal(byBytes.records.length, index);
+  byBytes.log.endBuffering();
+});
+
+test("plain setup errors preserve safe HTTP causes in real Actions output", async () => {
+  const module = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const script = `import {Diagnostics} from ${module}; const log=new Diagnostics({run_id:'13',run_attempt:'2'});
+    const error=Object.assign(new Error('HTTP 403 {"body":"private-response-7831"}'),
+      {reason:'skill_lookup_failed',stage:'skills',status:403,response:{headers:{'x-github-request-id':'ABCD:1234'}}});
+    log.failure(error);`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script]);
+  const line = stdout.split("\n").find(item => item.includes('"event":"runtime.failed"'));
+  assert.ok(line.startsWith("::error::"));
+  const record = JSON.parse(line.slice(line.indexOf("{")));
+  assert.equal(record.reason, "skill_lookup_failed"); assert.equal(record.stage, "skills");
+  assert.equal(record.http_status, 403); assert.equal(record.request_id, "ABCD:1234");
+  assert.doesNotMatch(stdout, /private-response-7831/);
+});
+
+test("a silent real process emits a folded heartbeat with idle time", async t => {
+  const f = await fixture(t), diagnostics = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const processModule = JSON.stringify(new URL("../.build/process.js", import.meta.url).href);
+  const script = `import {mock} from 'node:test'; import {Diagnostics} from ${diagnostics}; import {command} from ${processModule};
+    mock.timers.enable({apis:['Date','setInterval','setTimeout'],now:0});
+    const log=new Diagnostics({run_id:'13',run_attempt:'1',session_id:'fixture-session'}); log.beginBuffering();
+    log.event('runtime.tool','INFO',{stage:'native',phase:'started'});
+    let ready; const started=new Promise(resolve=>{ready=resolve});
+    const run=command('/bin/sh',['-c','sleep 1'],{cwd:process.argv[1],env:{...process.env,TMPDIR:process.argv[1]},stage:'native',log,timeoutMs:Infinity,onControl:()=>ready()});
+    await started; mock.timers.tick(60000); await run; log.endBuffering(); mock.timers.reset();`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, f.temporary]);
+  assert.ok(stdout.includes("::group::Heartbeat"));
+  assert.ok(stdout.includes("::group::Runtime diagnostics (1 events)"));
+  const line = stdout.split("\n").find(item => item.includes('"event":"runtime.heartbeat"'));
+  const record = JSON.parse(line.slice(line.indexOf("{")));
+  assert.equal(record.idle_ms, 60000); assert.equal(record.run_id, "13"); assert.equal(record.session_id, "fixture-session");
+});
+
+test("snapshot log offsets preserve UTF-8 records, warnings and sanitized worker failures", async t => {
+  const f = await fixture(t), path = join(f.job.root, "snapshots.log");
+  const commits = [], tailer = new SnapshotLogTailer(f.job.root, f.log, 0, async offset => commits.push(offset), false, 0);
+  const first = Buffer.from(JSON.stringify({ schema_version: 1, event: "checkpoint.export", level: "INFO", cycle: 1, marker: "café" }) + "\n");
+  const split = first.indexOf(Buffer.from("é")) + 1;
+  await writeFile(path, first.subarray(0, split));
+  await tailer.flush(true);
+  assert.equal(commits.length, 0);
+  await appendFile(path, first.subarray(split));
+  await appendFile(path, JSON.stringify({ schema_version: 1, event: "checkpoint.cycle", level: "INFO", cycle: 1 }) + "\n");
+  await appendFile(path, JSON.stringify({ schema_version: 1, event: "checkpoint.deferred", level: "WARN", cycle: 2, reason: "snapshot_pause_deferred" }) + "\n");
+  await appendFile(path, "::add-mask::do-not-forward\nSnapshot worker failed. fixture-api-credential-9374\n");
+  await tailer.flush(true, true);
+  const size = (await readFile(path)).length;
+  assert.equal(commits.at(-1), size);
+  assert.equal(Number(await readFile(join(f.job.root, "snapshots.offset"), "utf8")), size);
+  assert.ok(f.records.some(record => record.event === "checkpoint.export" && record.marker === "café"));
+  assert.ok(f.records.some(record => record.event === "checkpoint.deferred" && record.level === "WARN"));
+  assert.ok(f.records.some(record => record.event === "checkpoint.worker_stderr" && record.level === "ERROR"));
+  assert.doesNotMatch(f.lines.join("\n"), /do-not-forward|fixture-api-credential-9374/);
+  const before = f.records.length;
+  const resumed = new SnapshotLogTailer(f.job.root, f.log, size, async () => {}, true);
+  await resumed.flush(true, true);
+  assert.equal(f.records.length, before);
+});
+
+test("real Actions output reconstructs a deferred checkpoint and worker failure", async t => {
+  const f = await fixture(t), path = join(f.job.root, "snapshots.log");
+  const diagnostic = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const deferred = { schema_version: 1, event: "checkpoint.deferred", level: "WARN", run_id: "13", run_attempt: "2",
+    session_id: "fixture-session", cycle: 4, reason: "snapshot_pause_deferred", pause_reason: "permission_denied", os_errno: 1, retry_interval_ms: 60000 };
+  await writeFile(path, JSON.stringify(deferred) + '\nSnapshot worker failed. fixture-capture-secret-7284\n');
+  const script = `import {Diagnostics} from ${diagnostic}; import {SnapshotLogTailer} from ${main};
+    const log=new Diagnostics({run_id:'13',run_attempt:'2',session_id:'fixture-session'}); log.protect('fixture-capture-secret-7284');
+    const tailer=new SnapshotLogTailer(process.argv[1],log,0,async()=>{}); await tailer.flush(true,true);`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, f.job.root]);
+  const lines = stdout.split("\n").filter(line => !line.startsWith("::add-mask::"));
+  const warning = lines.find(line => line.startsWith("::warning::") && line.includes('"event":"checkpoint.deferred"'));
+  const failure = lines.find(line => line.startsWith("::error::") && line.includes('"event":"checkpoint.worker_stderr"'));
+  const evidence = JSON.parse(warning.slice(warning.indexOf("{")));
+  assert.equal(evidence.run_id, "13"); assert.equal(evidence.run_attempt, "2"); assert.equal(evidence.session_id, "fixture-session");
+  assert.equal(evidence.cycle, 4); assert.equal(evidence.pause_reason, "permission_denied"); assert.equal(evidence.os_errno, 1);
+  assert.equal(evidence.retry_interval_ms, 60000); assert.ok(failure);
+  assert.doesNotMatch(lines.join("\n"), /fixture-capture-secret-7284/);
+});
+
+test("real Actions logger replays a partial UTF-8 checkpoint from its committed offset", async t => {
+  const f = await fixture(t), path = join(f.job.root, "snapshots.log");
+  const diagnostic = JSON.stringify(new URL("../.build/diagnostics.js", import.meta.url).href);
+  const main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const script = `import assert from 'node:assert/strict'; import {writeFile,appendFile,readFile} from 'node:fs/promises'; import {join} from 'node:path';
+    import {Diagnostics} from ${diagnostic}; import {SnapshotLogTailer} from ${main};
+    const root=process.argv[1], path=join(root,'snapshots.log'), commits=[];
+    const log=new Diagnostics({run_id:'13',run_attempt:'2'}), tailer=new SnapshotLogTailer(root,log,0,async offset=>commits.push(offset));
+    const first=Buffer.from(JSON.stringify({schema_version:1,event:'checkpoint.export',level:'INFO',cycle:1,marker:'café'})+'\\n');
+    const split=first.indexOf(Buffer.from('é'))+1;
+    await writeFile(path,first.subarray(0,split)); await tailer.flush(true); assert.equal(commits.length,0);
+    await appendFile(path,first.subarray(split)); await appendFile(path,JSON.stringify({schema_version:1,event:'checkpoint.cycle',level:'INFO',cycle:1})+'\\n');
+    await tailer.flush(true,true); const offset=Number(await readFile(join(root,'snapshots.offset'),'utf8'));
+    assert.equal(offset,commits.at(-1)); const resumed=new SnapshotLogTailer(root,log,offset,async()=>{},true); await resumed.flush(true,true);`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, f.job.root]);
+  const records = stdout.split("\n").filter(line => line.includes('"event":"checkpoint.export"'));
+  assert.equal(records.length, 1); assert.equal(JSON.parse(records[0].slice(records[0].indexOf("{"))).marker, "café");
+  assert.equal(Number(await readFile(join(f.job.root, "snapshots.offset"), "utf8")), (await readFile(path)).length);
+});
+
+test("an incomplete checkpoint cycle flushes when it becomes stale", async t => {
+  const f = await fixture(t), path = join(f.job.root, "snapshots.log"), offsets = [];
+  const tailer = new SnapshotLogTailer(f.job.root, f.log, 0, async offset => offsets.push(offset), false, 0);
+  await writeFile(path, JSON.stringify({ schema_version: 1, event: "checkpoint.export", level: "INFO", cycle: 4, outcome: "started" }) + "\n");
+  await tailer.flush();
+  assert.ok(f.records.some(record => record.event === "checkpoint.export" && record.cycle === 4));
+  assert.ok(f.timeline.some(entry => entry.level === "group" && entry.line === "Checkpoint #4"));
+  assert.equal(offsets.at(-1), (await readFile(path)).length);
+});
+
+test("checkpoint upload and retention failures retain their diagnostic causes", async t => {
+  const f = await fixture(t), repo = await repository(f); await history(f);
+  const metadata = checkpoint({ ...await new TaskGit(repo.cwd, f.job.env, f.log).snapshot(), workspace: repo.cwd });
+  await assert.rejects(durableCheckpoint(f.job, metadata, f.log, async () => {
+    throw new RunnerError("command_failed", "artifact_upload", "fixture transport failure", { elapsed_ms: 241, exit_code: 7 });
+  }), error => {
+    assert.equal(error.details.cause_elapsed_ms, 241); assert.equal(error.details.cause_exit_code, 7); return true;
+  });
+  const saved = { job: f.job, metadata, secrets: f.log.protectedValues, response: "", latest: null };
+  const api = async () => { throw Object.assign(new Error("fixture retention failure"),
+    { status: 500, response: { headers: { "x-github-request-id": "ABCD:5678" } } }); };
+  const receipt = await saveSnapshot(saved, f.log, api, async () => ({ id: 75 }));
+  assert.equal(receipt.artifact_id, 75);
+  const warning = f.records.find(record => record.event === "checkpoint.retention");
+  assert.equal(warning.level, "WARN"); assert.equal(warning.http_status, 500); assert.equal(warning.request_id, "ABCD:5678");
+});
+
+test("unsafe final state reports an error without exposing temporary paths", async t => {
+  const f = await fixture(t), main = JSON.stringify(new URL("../.build/main.js", import.meta.url).href);
+  const path = join(f.temporary, "outside-state.json");
+  const script = `import {finish} from ${main}; await finish({github:{},statePath:process.argv[1]});`;
+  await assert.rejects(exec(process.execPath, ["--input-type=module", "-e", script, path],
+    { env: { ...process.env, RUNNER_TEMP: f.temporary, GITHUB_RUN_ID: "13", GITHUB_RUN_ATTEMPT: "1" } }), error => {
+    assert.equal(error.code, 1);
+    assert.match(error.stdout, /"reason":"unsafe_final_state"/);
+    assert.ok(!error.stdout.includes(f.temporary)); assert.ok(!error.stdout.includes(path));
+    return true;
+  });
+});
+
+test("snapshot watcher registers secrets without emitting Actions mask commands", async t => {
+  const f = await fixture(t), path = join(f.job.root, "state.json");
+  await writeFile(path, JSON.stringify({ job: f.job, metadata: checkpoint({ outcome: "completed" }), secrets: ["fixture-watch-secret-8293"] }));
+  const module = JSON.stringify(new URL("../.build/checkpoint-worker.js", import.meta.url).href);
+  const script = `import {watchSnapshots} from ${module}; await watchSnapshots(process.argv[1], {intervalMs:10});`;
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", script, path]);
+  assert.doesNotMatch(stdout, /::add-mask::|fixture-watch-secret-8293/);
+});
+
+test("snapshot worker failure diagnostics hide temporary paths", async t => {
+  const f = await fixture(t), repo = await repository(f); await history(f);
+  const metadata = checkpoint({ ...await new TaskGit(repo.cwd, f.job.env, f.log).snapshot(), workspace: repo.cwd });
+  const saved = { job: f.job, metadata, secrets: f.log.protectedValues, response: "", latest: null,
+    control: { directory: join(f.temporary, "missing-control"), nonce: "fixture-nonce" } };
+  const path = join(f.job.root, "state.json"), lines = [];
+  await writeFile(path, JSON.stringify(saved));
+  const watching = watchSnapshots(path, { intervalMs: 10000, emit: line => lines.push(String(line)) });
+  try {
+    const deadline = Date.now() + 10000;
+    while (!lines.some(line => line.includes('"event":"runtime.failed"'))) {
+      assert.ok(Date.now() < deadline, "Expected the worker failure");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  } finally {
+    saved.metadata.outcome = "completed";
+    await writeFile(path, JSON.stringify(saved));
+    await watching;
+  }
+  const failure = lines.map(line => JSON.parse(line)).find(record => record.event === "runtime.failed");
+  assert.match(failure.native_cause, /<outside-workspace>/);
+  assert.ok(!lines.join("\n").includes(f.temporary));
+});
+
+test("patch parsing limits edits to the executable and suppresses sensitive or outside paths", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-before\n+after\n*** Update File: .env\n@@\n-password\n+secret\n*** End Patch";
+  assert.equal(parseApplyPatch("rg apply_patch", "", r.cwd), null);
+  assert.equal(parseApplyPatch("cat tests/cli.test.mjs", "", r.cwd), null);
+  const fallback = parseApplyPatch('apply_patch <<< "$PATCH"', 'Success. Updated the following files:\nM README.md\n', r.cwd);
+  assert.equal(fallback[0].path, "README.md"); assert.equal(fallback[0].kind, "update");
+  const edits = parseApplyPatch(`cd . && apply_patch <<'PATCH'\n${patch}\nPATCH`, "", r.cwd);
+  assert.equal(edits[0].path, "README.md"); assert.match(edits[0].diff, /\+after/);
+  assert.equal(edits[1].suppressed, "sensitive file"); assert.equal(edits[1].diff, undefined);
+  assert.equal(activityPath("../outside.key", r.cwd).path, "<outside-workspace>");
+  assert.equal(activityPath("src/credentials.ts", r.cwd).sensitive, false);
+  assert.equal(summarizeCommand("git commit -m 'private task'", r.cwd), "git commit");
+  assert.equal(summarizeCommand("node --test tests/runtime.test.mjs", r.cwd), "node --test tests/runtime.test.mjs");
+  const missing = parseApplyPatch("apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: missing.txt\n@@\n-before\n+after\n*** End Patch\nPATCH", "", r.cwd);
+  assert.equal(missing[0].path, "missing.txt"); assert.equal(missing[0].suppressed, "original path unverified");
+  assert.equal(parseApplyPatch(`apply_patch <<'PATCH' | cat\n${patch}\nPATCH`, "", r.cwd), null);
+  assert.equal(parseApplyPatch(`true # comment; apply_patch <<'PATCH'\n${patch}\nPATCH`, "", r.cwd), null);
+});
+
+test("patch detection ignores heredoc data and binds patches to their executable", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const body = name => `*** Begin Patch\n*** Update File: ${name}\n@@\n-before\n+after\n*** End Patch`;
+  const fake = body("fake.txt").replace("*** End Patch", "*** Update File: fake2.txt\n@@\n-before\n+after\n*** End Patch");
+  const data = `cat <<'EOF'\napply_patch <<'PATCH'\n${fake}\nPATCH\nEOF`;
+  assert.equal(parseApplyPatch(data, "", r.cwd), null);
+  const edits = parseApplyPatch(`${data}\napply_patch <<'PATCH'\n${body("real.txt")}\nPATCH`, "", r.cwd);
+  assert.equal(edits.length, 1); assert.equal(edits[0].suppressed, "working directory unknown");
+});
+
+test("patch parsing suppresses unresolved shell expansion while preserving quoted heredocs", async t => {
+  const f = await fixture(t), r = await repository(f);
+  await writeFile(join(r.cwd, "$TARGET"), "before\n");
+  const patch = '*** Begin Patch\n*** Update File: $TARGET\n@@\n-before\n+after\n*** End Patch';
+  const command = marker => `apply_patch <<${marker}\n${patch}\nPATCH`;
+  const expanded = parseApplyPatch(command('PATCH'), "", r.cwd);
+  assert.equal(expanded[0].path, "<outside-workspace>"); assert.equal(expanded[0].suppressed, "shell expansion unresolved");
+  assert.equal(expanded[0].diff, undefined);
+  const quoted = parseApplyPatch(command("'PATCH'"), "", r.cwd);
+  assert.equal(quoted[0].path, "$TARGET"); assert.match(quoted[0].diff, /\+after/);
+  const wrapped = parseApplyPatch(`/bin/bash -c "${command("'PATCH'")}"`, "", r.cwd);
+  assert.equal(wrapped[0].suppressed, "shell expansion unresolved"); assert.equal(wrapped[0].diff, undefined);
+});
+
+test("patch parsing suppresses diffs when the effective shell directory is outside or uncertain", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const patch = "*** Begin Patch\n*** Update File: config.txt\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch";
+  const command = prefix => `${prefix} && apply_patch <<'PATCH'\n${patch}\nPATCH`;
+  const external = parseApplyPatch(command("cd '/tmp/private folder'"), "", r.cwd);
+  assert.equal(external[0].path, "<outside-workspace>");
+  assert.equal(external[0].suppressed, "outside workspace");
+  assert.equal(external[0].diff, undefined);
+  for (const prefix of ['cd "$TARGET"', "cd -P", "cd -L", "cd /tmp/private && echo done; true"]) {
+    const edits = parseApplyPatch(command(prefix), "", r.cwd);
+    assert.equal(edits[0].path, "<outside-workspace>");
+    assert.equal(edits[0].suppressed, "working directory unknown");
+    assert.equal(edits[0].diff, undefined);
+  }
+  assert.equal(parseApplyPatch(command("cd /tmp/private && cd /missing || true"), "", r.cwd), null);
+  await mkdir(join(r.cwd, "sub directory"));
+  await writeFile(join(r.cwd, "sub directory/config.txt"), "before\n");
+  const inside = parseApplyPatch(command(`cd '/tmp' && cd '${join(r.cwd, "sub directory")}'`), "", r.cwd);
+  assert.equal(inside[0].path, "sub directory/config.txt");
+  assert.match(inside[0].diff, /unregistered-sensitive-value/);
+  await mkdir(join(r.cwd, "-P"));
+  await writeFile(join(r.cwd, "-P/config.txt"), "before\n");
+  const explicit = parseApplyPatch(command("cd -- -P"), "", r.cwd);
+  assert.equal(explicit[0].path, "-P/config.txt"); assert.match(explicit[0].diff, /unregistered-sensitive-value/);
+});
+
+test("patch moves suppress diff bodies when either path is sensitive or outside the workspace", async t => {
+  const f = await fixture(t), r = await repository(f);
+  const command = (source, destination) => `apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: ${source}\n*** Move to: ${destination}\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch\nPATCH`;
+  for (const [source, destination] of [["config.txt", ".env"], ["config.txt", "../outside.txt"], [".env", "config.txt"]]) {
+    const edits = parseApplyPatch(command(source, destination), "", r.cwd);
+    assert.equal(edits.length, 1);
+    assert.ok(edits[0].suppressed);
+    assert.equal(edits[0].diff, undefined);
+  }
+  const safe = parseApplyPatch(command("config.txt", "renamed.txt"), "", r.cwd);
+  assert.equal(safe[0].path, "config.txt -> renamed.txt");
+  assert.equal(safe[0].suppressed, "original source path unverified"); assert.equal(safe[0].diff, undefined);
+});
+
+test("activity paths protect sensitive symlink names and resolve symlink traversal before checking the workspace", async t => {
+  const f = await fixture(t), r = await repository(f);
+  await mkdir(join(r.cwd, ".docker"));
+  await writeFile(join(r.cwd, ".docker/config.json"), "{}\n");
+  await writeFile(join(r.cwd, ".docker/Dockerfile"), "FROM scratch\n");
+  await symlink(".docker/config.json", join(r.cwd, "docker-config-alias"));
+  assert.equal(activityPath(".docker/config.json", r.cwd).sensitive, true);
+  assert.equal(activityPath("docker-config-alias", r.cwd).sensitive, true);
+  assert.equal(activityPath(".docker/Dockerfile", r.cwd).sensitive, false);
+  await mkdir(join(r.cwd, "config"));
+  await writeFile(join(r.cwd, "config/development.env"), "unregistered-sensitive-value\n");
+  await symlink("config/development.env", join(r.cwd, ".env"));
+  const logical = activityPath(".env", r.cwd);
+  assert.equal(logical.path, ".env"); assert.equal(logical.outside, false); assert.equal(logical.sensitive, true);
+  const patch = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: .env\n@@\n-before\n+unregistered-sensitive-value\n*** End Patch\nPATCH";
+  const edits = parseApplyPatch(patch, "", r.cwd);
+  assert.equal(edits[0].suppressed, "sensitive file"); assert.equal(edits[0].diff, undefined);
+
+  await writeFile(join(r.cwd, "config/.env"), "sensitive target\n");
+  await symlink("config/.env", join(r.cwd, "settings"));
+  assert.equal(activityPath("settings", r.cwd).sensitive, true);
+  await symlink("missing.env", join(r.cwd, "broken"));
+  assert.equal(activityPath("broken", r.cwd).outside, true);
+  assert.equal(activityPath("broken/child", r.cwd).outside, true);
+  const outside = join(f.temporary, "outside"), child = join(outside, "child");
+  await mkdir(child, { recursive: true });
+  await writeFile(join(outside, "external.txt"), "outside\n");
+  await symlink(child, join(r.cwd, "link"));
+  assert.equal(activityPath("link/../external.txt", r.cwd).outside, true);
+  assert.equal(activityPath("link/../missing.txt", r.cwd).outside, true);
+});
+
+test("Git summary parses renamed and untracked paths with NUL delimiters", async t => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
+  await r.git("mv", "README.md", "renamed & file.md");
+  await r.git("commit", "-m", "Rename fixture");
+  await writeFile(join(r.cwd, "untracked & file.txt"), "work\n");
+  const summary = await git.summary(r.base);
+  assert.equal(summary.base, r.base);
+  assert.ok(summary.commits.some(commit => commit.subject === "Rename fixture"));
+  assert.ok(summary.changes.some(change => change.previous === "README.md" && change.path === "renamed & file.md"));
+  assert.ok(summary.untracked.includes("untracked & file.txt"));
+  assert.equal(summary.unpushed, 1);
+});
+
+test("Git summary handles unavailable or unrelated bases and bounds path results", async t => {
+  const f = await fixture(t), r = await repository(f), git = new TaskGit(r.cwd, f.job.env, f.log);
+  const unrelated = await r.git("commit-tree", `${r.base}^{tree}`, "-m", "Unrelated fixture");
+  assert.equal((await git.summary("f".repeat(40))).base, null);
+  assert.equal((await git.summary(unrelated)).base, null);
+  await Promise.all(Array.from({ length: 105 }, (_, index) => writeFile(join(r.cwd, `untracked-${index}.txt`), "work\n")));
+  const summary = await git.summary(r.base);
+  assert.equal(summary.changes.length + summary.untracked.length, 100);
+  assert.equal(summary.omitted, 5);
+});
+
 async function finalization(t, { host, denyCleanup = false, lost = [], failResult = false, conflicting = null, protectResult = false,
-  response = "fixture-result-private-content-8147", checkpointSaved = true, runner = "codex" }) {
+  response = "fixture-result-private-content-8147", checkpointSaved = true, runner = "codex", prepareRepo }) {
   assert.notEqual(process.geteuid(), 0);
   const f = await fixture(t, runner), repo = await repository(f);
+  if (prepareRepo) await prepareRepo(f, repo);
   await history(f);
   await readOnlyCache(f.job.home);
   const previous = { artifact_id: 72, sequence: 3, checkpoint_sha: repo.base };
@@ -383,7 +1137,7 @@ async function finalization(t, { host, denyCleanup = false, lost = [], failResul
   if (checkpointSaved) await writeFile(join(f.job.root, "latest.json"), JSON.stringify(previous));
   await writeFile(statePath, JSON.stringify({ job: f.job, metadata: checkpoint({ outcome: "completed", workspace: repo.cwd,
     session_id: checkpointSaved ? sessionId : "" }), secrets: [...f.log.protectedValues, ...(protectResult ? [payload] : [])], response: payload,
-    latest: checkpointSaved ? previous : null }), { mode: 0o600 });
+    latest: checkpointSaved ? previous : null, initial_git: { sha: repo.base, branch: repo.branch } }), { mode: 0o600 });
   const outputFile = join(f.temporary, "actions-output"), summaryFile = join(f.temporary, "actions-summary");
   await writeFile(outputFile, "");
   await writeFile(summaryFile, "");
@@ -601,6 +1355,58 @@ test("final credential validation stops before attempting or reconciling the res
   assert.deepEqual(result.lookups, []);
   assert.equal(result.exportFailure.reason, "credential_in_result");
   assert.doesNotMatch(result.summary, /fixture-result-private-content-8147/);
+});
+
+test("final edit history escapes Git content and redacts configured secrets", async t => {
+  const secret = "fixture-commit-secret-9821";
+  const result = await finalization(t, { host: "github-hosted", prepareRepo: async (f, repo) => {
+    f.log.protect(secret);
+    await writeFile(join(repo.cwd, "notes <sample>.txt"), "work\n");
+    await repo.git("add", "notes <sample>.txt");
+    await repo.git("commit", "-m", `Change <example> ${secret}`);
+    await writeFile(join(repo.cwd, "untracked & work.txt"), "work\n");
+  } });
+  assert.equal(result.code, 0);
+  assert.match(result.summary, /## Runner outcome[\s\S]*## Edit history/);
+  assert.match(result.summary, /notes &lt;sample&gt;\.txt/);
+  assert.match(result.summary, /untracked &amp; work\.txt/);
+  assert.match(result.summary, /Change &lt;example&gt; \[redacted\]/);
+  assert.ok(!result.summary.includes(secret));
+});
+
+for (const failure of ["status", "merge-base", "cat-file", "object-check-stderr"]) test(`Git summary ${failure} failure remains visible without failing final export`, async t => {
+  const result = await finalization(t, { host: "github-hosted", prepareRepo: async f => {
+    const bin = join(f.temporary, "git-summary-failure");
+    await mkdir(bin);
+    const pattern = { status: "*--untracked-files=normal*", "merge-base": "*merge-base*", "cat-file": "*'cat-file -e'*",
+      "object-check-stderr": "*--batch-check*" }[failure];
+    const action = failure === "object-check-stderr" ? "read -r object; printf '%s missing\\n' \"$object\"; printf 'object access error\\n' >&2; exit 0" : "exit 128";
+    await writeFile(join(bin, "git"), `#!/bin/sh\ncase "$*" in ${pattern}) ${action} ;; esac\nexec /usr/bin/git "$@"\n`, { mode: 0o700 });
+    f.job.env.PATH = `${bin}:${f.job.env.PATH}`;
+  } });
+  assert.equal(result.code, 0);
+  assert.ok(result.records.some(record => record.event === "runtime.summary_git" && record.level === "INFO" && record.outcome === "unavailable"));
+  assert.match(result.summary, /Git edit history unavailable/);
+});
+
+test("the post-escape summary credential gate fails before writing the summary", async t => {
+  const result = await finalization(t, { host: "github-hosted", prepareRepo: async (f, repo) => {
+    f.log.protect("amp;");
+    await writeFile(join(repo.cwd, "work & notes.txt"), "work\n");
+  } });
+  assert.equal(result.code, 1);
+  assert.equal(result.exportFailure.reason, "credential_in_summary");
+  assert.equal(result.summary, "");
+});
+
+test("the pre-escape summary credential gate catches values spanning static and Git text", async t => {
+  const result = await finalization(t, { host: "github-hosted", prepareRepo: async (f, repo) => {
+    f.log.protect("Untracked <fixture-note");
+    await writeFile(join(repo.cwd, "<fixture-note>.txt"), "work\n");
+  } });
+  assert.equal(result.code, 1);
+  assert.equal(result.exportFailure.reason, "credential_in_summary");
+  assert.equal(result.summary, "");
 });
 
 test("final artifact recovery leaves SDK file validation failed even when the exact artifact already exists", async t => {

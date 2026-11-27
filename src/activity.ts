@@ -1,0 +1,237 @@
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import type { Diagnostics } from "./diagnostics.js";
+
+const commandNames = new Set(["cat", "head", "tail", "sed", "rg", "ls", "find", "pwd", "git", "gh", "npm", "npx", "node",
+  "python", "python3", "apply_patch", "make", "cargo", "go", "cd", "set", "printf", "echo", "test", "sleep", "curl", "wget"]);
+const sensitiveNames = /^(?:\.env(?:\..*)?|\.netrc|\.npmrc|\.pypirc|\.pgpass|\.htpasswd|auth\.json|id_(?:rsa|ed25519|ecdsa).*)$/i;
+const sensitiveExtension = /\.(?:pem|key|p8|p12|pfx|jks|keystore)$/i;
+const sensitiveData = /(?:secret|credential)/i;
+const dataExtension = /^\.(?:json|ya?ml|toml|ini|env|txt|cfg|conf)$/i;
+
+function existingPath(path: string) {
+  let current = path;
+  const remaining: string[] = [];
+  for (;;) {
+    try { return resolve(realpathSync.native(current), ...remaining); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      try { lstatSync(current); return undefined; }
+      catch (lookupError) { if ((lookupError as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
+      const parent = dirname(current);
+      if (parent === current) return undefined;
+      remaining.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+export function activityPath(path: string, cwd: string, base = cwd) {
+  const root = existingPath(cwd);
+  const raw = isAbsolute(path) ? path : `${base}${sep}${path}`;
+  const absolute = existingPath(raw);
+  let present = true;
+  try { lstatSync(raw); } catch { present = false; }
+  const name = relative(resolve(cwd), resolve(base, path));
+  const physical = root && absolute ? relative(root, absolute) : "..";
+  const escapes = (value: string) => value === ".." || value.startsWith(".." + sep) || isAbsolute(value);
+  const outside = escapes(name) || escapes(physical);
+  const sensitive = [raw, physical].some(candidate => {
+    const segments = candidate.split(/[\\/]/), file = basename(candidate);
+    return (segments.at(-2)?.toLowerCase() === ".docker" && file.toLowerCase() === "config.json") ||
+      segments.some(segment => [".ssh", ".aws", ".gnupg"].includes(segment.toLowerCase())) ||
+      sensitiveNames.test(file) || sensitiveExtension.test(file) || sensitiveData.test(file) && (!extname(file) || dataExtension.test(extname(file)));
+  });
+  return { path: outside ? "<outside-workspace>" : name || ".", outside, sensitive, present };
+}
+
+function unwrapCommand(command: string) {
+  const wrapper = /^\s*(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+(["'])([\s\S]*)\1\s*$/.exec(command);
+  return wrapper ? wrapper[2] : command;
+}
+
+type HereDocument = { text: string; expands: boolean };
+
+function commandSegments(command: string, separators?: string[], bodies?: Map<number, HereDocument[]>) {
+  const result: string[] = [];
+  const heredocs: { delimiter: string; stripTabs: boolean; segment: number; expands: boolean }[] = [];
+  let quote = "", escaped = false, start = 0;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (escaped) { escaped = false; continue; }
+    if (character === "\\" && quote !== "'") { escaped = true; continue; }
+    if (quote) { if (character === quote) quote = ""; continue; }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === "#" && (index === start || /[\s;&|()]/.test(command[index - 1]))) {
+      const end = command.indexOf("\n", index);
+      if (end < 0) break;
+      index = end - 1; continue;
+    }
+    if (character === "<" && command[index + 1] === "<") {
+      if (command[index + 2] === "<") { index += 2; continue; }
+      const match = /^<<(-)?[ \t]*(?:'([^'\n]*)'|"([^"$`\\\n]*)"|([\w./-]+))(?=[\s;&|<>]|$)/.exec(command.slice(index));
+      if (!match) return result;
+      heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], stripTabs: Boolean(match[1]), segment: result.length,
+        expands: match[2] === undefined && match[3] === undefined });
+      index += match[0].length - 1;
+      continue;
+    }
+    if (character === "\n" || character === ";" || character === "&" || character === "|") {
+      result.push(command.slice(start, index).trim());
+      const doubled = (character === "&" || character === "|") && command[index + 1] === character;
+      separators?.push(doubled ? character + character : character);
+      if (doubled) index++;
+      start = index + 1;
+      if (character === "\n" && heredocs.length) {
+        let cursor = start;
+        for (const { delimiter, stripTabs, segment, expands } of heredocs) {
+          const bodyStart = cursor;
+          let found = false;
+          while (cursor < command.length) {
+            const lineStart = cursor;
+            const end = command.indexOf("\n", cursor);
+            const line = command.slice(cursor, end < 0 ? command.length : end).replace(/\r$/, "");
+            cursor = end < 0 ? command.length : end + 1;
+            if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) {
+              const body = command.slice(bodyStart, lineStart);
+              if (bodies) bodies.set(segment, [...(bodies.get(segment) ?? []), { text: stripTabs ? body.replace(/^\t+/gm, "") : body, expands }]);
+              found = true; break;
+            }
+          }
+          if (!found) return result;
+        }
+        heredocs.length = 0;
+        start = cursor;
+        index = cursor - 1;
+      }
+    }
+  }
+  result.push(command.slice(start).trim());
+  return result;
+}
+
+export function commandName(command: string) {
+  const first = commandSegments(unwrapCommand(command))[0] ?? "";
+  const name = /^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*([a-z_][a-z0-9_-]*)(?=\s|$)/.exec(first)?.[1];
+  return name && commandNames.has(name) ? name : "shell";
+}
+
+export function summarizeCommand(command: string, cwd: string) {
+  const first = commandSegments(unwrapCommand(command))[0] ?? "";
+  const name = commandName(command);
+  if (name === "shell") return name;
+  const words = first.split(/\s+/);
+  const position = words.findIndex(word => word === name);
+  const args = words.slice(position + 1);
+  const summary = [name];
+  if (["git", "gh", "npm", "cargo", "go", "make"].includes(name) && /^[a-z][a-z0-9_-]*$/.test(args[0] ?? "")) {
+    summary.push(args.shift()!);
+    if (name === "npm" && summary[1] === "run" && /^[a-z0-9:_-]+$/i.test(args[0] ?? "")) summary.push(args.shift()!);
+  }
+  if (name === "node" && args[0] === "--test") {
+    summary.push("--test");
+    for (const arg of args.slice(1, 6)) {
+      if (!/^[\w./-]+$/.test(arg) || arg.startsWith("-")) break;
+      summary.push(activityPath(arg, cwd).path);
+    }
+  }
+  return summary.join(" ");
+}
+
+export type ActivityEdit = { path: string; kind: string; diff?: string; suppressed?: string };
+
+export function editForPath(path: string, kind: string, diff: string | undefined, cwd: string, base = cwd): ActivityEdit {
+  const result = activityPath(path, cwd, base);
+  return { path: result.path, kind, ...(result.outside ? { suppressed: "outside workspace" }
+    : result.sensitive ? { suppressed: "sensitive file" } : diff && !result.present ? { suppressed: "original path unverified" } : diff ? { diff } : {}) };
+}
+
+export function parseApplyPatch(command: string, output: string, cwd: string): ActivityEdit[] | null {
+  const unwrapped = unwrapCommand(command);
+  const separators: string[] = [];
+  const bodies = new Map<number, HereDocument[]>();
+  let base: string | undefined = cwd, found = false, changedDirectory = false;
+  let patchSource = "", expansion = false, unverified = false;
+  const doubleWrapped = /^\s*(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+"/.test(command);
+  const segments = commandSegments(unwrapped, separators, bodies);
+  for (const [index, segment] of segments.entries()) {
+    if (/^apply_patch(?:\s|$)/.test(segment)) {
+      const documents = bodies.get(index) ?? [];
+      let last = segments.length - 1;
+      while (last > index && !segments[last]) last--;
+      const before = separators.slice(0, index);
+      let boundary = -1;
+      for (const [position, separator] of before.entries()) if ([";", "\n", "&"].includes(separator)) boundary = position;
+      if (before.slice(boundary + 1).some(separator => ["||", "|"].includes(separator)) ||
+        ["||", "|", "&"].includes(separators[index]) ||
+        segments.slice(index + 1).some(next => next.length > 0) &&
+          separators.slice(index, last).some(separator => separator !== "&&")) return null;
+      found = true; patchSource = [segment, ...documents.map(document => document.text)].join("\n");
+      expansion = documents.some(document => document.expands && /[$`\\]/.test(document.text)) ||
+        !documents.length && /[$`\\]/.test(segment) || doubleWrapped && /[$`\\]/.test(patchSource);
+      const direct = /^apply_patch[ \t]+<<-?[ \t]*(?:'[^'\n]*'|"[^"$`\\\n]*"|[\w./-]+)[ \t]*$/.test(segment) ||
+        /^apply_patch[ \t]+'[^']*'[ \t]*$/.test(segment) || /^apply_patch[ \t]+"[^"$`\\]*"[ \t]*$/.test(segment);
+      unverified = !direct || segments.slice(index + 1).some(next => next.length > 0);
+      break;
+    }
+    const changeDirectory = /^cd\s+(?:--\s+)?(?:'([^']*)'|"([^"$`\\]*)"|([\w./-]+))$/.exec(segment);
+    if (changeDirectory) {
+      const directory = changeDirectory[1] ?? changeDirectory[2] ?? changeDirectory[3];
+      const option = directory.startsWith("-") && !/^cd\s+--\s+/.test(segment);
+      base = directory === "-" || option ? undefined : isAbsolute(directory) ? resolve(directory) : base ? resolve(base, directory) : undefined;
+      changedDirectory = true;
+    } else if (!/^(?:true|false|:|pwd)$/.test(segment)) {
+      base = undefined;
+    }
+    if (changedDirectory && separators[index] !== "&&") base = undefined;
+  }
+  if (!found) return null;
+  const patch = /\*\*\* Begin Patch\r?\n([\s\S]*?)\r?\n\*\*\* End Patch/.exec(patchSource)?.[1];
+  const sections = patch?.split(/(?=^\*\*\* (?:Add|Update|Delete) File: )/m) ?? [];
+  if (sections.length > 1 && sections.some(section => /^\*\*\* (?:Delete File|Move to): /m.test(section))) unverified = true;
+  const edit = (path: string, kind: string, diff?: string) => {
+    if (patch && expansion) return { path: "<outside-workspace>", kind, suppressed: "shell expansion unresolved" };
+    if (!base) return { path: "<outside-workspace>", kind, suppressed: "working directory unknown" };
+    const result = editForPath(path, kind, unverified ? undefined : diff, cwd, base);
+    if (patch && unverified && !result.suppressed) result.suppressed = "post-patch state unverified";
+    return result;
+  };
+  const edits: ActivityEdit[] = [];
+  if (patch) {
+    for (const section of sections) {
+      const header = /^\*\*\* (Add|Update|Delete) File: ([^\r\n]+)/.exec(section);
+      if (!header) continue;
+      const move = /^\*\*\* Move to: ([^\r\n]+)/m.exec(section);
+      if (!move) { edits.push(edit(header[2], header[1].toLowerCase(), section)); continue; }
+      const source = edit(header[2], "move"), destination = edit(move[1], "move");
+      const suppressed = source.suppressed ?? destination.suppressed ?? "original source path unverified";
+      edits.push({ path: `${source.path} -> ${destination.path}`, kind: "move", suppressed });
+    }
+  } else {
+    const lines = output.split(/\r?\n/);
+    const start = lines.findIndex(line => line === "Success. Updated the following files:");
+    if (start >= 0) for (const line of lines.slice(start + 1)) {
+      const entry = /^([AMD])\s+(.+)$/.exec(line);
+      if (!entry) break;
+      edits.push(edit(entry[2], { A: "add", M: "update", D: "delete" }[entry[1]]!));
+    }
+  }
+  return edits;
+}
+
+export function boundedLines(value: string, limit = 12000) {
+  const lines: string[] = [];
+  let bytes = 0;
+  for (const line of value.split("\n")) {
+    const safe = Buffer.byteLength(line) > 4096 ? "[oversized line omitted]" : line;
+    const size = Buffer.byteLength(safe) + 1;
+    if (bytes + size > limit) { lines.push("[remaining lines omitted]"); break; }
+    lines.push(safe); bytes += size;
+  }
+  return lines;
+}
+
+export function showEdit(log: Diagnostics, edit: ActivityEdit) {
+  log.line(`[edit] ${edit.kind} ${edit.path}${edit.suppressed ? ` (${edit.suppressed})` : ""}`);
+  if (edit.diff && !edit.suppressed) log.group(`Diff ${edit.path}`, boundedLines(log.redact(edit.diff)), { untrusted: true });
+}
