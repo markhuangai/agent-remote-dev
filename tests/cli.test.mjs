@@ -611,21 +611,33 @@ test('native terminal completion does not await a stalled periodic upload', asyn
 test('the actual snapshot loop repeatedly captures a running native conversation', async t => {
   const { watchSnapshots } = await import('../.build/checkpoint-worker.js');
   const { rename } = await import('node:fs/promises');
-  const f = await fixture(t), r = await repository(f);
-  const api = await provider(t, [[(await import('./helpers.mjs')).tool('sleep 2')], [message('Completed after periodic persistence.')]]);
+  const f = await fixture(t), r = await repository(f), captures = [];
+  let releaseCaptures;
+  const capturesReady = new Promise(resolve => { releaseCaptures = resolve; });
+  const api = await provider(t, async (_body, count) => {
+    if (count === 1) return [tool('sleep 1')];
+    if (count === 2) {
+      let timer;
+      await Promise.race([capturesReady, new Promise(resolve => { timer = setTimeout(resolve, 15000); })]);
+      clearTimeout(timer);
+      return [message('Completed after periodic persistence.')];
+    }
+  });
   await configure(f.job, api.config, f.log);
   const saved = { job: f.job, metadata: checkpoint({ workspace: r.cwd, session_id: '' }), secrets: f.log.protectedValues, response: '', latest: null };
-  const path = join(f.job.root, 'state.json'); let writes = Promise.resolve(); const captures = [];
+  const path = join(f.job.root, 'state.json'); let writes = Promise.resolve();
   const persist = () => writes = writes.then(async () => { await writeFile(path + '.tmp', JSON.stringify(saved)); await rename(path + '.tmp', path); });
   await persist();
   const watcher = watchSnapshots(path, { intervalMs: 50, api: async () => ({ artifacts: [] }), upload: async (job, name, files, root) => {
-    captures.push(JSON.parse(await readFile(join(root, 'manifest.json')))); return { id: captures.length };
+    captures.push(JSON.parse(await readFile(join(root, 'manifest.json'))));
+    if (captures.length === 2) releaseCaptures();
+    return { id: captures.length };
   } });
-  await drive({ job: f.job, cwd: r.cwd, log: f.log, plan, state: async value => {
+  const result = await drive({ job: f.job, cwd: r.cwd, log: f.log, plan, state: async value => {
     if (value.session) saved.metadata.session_id = value.session; if (value.control) saved.control = value.control;
     saved.metadata.outcome = value.outcome; await persist();
   } });
-  await watcher; assert.ok(captures.length >= 2);
+  await watcher; assert.equal(result.outcome, 'completed'); assert.ok(captures.length >= 2);
   assert.ok(captures.every(value => value.outcome === 'running' && value.session_id === saved.metadata.session_id));
   assert.ok(captures.at(-1).sequence > captures[0].sequence);
 });
